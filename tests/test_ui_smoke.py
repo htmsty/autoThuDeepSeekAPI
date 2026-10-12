@@ -55,6 +55,11 @@ class UiSmokeTest(unittest.TestCase):
         dialog.keep_spin.setValue(3)
         dialog.unify_profiles.setChecked(True)
         dialog.dsh_dir_edit.setText(r"D:\some\dsh")
+        dialog.preflight_check.setChecked(False)
+        dialog.close_to_tray_check.setChecked(False)
+        dialog.silent_timeout_spin.setValue(75)
+        dialog.log_level_combo.setCurrentText("DEBUG")
+        dialog.default_model_combo.setCurrentText("qwen3.8-27b")
         dialog.apply_to(settings)
 
         self.assertFalse(settings.enable_dsh)
@@ -63,6 +68,11 @@ class UiSmokeTest(unittest.TestCase):
         self.assertEqual(settings.backup_keep, 3)
         self.assertTrue(settings.unify_all_profiles)
         self.assertEqual(settings.dsh_dir, r"D:\some\dsh")
+        self.assertFalse(settings.preflight_enabled)
+        self.assertFalse(settings.close_to_tray)
+        self.assertEqual(settings.silent_capture_timeout_seconds, 75)
+        self.assertEqual(settings.log_level, "DEBUG")
+        self.assertEqual(settings.default_model_id, "qwen3.8-27b")
         dialog.close()
 
     def test_paths_fall_back_when_app_dir_read_only(self) -> None:

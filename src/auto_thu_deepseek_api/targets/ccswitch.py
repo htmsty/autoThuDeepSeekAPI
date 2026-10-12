@@ -12,7 +12,7 @@ from .. import constants
 from ..backup import BackupManager
 from ..paths import TargetPaths, write_text_atomic
 from ..token.jwt_utils import looks_like_jwt
-from .base import ApplyResult, TargetStatus
+from .base import ApplyResult, RenderedFile, TargetStatus, emit
 
 logger = logging.getLogger(__name__)
 
@@ -43,23 +43,28 @@ def _load_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _write_json(path: Path, data: dict, backup: BackupManager, label: str) -> bool:
-    original = path.read_text(encoding="utf-8") if path.exists() else ""
-    new_text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    if original == new_text:
-        return False
-    if path.exists():
-        backup.backup_file(path, label)
-    write_text_atomic(path, new_text)
-    return True
-
-
 class CcSwitchTarget:
     key = "ccswitch"
     label = "CC Switch"
 
     def __init__(self, paths: TargetPaths) -> None:
         self.paths = paths
+        # 干跑：只渲染将要写入的内容，不备份、不写库（预检用）
+        self.dry_run = False
+        self.rendered: list[RenderedFile] = []
+
+    def _write_json(self, path: Path, data: dict, backup: BackupManager, label: str) -> bool:
+        original = path.read_text(encoding="utf-8") if path.exists() else ""
+        new_text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        if original == new_text:
+            return False
+        emit(self, path, new_text, label, "json")
+        if self.dry_run:
+            return True
+        if path.exists():
+            backup.backup_file(path, label)
+        write_text_atomic(path, new_text)
+        return True
 
     # —— 探测 ——
 
@@ -138,6 +143,23 @@ class CcSwitchTarget:
 
             current_fix = bool(has_current and self._other_current_cards(connection))
             refresh_targets = self._collect_refresh_targets(connection, token)
+
+            if self.dry_run:
+                # 预检：只把"将要写进卡片的内容"渲染出来，别碰数据库
+                payload = json.dumps(
+                    {
+                        "name": constants.PROVIDER_DISPLAY_NAME,
+                        "settings_config": settings_config,
+                        "meta": meta,
+                        "is_current": bool(has_current),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                emit(self, db, payload, "ccswitch-card", "sqlite-json")
+                result.note("（预检）已渲染 CC Switch 卡片内容（未写库）")
+                return
+
             if not card_needs_write and not current_fix and not refresh_targets:
                 result.note("卡片与同站点旧卡片都已是最新，未改动 CC Switch 数据库")
                 return
@@ -400,7 +422,7 @@ class CcSwitchTarget:
             key = f"currentProvider{constants.CCSWITCH_APP_TYPE.capitalize()}"
             if data.get(key) != constants.CCSWITCH_PROVIDER_ID:
                 data[key] = constants.CCSWITCH_PROVIDER_ID
-                if _write_json(settings_path, data, backup, "ccswitch-settings"):
+                if self._write_json(settings_path, data, backup, "ccswitch-settings"):
                     result.changed = True
                     result.note(f"已把 settings.json 的 {key} 指向 DeepSeek (THU)")
             else:
@@ -421,7 +443,7 @@ class CcSwitchTarget:
                 apps[constants.CCSWITCH_APP_TYPE] = app_state
             if app_state.get("proxy_route") != constants.CCSWITCH_PROVIDER_ID:
                 app_state["proxy_route"] = constants.CCSWITCH_PROVIDER_ID
-                if _write_json(live_path, data, backup, "ccswitch-live-state"):
+                if self._write_json(live_path, data, backup, "ccswitch-live-state"):
                     result.changed = True
                     result.note("已把 live-state.json 的代理路由指向 DeepSeek (THU)")
                 if "contract" in app_state:

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from . import paths
 from .backup import BackupManager
+from .preflight import PreflightReport, run_preflight
 from .settings import AppSettings
 from .targets import ApplyResult, CcSwitchTarget, DshTarget
 from .targets.base import TargetStatus
@@ -23,6 +24,7 @@ class SyncReport:
     results: list[ApplyResult] = field(default_factory=list)
     models: list[dict] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    preflight: PreflightReport | None = None
 
     @property
     def ok(self) -> bool:
@@ -62,7 +64,13 @@ class SyncReport:
 def build_targets(settings: AppSettings) -> list[object]:
     targets: list[object] = []
     if settings.enable_dsh:
-        targets.append(DshTarget(paths.resolve_dsh_paths(settings.dsh_dir), settings.unify_all_profiles))
+        targets.append(
+            DshTarget(
+                paths.resolve_dsh_paths(settings.dsh_dir),
+                settings.unify_all_profiles,
+                settings.default_model_id,
+            )
+        )
     if settings.enable_ccswitch:
         targets.append(CcSwitchTarget(paths.resolve_ccswitch_paths(settings.ccswitch_dir)))
     return targets
@@ -97,12 +105,30 @@ def run_sync(
             report.skipped.append("Token 被站点拒绝，未写入任何目标")
             return report
 
+    blocked: set[str] = set()
+    if settings.preflight_enabled:
+        report.preflight = run_preflight(settings, token, models)
+        for line in report.preflight.text().splitlines():
+            logger.info("预检 %s", line)
+        blocked = report.preflight.blocked_targets()
+        if blocked:
+            logger.warning("预检未通过，这次跳过写入：%s", "、".join(sorted(blocked)))
+
     backup = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
     for target in targets:
         status = target.detect()
         report.statuses.append(status)
         if not status.detected:
             report.skipped.append(f"{status.label}（未安装）")
+            continue
+        if target.key in blocked:
+            reasons = "；".join(
+                item.detail for item in (report.preflight.failed() if report.preflight else []) if item.target_key == target.key
+            )
+            result = ApplyResult(target.key, target.label, ok=False)
+            result.fail(f"预检未通过，已跳过写入：{reasons}")
+            report.results.append(result)
+            logger.error("%s：%s", result.label, result.errors[0])
             continue
         logger.info("开始写入 %s", status.label)
         try:

@@ -13,7 +13,7 @@ from ruamel.yaml import YAML
 from .. import constants
 from ..backup import BackupManager
 from ..paths import TargetPaths, write_text_atomic
-from .base import ApplyResult, TargetStatus
+from .base import ApplyResult, RenderedFile, TargetStatus, emit
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,18 @@ class DshTarget:
     key = "dsh"
     label = "DeepSeek Harness (DSH)"
 
-    def __init__(self, paths: TargetPaths, unify_all_profiles: bool = False) -> None:
+    def __init__(
+        self,
+        paths: TargetPaths,
+        unify_all_profiles: bool = False,
+        default_model_id: str = "",
+    ) -> None:
         self.paths = paths
         self.unify_all_profiles = unify_all_profiles
+        self.default_model_id = (default_model_id or "").strip()
+        # 干跑：只把"将要写入的内容"渲染出来，不备份也不落盘（预检用）
+        self.dry_run = False
+        self.rendered: list[RenderedFile] = []
 
     # —— 探测 ——
 
@@ -85,7 +94,6 @@ class DshTarget:
             data = yaml.load(text)
         except Exception as exc:  # noqa: BLE001 - 文件已经坏了，下面按行救回能救的
             result.note(f"凭据文件解析失败（{type(exc).__name__}），已留底并尝试重建")
-            backup.backup_file(path, "dsh-credentials-broken")
             salvaged = self._salvage_credentials(text)
             if not salvaged:
                 result.fail(f"凭据文件损坏且没有可救回的键，请手工修复：{path}")
@@ -107,8 +115,7 @@ class DshTarget:
             result.note("凭据里的 MADMODEL_API_KEY 已是该 Token，无需改动")
             return False
 
-        if not rebuilt:
-            backup.backup_file(path, "dsh-credentials")
+        label = "dsh-credentials-broken" if rebuilt else "dsh-credentials"
         refs[constants.DSH_CREDENTIAL_KEY] = token
 
         import io
@@ -125,6 +132,13 @@ class DshTarget:
         if not isinstance(parsed, dict) or parsed.get("refs", {}).get(constants.DSH_CREDENTIAL_KEY) != token:
             raise ValueError("回读校验失败：写入后解析出的 Token 与预期不一致")
 
+        emit(self, path, new_text, label, "yaml")
+        if self.dry_run:
+            result.note(f"（预检）将更新凭据 {path}")
+            return True
+
+        # 真实写入前先留底（重建的情况留的就是那份坏文件）
+        backup.backup_file(path, label)
         write_text_atomic(path, new_text)
         result.note(f"已更新凭据 {path}")
         logger.info("DSH 凭据已更新：%s", path)
@@ -307,6 +321,11 @@ class DshTarget:
         if not isinstance(check_provider, dict) or check_provider.get("apiKeyEnv") != constants.DSH_CREDENTIAL_KEY:
             raise ValueError(f"回读校验失败：写出的补丁里找不到 provider {provider_key}")
 
+        emit(self, path, new_text, "dsh-profile", "yaml")
+        if self.dry_run:
+            result.note(f"（预检）将更新供应商配置 {path}")
+            return True
+
         backup.backup_file(path, "dsh-profile")
         write_text_atomic(path, new_text)
         result.note(f"已更新供应商配置 {path}")
@@ -439,7 +458,14 @@ class DshTarget:
             return
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
-            config["model"] = model_ids[0]
+            config["model"] = self._preferred_model_id(model_ids)
+
+    def _preferred_model_id(self, model_ids: list[str]) -> str:
+        """设置里指定了默认模型就用它，否则用清单里的第一个。"""
+
+        if self.default_model_id and self.default_model_id in model_ids:
+            return self.default_model_id
+        return model_ids[0] if model_ids else ""
 
     def _point_default_model(self, data: list, models: list[dict], provider_key: str) -> None:
         entry = self._find_entry(
@@ -462,5 +488,5 @@ class DshTarget:
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
             # 换 provider 时必须一起换 model，否则会留下"指着 madmodel 却填别的模型 id"的组合
-            config["model"] = model_ids[0]
+            config["model"] = self._preferred_model_id(model_ids)
 

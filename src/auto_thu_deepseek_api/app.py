@@ -57,6 +57,9 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = AppSettings.load()
     state = AppState.load()
+    if settings.log_level == "DEBUG":
+        setup_logging(level=logging.DEBUG)
+        logger.info("日志级别已切到 DEBUG")
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         logger.warning("系统托盘不可用：关闭窗口会直接退出程序")

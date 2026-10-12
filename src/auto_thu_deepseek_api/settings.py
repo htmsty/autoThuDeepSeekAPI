@@ -29,6 +29,19 @@ class AppSettings:
     minimize_after_sync: bool = False
     launch_at_startup: bool = False
 
+    # 取 Token
+    silent_capture_timeout_seconds: int = 40
+
+    # 写入前预检（把"将要写入的内容"先渲染出来校验，避免写坏目标文件）
+    preflight_enabled: bool = True
+
+    # DSH 细节
+    default_model_id: str = ""  # 空 = 用站点清单里的第一个
+
+    # 界面
+    close_to_tray: bool = True
+    log_level: str = "INFO"
+
     # 目标开关（检测到哪个写哪个；可分别关闭）
     enable_dsh: bool = True
     enable_ccswitch: bool = True
@@ -105,6 +118,16 @@ class AppSettings:
         if self.ccswitch_running_policy not in (CCSWITCH_POLICY_PROMPT, CCSWITCH_POLICY_DIRECT):
             self.ccswitch_running_policy = CCSWITCH_POLICY_PROMPT
 
+        try:
+            self.silent_capture_timeout_seconds = int(self.silent_capture_timeout_seconds)
+        except (TypeError, ValueError):
+            self.silent_capture_timeout_seconds = 40
+        self.silent_capture_timeout_seconds = max(10, min(self.silent_capture_timeout_seconds, 600))
+
+        if self.log_level not in ("INFO", "DEBUG"):
+            self.log_level = "INFO"
+
+        self.default_model_id = (self.default_model_id or "").strip()
         self.dsh_dir = (self.dsh_dir or "").strip()
         self.ccswitch_dir = (self.ccswitch_dir or "").strip()
 

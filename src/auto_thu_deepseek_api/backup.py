@@ -45,7 +45,6 @@ class BackupManager:
     def __init__(self, root: Path, keep: int = 10) -> None:
         self.root = Path(root)
         self.keep = max(1, int(keep))
-        self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / INDEX_NAME
 
     # —— 索引 ——
@@ -81,6 +80,7 @@ class BackupManager:
     # —— 备份 ——
 
     def _new_snapshot_dir(self, label: str) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         safe_label = "".join(ch for ch in label if ch.isalnum() or ch in "-_") or "backup"
         base = f"{stamp}-{safe_label}"

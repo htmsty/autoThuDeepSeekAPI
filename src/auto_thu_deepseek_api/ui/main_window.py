@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QFont
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import constants, paths, startup
+from .. import backup_ops, constants, paths, preflight, startup
 from ..logging_setup import log_bus
 from ..settings import CCSWITCH_POLICY_DIRECT, AppSettings
 from ..state_store import AppState
@@ -111,14 +112,26 @@ class MainWindow(QMainWindow):
         first_row = QHBoxLayout()
         self.sync_button = QPushButton("立即获取并同步")
         self.sync_button.setMinimumHeight(34)
+        self.preflight_button = QPushButton("校验写入内容")
+        self.preflight_button.setToolTip("只读检查：把将要写入 DSH / CC Switch 的内容渲染出来并校验合法性")
+        self.backup_button = QPushButton("手动备份")
+        self.backup_button.setToolTip("立刻把 DSH / CC Switch 的关键文件各留一份备份")
+        self.restore_button = QPushButton("一键还原")
+        self.restore_button.setToolTip("把各文件恢复成最早的备份（= 第一次修改前的状态）")
+        for button in (self.sync_button, self.preflight_button, self.backup_button, self.restore_button):
+            first_row.addWidget(button)
+        first_row.addStretch(1)
+        actions_layout.addLayout(first_row)
+
+        second_row = QHBoxLayout()
         self.config_button = QPushButton("打开配置")
         self.log_button = QPushButton("打开日志")
         self.data_button = QPushButton("打开数据目录")
         self.exit_button = QPushButton("退出")
-        for button in (self.sync_button, self.config_button, self.log_button, self.data_button, self.exit_button):
-            first_row.addWidget(button)
-        first_row.addStretch(1)
-        actions_layout.addLayout(first_row)
+        for button in (self.config_button, self.log_button, self.data_button, self.exit_button):
+            second_row.addWidget(button)
+        second_row.addStretch(1)
+        actions_layout.addLayout(second_row)
 
         settings_row = QHBoxLayout()
         self.startup_check = QCheckBox("开机启动（最小化到托盘）")
@@ -139,6 +152,11 @@ class MainWindow(QMainWindow):
         settings_row.addSpacing(12)
         settings_row.addWidget(self.auto_sync_check)
         settings_row.addWidget(self.interval_spin)
+        for minutes in (20, 60, 180):
+            preset = QPushButton(f"{minutes} 分")
+            preset.setMaximumWidth(64)
+            preset.clicked.connect(lambda _=False, value=minutes: self.interval_spin.setValue(value))
+            settings_row.addWidget(preset)
         settings_row.addWidget(self.minimize_after_check)
         settings_row.addStretch(1)
         actions_layout.addLayout(settings_row)
@@ -187,6 +205,9 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self) -> None:
         self.sync_button.clicked.connect(lambda: self.start_sync(interactive=True))
+        self.preflight_button.clicked.connect(self.check_preflight)
+        self.backup_button.clicked.connect(self.manual_backup)
+        self.restore_button.clicked.connect(self.restore_backup)
         self.config_button.clicked.connect(self.open_settings)
         self.log_button.clicked.connect(self.open_log)
         self.data_button.clicked.connect(lambda: self._open_path(paths.data_root()))
@@ -259,6 +280,70 @@ class MainWindow(QMainWindow):
             return
         self._open_path(log_dir)
 
+    # —— 预检 / 备份 / 还原 ——
+
+    def current_token(self) -> str:
+        """当前还能用的 Token；没有就返回空串。"""
+
+        token = self.state.last_token
+        if token and not is_expired(token):
+            return token
+        return ""
+
+    def check_preflight(self) -> None:
+        token = self.current_token()
+        if not token:
+            QMessageBox.information(
+                self, "校验写入内容", "需要先获取一次 Token（点「立即获取并同步」），再回来校验。"
+            )
+            return
+        try:
+            report = preflight.run_preflight(self.settings, token)
+        except Exception as exc:  # noqa: BLE001 - 预检本身出问题也要如实说
+            logger.exception("预检失败")
+            QMessageBox.warning(self, "校验写入内容", f"预检失败：{exc}")
+            return
+        for line in report.text().splitlines():
+            logger.info("预检 %s", line)
+        QMessageBox.information(self, "校验写入内容", report.text())
+
+    def manual_backup(self) -> None:
+        try:
+            done, lines = backup_ops.manual_backup(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("手动备份失败")
+            QMessageBox.warning(self, "手动备份", f"备份失败：{exc}")
+            return
+        QMessageBox.information(
+            self,
+            "手动备份",
+            "\n".join(lines) + f"\n\n共 {done} 份\n备份目录：{backup_ops.backup_dir()}",
+        )
+
+    def restore_backup(self) -> None:
+        entries = backup_ops.pending_restore(self.settings)
+        if not entries:
+            QMessageBox.information(self, "一键还原", "还没有任何备份，不需要还原。")
+            return
+        detail = "\n".join(
+            f"· {Path(source).name} ← {Path(entry.backup).parent.name}" for source, entry in entries.items()
+        )
+        if QMessageBox.question(
+            self,
+            "一键还原",
+            "将把下列文件恢复成最早的备份（当前状态会先被备份一份）：\n\n" + detail,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            messages = backup_ops.restore_original(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("一键还原失败")
+            QMessageBox.warning(self, "一键还原", f"还原失败：{exc}")
+            return
+        QMessageBox.information(self, "一键还原", "\n".join(messages) or "没有可还原的内容。")
+        self.refresh_status()
+
     @staticmethod
     def _open_path(path) -> None:  # noqa: ANN001
         try:
@@ -288,8 +373,13 @@ class MainWindow(QMainWindow):
     # —— 关闭与退出 ——
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
-        if self._quitting or not QSystemTrayIcon.isSystemTrayAvailable():
+        if self._quitting:
             event.accept()
+            return
+        if not self.settings.close_to_tray or not QSystemTrayIcon.isSystemTrayAvailable():
+            # 设置里选了"关掉就退出"，那就真的退出
+            event.accept()
+            self.quit_app()
             return
         event.ignore()
         self.hide()
@@ -427,7 +517,12 @@ class MainWindow(QMainWindow):
         if self._browser_profile is None:
             self._browser_profile = build_profile(paths.browser_profile_dir())
 
-        self._capture = TokenCaptureSession(self._browser_profile, silent=silent, parent=self)
+        self._capture = TokenCaptureSession(
+            self._browser_profile,
+            silent=silent,
+            timeout_seconds=None if not silent else self.settings.silent_capture_timeout_seconds,
+            parent=self,
+        )
         self._capture.captured.connect(self._on_token_captured)
         self._capture.failed.connect(self._on_capture_failed)
         self._capture.cancelled.connect(self._on_capture_cancelled)

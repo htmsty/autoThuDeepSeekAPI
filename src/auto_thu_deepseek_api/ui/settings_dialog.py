@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from .. import paths
 from ..backup import BackupManager
+from ..constants import DEFAULT_MODELS
 from ..settings import CCSWITCH_POLICY_DIRECT, CCSWITCH_POLICY_PROMPT, AppSettings
 from ..token.jwt_utils import looks_like_jwt
 
@@ -105,6 +107,47 @@ class SettingsDialog(QDialog):
         self.paste_button.clicked.connect(self._paste_token)
         backup_layout.addWidget(self.paste_button)
         layout.addWidget(backup_box)
+
+        # —— 更多 ——
+        more_box = QGroupBox("更多")
+        more_form = QFormLayout(more_box)
+
+        self.preflight_check = QCheckBox("同步前先预检将要写入的内容（不通过就这次不写）")
+        self.preflight_check.setChecked(settings.preflight_enabled)
+        self.preflight_check.setToolTip(
+            "预检把要写出去的 YAML / JSON 先渲染一遍再校验：能不能解析、字段齐不齐、\n"
+            "模型 id 与站点清单是否一致、Token 是不是本次拿到的那个。只读，不改文件。"
+        )
+        more_form.addRow(self.preflight_check)
+
+        self.close_to_tray_check = QCheckBox("点 × 时最小化到托盘（取消勾选则直接退出程序）")
+        self.close_to_tray_check.setChecked(settings.close_to_tray)
+        more_form.addRow(self.close_to_tray_check)
+
+        self.silent_timeout_spin = QSpinBox()
+        self.silent_timeout_spin.setRange(10, 600)
+        self.silent_timeout_spin.setSuffix(" 秒")
+        self.silent_timeout_spin.setValue(settings.silent_capture_timeout_seconds)
+        self.silent_timeout_spin.setToolTip("自动同步时后台静默取 Token 最多等多久；超过就沿用旧 Token 并提示")
+        more_form.addRow("静默取 Token 超时", self.silent_timeout_spin)
+
+        self.default_model_combo = QComboBox()
+        self.default_model_combo.setEditable(True)
+        for model in DEFAULT_MODELS:
+            self.default_model_combo.addItem(str(model["id"]))
+        self.default_model_combo.setCurrentText(settings.default_model_id or str(DEFAULT_MODELS[0]["id"]))
+        self.default_model_combo.setToolTip(
+            "勾选「统一所有 profile」时，DSH 的默认模型用哪个 id（要能在站点清单里找到；留空=用第一个）"
+        )
+        more_form.addRow("DSH 默认模型", self.default_model_combo)
+
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(["INFO", "DEBUG"])
+        self.log_level_combo.setCurrentText(settings.log_level)
+        self.log_level_combo.setToolTip("DEBUG 会记录更多细节，排查问题时再开")
+        more_form.addRow("日志级别", self.log_level_combo)
+
+        layout.addWidget(more_box)
 
         note = QLabel(
             f"运行数据目录：{paths.data_root()}\n"
@@ -219,5 +262,11 @@ class SettingsDialog(QDialog):
         )
         settings.suppress_ccswitch_running_warning = self.suppress_warning.isChecked()
         settings.backup_keep = self.keep_spin.value()
+        settings.preflight_enabled = self.preflight_check.isChecked()
+        settings.close_to_tray = self.close_to_tray_check.isChecked()
+        settings.silent_capture_timeout_seconds = self.silent_timeout_spin.value()
+        settings.log_level = self.log_level_combo.currentText()
+        text = self.default_model_combo.currentText().strip()
+        settings.default_model_id = "" if text == str(DEFAULT_MODELS[0]["id"]) else text
         settings.normalize()
 

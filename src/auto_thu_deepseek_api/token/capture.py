@@ -138,6 +138,7 @@ class TokenCaptureSession(QObject):
         self._silent = silent
         self._finished = False
         self._profile = profile
+        self._url = url or constants.MADMODEL_LOGIN_URL
         self._timeout_s = timeout_seconds or (
             DEFAULT_SILENT_TIMEOUT_S if silent else DEFAULT_INTERACTIVE_TIMEOUT_S
         )
@@ -190,8 +191,8 @@ class TokenCaptureSession(QObject):
             self._window.show()
             self._window.raise_()
             self._window.activateWindow()
-        self._page.load(QUrl(constants.MADMODEL_LOGIN_URL))
-        logger.info("已打开登录窗口（%s 模式）：%s", "静默" if self._silent else "交互", constants.MADMODEL_LOGIN_URL)
+        self._page.load(QUrl(self._url))
+        logger.info("已打开登录窗口（%s 模式）：%s", "静默" if self._silent else "交互", self._url)
 
     def finish(self) -> None:
         self._finished = True

@@ -105,6 +105,10 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 | M6 | 打包 | 文件夹版与单文件版均可双击运行 |
 | M7 | 实测与发布 | 本机端到端验证通过并推送 GitHub |
 
+打包注意：`build/atd.spec` 会过滤两类 DLL —— Codex 运行库自带的旧 `api-ms-win-*`
+转发 DLL，以及外部工具链（Poppler）里的 ICU。它们会盖住 Qt 需要的系统版本，
+导致打包后导入 QtCore 时报 WinError 127。`--selftest` 用来确认打包版能真的抓到 Token。
+
 ## 约定
 
 - 只在 `private/` 下写运行数据；仓库内不出现任何 Token、路径或账号。

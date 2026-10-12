@@ -31,6 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     start_minimized = "--minimized" in argv
 
+    if "--selftest" in argv:
+        from .selftest import main as selftest_main
+
+        return selftest_main([arg for arg in argv if arg != "--selftest"])
+
     QApplication.setApplicationName(constants.APP_NAME)
     QApplication.setApplicationDisplayName(constants.APP_DISPLAY_NAME)
     QApplication.setOrganizationName(constants.APP_AUTHOR)

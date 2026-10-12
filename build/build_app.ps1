@@ -27,34 +27,40 @@ try {
     & $python 'tools\make_icon.py'
     if ($LASTEXITCODE -ne 0) { throw "icon generation failed (exit $LASTEXITCODE)" }
 
-    # Absolute paths: --specpath moves the spec file, so relative datas would resolve wrong.
-    $assets = Join-Path $root 'assets'
-    $iconFile = Join-Path $assets 'icon.ico'
-    $entry = Join-Path $root 'run_dev.py'
-
+    $spec = Join-Path $root 'build\atd.spec'
     $common = @(
         '--noconfirm',
         '--clean',
-        '--windowed',
-        '--icon', $iconFile,
-        '--add-data', "$assets;assets",
-        '--paths', (Join-Path $root 'src'),
         '--workpath', (Join-Path $root 'build\_work'),
-        '--specpath', (Join-Path $root 'build\_work'),
         '--distpath', (Join-Path $root 'dist')
     )
 
     if (-not $OneFileOnly) {
         Write-Host '== building folder version ==' -ForegroundColor Cyan
-        & $python -m PyInstaller @common --name 'autoThuDeepSeekAPI' $entry
+        $env:ATD_ONEFILE = ''
+        $env:ATD_NAME = 'autoThuDeepSeekAPI'
+        & $python -m PyInstaller @common $spec
         if ($LASTEXITCODE -ne 0) { throw "folder build failed (exit $LASTEXITCODE)" }
+
+        # PyInstaller 会把启动器 exe 留在 dist 根目录一份（没有配套的 _internal，
+        # 双击必失败）。这里把它删掉，避免和单文件版混淆。
+        $stray = Join-Path $root 'dist\autoThuDeepSeekAPI.exe'
+        $inside = Join-Path $root 'dist\autoThuDeepSeekAPI\autoThuDeepSeekAPI.exe'
+        if ((Test-Path -LiteralPath $stray -PathType Leaf) -and (Test-Path -LiteralPath $inside -PathType Leaf)) {
+            Remove-Item -LiteralPath $stray -Force
+            Write-Host "removed stray launcher: $stray"
+        }
     }
 
     if (-not $FolderOnly) {
         Write-Host '== building single-file version ==' -ForegroundColor Cyan
-        & $python -m PyInstaller @common --onefile --name 'autoThuDeepSeekAPI-single' $entry
+        $env:ATD_ONEFILE = '1'
+        $env:ATD_NAME = 'autoThuDeepSeekAPI-single'
+        & $python -m PyInstaller @common $spec
         if ($LASTEXITCODE -ne 0) { throw "single-file build failed (exit $LASTEXITCODE)" }
     }
+    $env:ATD_ONEFILE = ''
+    $env:ATD_NAME = ''
 
     Write-Host '== done ==' -ForegroundColor Green
     Get-ChildItem -LiteralPath (Join-Path $root 'dist') | Select-Object Mode, Length, Name | Format-Table -AutoSize

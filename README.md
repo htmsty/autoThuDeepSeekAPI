@@ -64,6 +64,20 @@ python -m venv .venv
 会同时产出文件夹版（`dist/autoThuDeepSeekAPI/`，推荐日常使用）与单文件版
 （`dist/autoThuDeepSeekAPI.exe`）。
 
+打包脚本用 `build/atd.spec`，里面挡掉了两类会“抢名字”的外部 DLL（UCRT 转发 DLL 与
+外部工具链的 ICU），否则 Qt 在打包后会报 `DLL load failed while importing QtCore:
+找不到指定的程序`。改动 spec 前请先看它的文件头说明。
+
+### 打包后自检
+
+```powershell
+.\dist\autoThuDeepSeekAPI\autoThuDeepSeekAPI.exe --selftest
+```
+
+会起一个本地网页、把一枚假 Token 写进浏览器存储，验证“内置浏览器 + 捕获链路”随包可用，
+通过时打印 `自检通过：抓到 Token` 并以退出码 0 结束。排查启动问题时可以加上
+`ATD_CONSOLE=1` 环境变量重新打包，得到带控制台的版本。
+
 ## 说明与边界
 
 - 程序不模拟鼠标键盘，也不代替你点击页面：登录永远由你本人在内置浏览器窗口里完成。

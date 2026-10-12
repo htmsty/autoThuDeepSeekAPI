@@ -9,11 +9,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-from ..constants import MADMODEL_API_BASE
+from ..constants import MADMODEL_API_BASE, MADMODEL_AUTH_LOGIN_PATH, MADMODEL_ORIGIN
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30
+LIGHT_TIMEOUT = 15
+CHAT_TIMEOUT = 30
 
 
 @dataclass
@@ -64,8 +66,32 @@ def _first_model_id(models: list[dict] | None) -> str:
     return str(DEFAULT_MODELS[0]["id"])
 
 
-def verify_token(token: str, model_id: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> VerifyResult:
-    """向站点发一次最小请求，判断 Token 是否可用。"""
+def _light_verdict(token: str, timeout: int) -> VerifyResult:
+    """站点会话校验：GET /model-api/auth-login，不消耗模型额度。"""
+
+    status, body, error = _request(
+        f"{MADMODEL_ORIGIN}{MADMODEL_AUTH_LOGIN_PATH}", token, None, timeout
+    )
+    if status is None:
+        return VerifyResult(None, f"未能连接站点校验（{error}）")
+    if status in (401, 403):
+        return VerifyResult(False, f"站点拒绝该 Token（HTTP {status}）", status)
+    if status != 200:
+        return VerifyResult(None, f"校验接口返回 HTTP {status}", status)
+
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return VerifyResult(None, "校验接口没有返回预期的 JSON", status)
+    if not isinstance(payload, dict) or not isinstance(payload.get("success"), bool):
+        return VerifyResult(None, "校验接口的返回结构不是预期的样子", status)
+    if payload["success"]:
+        return VerifyResult(True, "站点确认 Token 可用", status)
+    return VerifyResult(False, "站点未接受该 Token（auth-login success=false）", status)
+
+
+def _chat_verdict(token: str, model_id: str | None, timeout: int) -> VerifyResult:
+    """兜底校验：发一次最小对话请求（慢，但结论最硬）。"""
 
     model = model_id or _first_model_id(None)
     payload = {
@@ -85,6 +111,21 @@ def verify_token(token: str, model_id: str | None = None, timeout: int = DEFAULT
 
     snippet = body[:200].decode("utf-8", "replace").strip()
     return VerifyResult(None, f"站点返回 HTTP {status}：{snippet or '（无内容）'}", status)
+
+
+def verify_token(token: str, model_id: str | None = None, timeout: int | None = None) -> VerifyResult:
+    """先走站点的会话校验（快、不花额度），给不出结论时再发一次最小对话请求。"""
+
+    light = _light_verdict(token, timeout or LIGHT_TIMEOUT)
+    if light.ok is not None:
+        return light
+
+    # 连不上站点时没必要再打一次：结论同样是"未知"，只是白等更久。
+    if light.status is None:
+        return light
+
+    logger.info("会话校验未给出结论（%s），改用最小对话请求核对", light.detail)
+    return _chat_verdict(token, model_id, timeout or CHAT_TIMEOUT)
 
 
 def fetch_models(token: str, timeout: int = 15) -> list[dict] | None:

@@ -1,0 +1,70 @@
+"""Token 校验的分支：先走会话接口，给不出结论才打模型请求。"""
+
+from __future__ import annotations
+
+import json
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from auto_thu_deepseek_api.token import verifier  # noqa: E402
+
+
+class VerifierTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.calls: list[tuple[str, dict | None]] = []
+        self._original = verifier._request
+
+    def tearDown(self) -> None:
+        verifier._request = self._original
+
+    def _stub(self, responses: list[tuple[int | None, bytes, str]]) -> None:
+        def fake_request(url, token, payload=None, timeout=30):  # noqa: ANN001
+            self.calls.append((url, payload))
+            return responses[min(len(self.calls) - 1, len(responses) - 1)]
+
+        verifier._request = fake_request
+
+    def test_success_from_session_endpoint(self) -> None:
+        self._stub([(200, json.dumps({"success": True, "data": "x"}).encode(), "")])
+        result = verifier.verify_token("tok")
+        self.assertTrue(result.ok)
+        self.assertEqual(len(self.calls), 1, "会话接口给了结论就不该再打模型请求")
+        self.assertIn("auth-login", self.calls[0][0])
+
+    def test_refused_token(self) -> None:
+        self._stub([(401, b"", "")])
+        result = verifier.verify_token("tok")
+        self.assertFalse(result.ok)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_success_false_is_refused(self) -> None:
+        self._stub([(200, json.dumps({"success": False}).encode(), "")])
+        result = verifier.verify_token("tok")
+        self.assertFalse(result.ok)
+
+    def test_network_error_stays_unknown_without_model_call(self) -> None:
+        self._stub([(None, b"", "TimeoutError: timed out")])
+        result = verifier.verify_token("tok")
+        self.assertIsNone(result.ok)
+        self.assertEqual(len(self.calls), 1, "连不上站点时不该再等一次模型请求")
+        self.assertIn("未能连接站点校验", result.detail)
+
+    def test_falls_back_to_chat_when_endpoint_shape_is_unknown(self) -> None:
+        self._stub(
+            [
+                (200, b"<html>not json</html>", ""),
+                (200, b'{"choices": []}', ""),
+            ]
+        )
+        result = verifier.verify_token("tok")
+        self.assertTrue(result.ok)
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("/v1/chat/completions", self.calls[1][0])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

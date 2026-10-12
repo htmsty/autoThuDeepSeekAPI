@@ -108,90 +108,114 @@ class CcSwitchTarget:
         backup: BackupManager,
         result: ApplyResult,
     ) -> None:
-        backup.backup_sqlite(db, "ccswitch-db")
-
         connection = sqlite3.connect(str(db), timeout=15)
         try:
             connection.execute("PRAGMA foreign_keys = ON")
             columns = [row[1] for row in connection.execute("PRAGMA table_info(providers)")]
-            connection.execute("BEGIN IMMEDIATE")
+            has_current = "is_current" in columns
 
             row = connection.execute(
-                "SELECT settings_config, meta, name, created_at, category FROM providers WHERE id = ? AND app_type = ?",
+                "SELECT settings_config, meta, name, is_current FROM providers WHERE id = ? AND app_type = ?",
                 (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
             ).fetchone()
 
+            # 先把"要写什么"算清楚，确实有变化再去备份和写库：
+            # CC Switch 运行中时，能不碰它的数据库就不碰。
             if row is None:
-                result.note(f"未找到供应商卡片 {constants.CCSWITCH_PROVIDER_ID}，将新建")
                 settings_config = self._new_settings_config(token, models)
                 meta = self._new_meta()
-                connection.execute(
-                    "INSERT INTO providers (id, app_type, name, settings_config, website_url, category,"
-                    " created_at, sort_index, meta, is_current)"
-                    " VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now')*1000, ?, ?, 1)",
-                    (
-                        constants.CCSWITCH_PROVIDER_ID,
-                        constants.CCSWITCH_APP_TYPE,
-                        constants.PROVIDER_DISPLAY_NAME,
-                        json.dumps(settings_config, ensure_ascii=False),
-                        constants.MADMODEL_ORIGIN,
-                        "custom",
-                        0,
-                        json.dumps(meta, ensure_ascii=False),
-                    ),
-                )
-                result.changed = True
-                result.note("已新建 CC Switch 供应商卡片 DeepSeek (THU)")
+                card_needs_write = True
             else:
-                raw_settings, raw_meta, name, _, _ = row
-                try:
-                    settings_config = json.loads(raw_settings)
-                    if not isinstance(settings_config, dict):
-                        settings_config = {}
-                except ValueError:
-                    settings_config = {}
-                try:
-                    meta = json.loads(raw_meta)
-                    if not isinstance(meta, dict):
-                        meta = {}
-                except ValueError:
-                    meta = {}
+                raw_settings, raw_meta, name, is_current = row
+                settings_config = self._json_object(raw_settings)
+                meta = self._json_object(raw_meta)
                 changed = self._update_settings_config(settings_config, token, models)
                 changed = self._update_meta(meta) or changed
                 if name != constants.PROVIDER_DISPLAY_NAME:
                     changed = True
-                assignments = ["settings_config = ?", "meta = ?", "name = ?"]
-                values: list[object] = [
-                    json.dumps(settings_config, ensure_ascii=False),
-                    json.dumps(meta, ensure_ascii=False),
-                    constants.PROVIDER_DISPLAY_NAME,
-                ]
-                if "is_current" in columns:
-                    assignments.append("is_current = 1")
-                connection.execute(
-                    f"UPDATE providers SET {', '.join(assignments)} WHERE id = ? AND app_type = ?",
-                    (*values, constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
-                )
-                result.changed = result.changed or changed
-                result.note("已更新供应商卡片 DeepSeek (THU)")
+                if has_current and is_current != 1:
+                    changed = True
+                card_needs_write = changed
 
-            if "is_current" in columns:
-                connection.execute(
-                    "UPDATE providers SET is_current = 0 WHERE app_type = ? AND id <> ?",
-                    (constants.CCSWITCH_APP_TYPE, constants.CCSWITCH_PROVIDER_ID),
-                )
+            current_fix = bool(has_current and self._other_current_cards(connection))
+            refresh_targets = self._collect_refresh_targets(connection, token)
+            if not card_needs_write and not current_fix and not refresh_targets:
+                result.note("卡片与同站点旧卡片都已是最新，未改动 CC Switch 数据库")
+                return
 
-            refreshed = self._refresh_other_cards(connection, token)
-            if refreshed:
-                result.changed = True
-                result.note(f"已刷新 {refreshed} 张同站点旧卡片的令牌")
+            backup.backup_sqlite(db, "ccswitch-db")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO providers (id, app_type, name, settings_config, website_url, category,"
+                        " created_at, sort_index, meta, is_current)"
+                        " VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now')*1000, ?, ?, 1)",
+                        (
+                            constants.CCSWITCH_PROVIDER_ID,
+                            constants.CCSWITCH_APP_TYPE,
+                            constants.PROVIDER_DISPLAY_NAME,
+                            json.dumps(settings_config, ensure_ascii=False),
+                            constants.MADMODEL_ORIGIN,
+                            "custom",
+                            0,
+                            json.dumps(meta, ensure_ascii=False),
+                        ),
+                    )
+                    result.note("已新建 CC Switch 供应商卡片 DeepSeek (THU)")
+                elif card_needs_write:
+                    assignments = ["settings_config = ?", "meta = ?", "name = ?"]
+                    values: list[object] = [
+                        json.dumps(settings_config, ensure_ascii=False),
+                        json.dumps(meta, ensure_ascii=False),
+                        constants.PROVIDER_DISPLAY_NAME,
+                    ]
+                    if has_current:
+                        assignments.append("is_current = 1")
+                    connection.execute(
+                        f"UPDATE providers SET {', '.join(assignments)} WHERE id = ? AND app_type = ?",
+                        (*values, constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
+                    )
+                    result.note("已更新供应商卡片 DeepSeek (THU)")
 
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+                if current_fix:
+                    connection.execute(
+                        "UPDATE providers SET is_current = 0 WHERE app_type = ? AND id <> ?",
+                        (constants.CCSWITCH_APP_TYPE, constants.CCSWITCH_PROVIDER_ID),
+                    )
+
+                for payload, provider_id, app_type in refresh_targets:
+                    connection.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                        (payload, provider_id, app_type),
+                    )
+
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+            result.changed = True
+            if refresh_targets:
+                result.note(f"已刷新 {len(refresh_targets)} 张同站点旧卡片的令牌")
         finally:
             connection.close()
+
+    @staticmethod
+    def _json_object(raw: object) -> dict:
+        if isinstance(raw, dict):
+            return raw
+        try:
+            data = json.loads(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _other_current_cards(self, connection: sqlite3.Connection) -> list[tuple[str, str]]:
+        return connection.execute(
+            "SELECT id, app_type FROM providers WHERE app_type = ? AND id <> ? AND is_current = 1",
+            (constants.CCSWITCH_APP_TYPE, constants.CCSWITCH_PROVIDER_ID),
+        ).fetchall()
 
     @staticmethod
     def _new_meta() -> dict:
@@ -265,10 +289,12 @@ class CcSwitchTarget:
         meta.setdefault("endpointAutoSelect", True)
         return changed
 
-    def _refresh_other_cards(self, connection: sqlite3.Connection, token: str) -> int:
-        """同站点（madmodel）的旧卡片也刷成新令牌。"""
+    def _collect_refresh_targets(
+        self, connection: sqlite3.Connection, token: str
+    ) -> list[tuple[str, str, str]]:
+        """同站点（madmodel）的旧卡片也刷成新令牌；只读，返回 [(新配置, id, app_type)]。"""
 
-        refreshed = 0
+        targets: list[tuple[str, str, str]] = []
         rows = connection.execute(
             "SELECT id, app_type, settings_config FROM providers WHERE id <> ? OR app_type <> ?",
             (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
@@ -284,13 +310,9 @@ class CcSwitchTarget:
                 continue
             if not self._replace_tokens(data, token):
                 continue
-            connection.execute(
-                "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
-                (json.dumps(data, ensure_ascii=False), provider_id, app_type),
-            )
-            refreshed += 1
-            logger.info("已刷新同站点卡片令牌：%s / %s", app_type, provider_id)
-        return refreshed
+            targets.append((json.dumps(data, ensure_ascii=False), provider_id, app_type))
+            logger.info("准备刷新同站点卡片令牌：%s / %s", app_type, provider_id)
+        return targets
 
     @classmethod
     def _replace_tokens(cls, node: object, token: str) -> bool:

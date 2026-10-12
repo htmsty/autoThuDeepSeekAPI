@@ -55,8 +55,10 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   只做三件事：扫 `localStorage` / `sessionStorage`、钩 `fetch` 与 `XHR` 的响应体、
   扫一次页面文本；命中 JWT 即写入 `window.__atdToken`，Python 侧轮询取走。
   **不做任何模拟点击。** 拿到 Token 后窗口自动关闭；静默续期时不显示窗口。
-- `verifier.py`：向 `{base}/v1/chat/completions` 发一次最小请求判断 Token 是否可用
-  （401/403 判无效，200 判有效，其余判"未知"而不是失败）；`fetch_models()` 尝试读模型列表。
+- `verifier.py`：先用站点的会话接口 `GET /model-api/auth-login`（带 `Authorization: Bearer`）
+  判断 Token —— 快、不消耗模型额度；401/403 或 `success:false` 判无效，200+`success:true` 判有效。
+  只有它给不出结论（非 200、不是预期 JSON）时才兜底发一次最小对话请求；连不上站点就直接
+  记"未知"，不再白等一次模型请求。`fetch_models()` 尝试读模型列表，读不到就回退内置名单。
 
 ### `targets/dsh.py`
 - 凭据：`<.dsh>/.credentials.yaml` 的 `refs.MADMODEL_API_KEY`。用 ruamel.yaml 往返模式读写，
@@ -76,6 +78,8 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 - `settings.json`：`currentProviderCodex = "deepseek-thu"`。
 - `live-state.json`：`apps.codex.proxy_route = "deepseek-thu"`（`mode` 保持原样）。
 - 写库前用 SQLite 备份接口做一致性备份；`database is locked` 时提示关闭 CC Switch。
+- 先算清楚"要写什么"：卡片、`is_current`、同站点旧卡片都无需改动时**不备份也不写库**
+  （CC Switch 正在运行时尤其重要）。
 
 ### `backup.py`
 每次写入前把原文件复制到 `private/backups/<时间戳>-<标签>/`，并写入
@@ -85,6 +89,10 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 
 ### `sync.py`
 编排：校验 Token → 逐个目标探测 → 备份 → 写入 → 汇总报告。不依赖 Qt，可单独测试。
+
+界面侧：`start_sync()` 有忙判断（正在同步或正在取 Token 时忽略新请求），并且在
+"CC Switch 正在运行"对话框关闭后会**再查一次**，避免等待对话框期间自动同步已经跑起来、
+又被点一次按钮导致两轮同步并行。
 
 ### `ui/`
 - `main_window.py`：状态区 + 操作按钮 + 设置项 + 日志视图。

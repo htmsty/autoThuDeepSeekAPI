@@ -342,15 +342,26 @@ class MainWindow(QMainWindow):
     # —— 同步流程 ——
 
     def start_sync(self, interactive: bool = True) -> None:
-        if self._sync_worker is not None and self._sync_worker.isRunning():
+        if self._busy():
             logger.info("上一次同步还没结束，忽略这次请求")
             return
         if interactive and not self._ask_about_ccswitch():
+            return
+        # 上面那个对话框是阻塞的，等待期间自动同步可能已经跑起来了，这里再确认一次
+        if self._busy():
+            logger.info("等待对话框期间已经开始了同步，忽略这次请求")
             return
         if interactive:
             self._open_capture(silent=False)
         else:
             self._open_capture(silent=True)
+
+    def _busy(self) -> bool:
+        """正在同步，或正在取 Token。"""
+
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return True
+        return self._capture is not None
 
     def _ask_about_ccswitch(self) -> bool:
         """CC Switch 运行中时的处理：提示先关闭 / 直接改 / 取消。"""
@@ -403,17 +414,19 @@ class MainWindow(QMainWindow):
         self._capture = TokenCaptureSession(self._browser_profile, silent=silent, parent=self)
         self._capture.captured.connect(self._on_token_captured)
         self._capture.failed.connect(self._on_capture_failed)
-        self._capture.cancelled.connect(lambda: logger.info("已取消取 Token"))
+        self._capture.cancelled.connect(self._on_capture_cancelled)
         if silent:
             logger.info("开始静默取 Token（自动同步）")
         self._capture.start()
 
     def _on_token_captured(self, token: str) -> None:
+        self._capture = None
         self.state.remember_token(token)
         self.refresh_status()
         self._start_sync_worker(token)
 
     def _on_capture_failed(self, message: str) -> None:
+        self._capture = None
         logger.warning(message)
         fallback = self.state.last_token
         if fallback and not is_expired(fallback):
@@ -422,6 +435,10 @@ class MainWindow(QMainWindow):
             return
         self.refresh_status()
         self.notify(message + "：请点「立即获取并同步」并完成登录。", warning=True)
+
+    def _on_capture_cancelled(self) -> None:
+        self._capture = None
+        logger.info("已取消取 Token")
 
     def _start_sync_worker(self, token: str) -> None:
         self.sync_button.setEnabled(False)

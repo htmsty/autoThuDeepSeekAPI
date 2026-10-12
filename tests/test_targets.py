@@ -163,6 +163,27 @@ class TargetTestCase(unittest.TestCase):
         self.assertEqual(json.loads(row[1])["auth"]["OPENAI_API_KEY"], FAKE_NEW_TOKEN)
         self.assertEqual(json.loads(row[2])["apiFormat"], "openai_chat")
 
+    def test_ccswitch_second_run_touches_nothing(self) -> None:
+        """没有变化就别再备份、别再写库（CC Switch 运行中时这点很重要）。"""
+
+        target = CcSwitchTarget(
+            TargetPaths(
+                base_dir=self.sandbox.ccswitch_dir,
+                db_file=self.sandbox.ccswitch_dir / "cc-switch.db",
+                settings_file=self.sandbox.ccswitch_dir / "settings.json",
+                live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
+            )
+        )
+        first = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(first.changed)
+        backups_after_first = len(self.backup.entries())
+
+        second = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(second.ok, second.errors)
+        self.assertFalse(second.changed)
+        self.assertEqual(len(self.backup.entries()), backups_after_first)
+        self.assertTrue(any("未改动 CC Switch 数据库" in note for note in second.messages), second.messages)
+
     # —— 备份与还原 ——
 
     def test_backup_and_restore_returns_original(self) -> None:

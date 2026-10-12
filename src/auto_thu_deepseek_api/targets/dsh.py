@@ -79,7 +79,19 @@ class DshTarget:
     ) -> bool:
         yaml = _yaml()
         text = path.read_text(encoding="utf-8")
-        data = yaml.load(text)
+        rebuilt = False
+        try:
+            data = yaml.load(text)
+        except Exception as exc:  # noqa: BLE001 - 文件已经坏了，下面按行救回能救的
+            result.note(f"凭据文件解析失败（{type(exc).__name__}），已留底并尝试重建")
+            backup.backup_file(path, "dsh-credentials-broken")
+            salvaged = self._salvage_credentials(text)
+            if not salvaged:
+                result.fail(f"凭据文件损坏且没有可救回的键，请手工修复：{path}")
+                return False
+            result.note(f"从损坏的文件里救回 {len(salvaged)} 个键：{', '.join(sorted(salvaged))}")
+            data = {"version": 1, "refs": salvaged}
+            rebuilt = True
         if not isinstance(data, dict):
             raise ValueError("凭据文件结构不是映射（mapping）")
 
@@ -90,11 +102,12 @@ class DshTarget:
         if not isinstance(refs, dict):
             raise ValueError("凭据文件的 refs 不是映射")
 
-        if refs.get(constants.DSH_CREDENTIAL_KEY) == token:
+        if not rebuilt and refs.get(constants.DSH_CREDENTIAL_KEY) == token:
             result.note("凭据里的 MADMODEL_API_KEY 已是该 Token，无需改动")
             return False
 
-        backup.backup_file(path, "dsh-credentials")
+        if not rebuilt:
+            backup.backup_file(path, "dsh-credentials")
         refs[constants.DSH_CREDENTIAL_KEY] = token
 
         import io
@@ -115,6 +128,24 @@ class DshTarget:
         result.note(f"已更新凭据 {path}")
         logger.info("DSH 凭据已更新：%s", path)
         return True
+
+    @staticmethod
+    def _salvage_credentials(text: str) -> dict[str, str]:
+        """从坏掉的凭据文件里按行捞回 `大写键: 值`，只认键名全大写的引用。
+
+        DSH 的 refs 键都长这样（DEEPSEEK_API_KEY / MADMODEL_API_KEY / TSINGHUA_API_KEY），
+        而 records/payload 里的 kind、secret、id 不会命中，所以不会把会话材料混进 refs。
+        """
+
+        salvaged: dict[str, str] = {}
+        for line in text.splitlines():
+            match = re.match(r"^\s*([A-Z][A-Z0-9_]*)\s*:\s*(\S+)\s*$", line)
+            if not match:
+                continue
+            key, value = match.group(1), match.group(2).strip("'\"")
+            if value and value.lower() not in {"null", "~"}:
+                salvaged[key] = value
+        return salvaged
 
     # —— profile 补丁 ——
 

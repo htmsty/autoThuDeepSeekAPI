@@ -68,6 +68,9 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 ### `targets/dsh.py`
 - 凭据：`<.dsh>/.credentials.yaml` 的 `refs.MADMODEL_API_KEY`。用 ruamel.yaml 往返模式读写，
   保留注释与其它键；写入后重新解析校验值一致。
+- 凭据文件已经坏掉（解析失败）时：先整份留底（标签 `dsh-credentials-broken`），再按行捞回
+  `大写键: 值` 形式的引用（`DEEPSEEK_API_KEY` 这类；不会把 `kind`/`secret`/`id` 混进去），
+  重写成 `version: 1` + `refs` 的合法结构；一个键都捞不回来就如实报错，不改文件。
 - 供应商：`<.dsh>/profiles/<profile>/cordis.patch.yml` 里 `llm-pi-ai` 的 `config.providers`。
   先**按标记认领**已有 provider：`apiKeyEnv: MADMODEL_API_KEY` 优先，其次 `baseURL` 指向
   `madmodel.cs.tsinghua.edu.cn`，再次本地转发 `http://127.0.0.1:xxxx/v1`（DSH 里常见的接法）——

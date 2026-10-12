@@ -75,6 +75,44 @@ class TargetTestCase(unittest.TestCase):
         self.assertIn("# Your patch layer for this dsh profile", desktop)
         self.assertIn("ui-chat", desktop)
 
+    def test_dsh_rebuilds_broken_credentials_file(self) -> None:
+        """凭据文件语法坏了也要能救：留底 → 按行捞回大写键 → 重写成合法结构。"""
+
+        credentials = self.sandbox.dsh_dir / ".credentials.yaml"
+        credentials.write_text(
+            "version: 1\n"
+            "records:\n"
+            "  client-connection/browser-session:\n"
+            "    kind: grant\n"
+            "    payload:\n"
+            "      version: 1\n"
+            "refs:\n"
+            "  DEEPSEEK_API_KEY: " + FAKE_OLD_TOKEN + "\n"
+            "  MADMODEL_API_KEY: " + FAKE_OLD_TOKEN + "\n"
+            "\tbad-indent: oops\n",  # 制表符缩进 + 结构错乱，真解析会失败
+            encoding="utf-8",
+        )
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=credentials,
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        self.assertTrue(any("留底并尝试重建" in note for note in result.messages), result.messages)
+
+        from ruamel.yaml import YAML
+
+        parsed = YAML(typ="safe").load(credentials.read_text(encoding="utf-8"))
+        self.assertEqual(parsed["refs"]["MADMODEL_API_KEY"], FAKE_NEW_TOKEN)
+        self.assertEqual(parsed["refs"]["DEEPSEEK_API_KEY"], FAKE_OLD_TOKEN, "能捞回的键要留着")
+        self.assertTrue(
+            any("broken" in entry.label for entry in self.backup.entries()),
+            "坏文件要先留底",
+        )
+
     def test_unify_writes_every_profile(self) -> None:
         target = DshTarget(
             TargetPaths(

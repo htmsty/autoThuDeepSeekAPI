@@ -28,6 +28,20 @@
   安装状态、Token 状态与程序日志。
 - 点击 `×` 最小化到系统托盘并从任务栏消失；托盘图标左键单击打开主界面，右键单击弹出菜单。
 
+### 设置里的「统一所有 profile 到 madmodel」
+
+| 勾选情况 | 程序会做什么 |
+| --- | --- |
+| 不勾（默认） | 只更新**已经配置过 madmodel** 的 profile（正文里有清华站点域名、`madmodel:` 或 `MADMODEL_API_KEY` 才算）：写 `apiKeyEnv` 与 `models`。**默认模型保持你在 DSH 里选的那个**，其它 profile 一律不碰。 |
+| 勾上 | 所有 profile 都写，并把 `agent-default-model` 强制切到 `madmodel`，同时把 `model` 校正成 madmodel 下真实存在的模型 id。 |
+
+所以：想让"每次同步都把 DSH 切到 DeepSeek (THU)"就**勾上**；想让 DSH 用官方 DeepSeek
+或自己挑模型就**不要勾**。两种情况的共同点是：provider 只按 `apiKeyEnv` / `baseURL`
+认领，认不出才新建，`madmodel` 键被别人占用时直接报错、不覆盖。
+
+注意：DSH 自己也会写这两份 profile 文件（在 DSH 设置里改东西时）。改完建议重启一次 DSH，
+否则它可能用内存里的旧配置把文件覆盖回去。
+
 ## 运行数据
 
 所有隐私与运行数据都在程序目录下的 `private/`（不进入 Git）：

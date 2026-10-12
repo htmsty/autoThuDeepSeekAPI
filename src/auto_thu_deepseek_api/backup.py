@@ -101,7 +101,7 @@ class BackupManager:
                 label=label,
                 source=str(source),
                 backup=str(target),
-                created=datetime.now().isoformat(timespec="seconds"),
+                created=datetime.now().isoformat(timespec="milliseconds"),
                 sha256=_sha256(target),
                 size=target.stat().st_size,
             )
@@ -139,7 +139,7 @@ class BackupManager:
                 label=label,
                 source=str(source),
                 backup=str(target),
-                created=datetime.now().isoformat(timespec="seconds"),
+                created=datetime.now().isoformat(timespec="milliseconds"),
                 sha256=_sha256(target),
                 size=target.stat().st_size if target.exists() else 0,
             )
@@ -149,6 +149,13 @@ class BackupManager:
         return target
 
     # —— 清理 ——
+
+    @staticmethod
+    def _sort_key(item: dict) -> tuple[str, str]:
+        """快照目录名带毫秒时间戳，用它排序最稳（created 只有秒级）。"""
+
+        backup_path = Path(item.get("backup", ""))
+        return (backup_path.parent.name, item.get("created", ""))
 
     def prune(self) -> None:
         """每个源文件只保留最近 keep 份，避免无限增长。"""
@@ -160,7 +167,7 @@ class BackupManager:
 
         keep_paths: set[str] = set()
         for items in by_source.values():
-            items.sort(key=lambda item: item.get("created", ""))
+            items.sort(key=self._sort_key)
             keep_paths.update(item.get("backup", "") for item in items[-self.keep :])
 
         removed_dirs: set[str] = set()
@@ -185,13 +192,13 @@ class BackupManager:
         """每个源文件最早的一份备份 = 首次修改前的状态。"""
 
         result: dict[str, BackupEntry] = {}
-        for entry in sorted(self.entries(), key=lambda item: item.created):
+        for entry in sorted(self.entries(), key=lambda item: Path(item.backup).parent.name):
             result.setdefault(entry.source, entry)
         return result
 
     def latest_entries(self) -> dict[str, BackupEntry]:
         result: dict[str, BackupEntry] = {}
-        for entry in sorted(self.entries(), key=lambda item: item.created):
+        for entry in sorted(self.entries(), key=lambda item: Path(item.backup).parent.name):
             result[entry.source] = entry
         return result
 

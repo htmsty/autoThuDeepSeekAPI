@@ -64,6 +64,9 @@ python -m venv .venv
 会同时产出文件夹版（`dist/autoThuDeepSeekAPI/`，推荐日常使用）与单文件版
 （`dist/autoThuDeepSeekAPI.exe`）。
 
+打包中间产物落在 `build/_work/`，两个版本最后再拷进 `dist/`；这样 `dist/` 里不会出现
+“没有 `_internal` 的启动器 exe”那种一点就失败的半成品。
+
 打包脚本用 `build/atd.spec`，里面挡掉了两类会“抢名字”的外部 DLL（UCRT 转发 DLL 与
 外部工具链的 ICU），否则 Qt 在打包后会报 `DLL load failed while importing QtCore:
 找不到指定的程序`。改动 spec 前请先看它的文件头说明。

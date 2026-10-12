@@ -5,8 +5,16 @@
 #   .\build\build_app.ps1 -FolderOnly    # folder build only
 #   .\build\build_app.ps1 -OneFileOnly   # single-file build only
 #
-# NOTE: keep this file ASCII-only. Windows PowerShell 5.1 reads .ps1 without a
-# BOM as ANSI, which corrupts non-ASCII text and breaks parsing.
+# IMPORTANT: keep this file ASCII-only. Windows PowerShell 5.1 reads .ps1 without
+# a BOM as ANSI; non-ASCII text (even inside comments) corrupts the parse and the
+# build then fails with a confusing PyInstaller usage error.
+#
+# Layout of the results:
+#   dist/autoThuDeepSeekAPI/         folder build (recommended for daily use)
+#   dist/autoThuDeepSeekAPI.exe      single-file build
+# Both are built into build/_work/_dist first and then copied over, because
+# PyInstaller's folder mode also drops a launcher exe in the dist root that has
+# no _internal next to it (double-clicking that one always fails).
 
 param(
     [switch]$FolderOnly,
@@ -28,11 +36,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "icon generation failed (exit $LASTEXITCODE)" }
 
     $spec = Join-Path $root 'build\atd.spec'
+    $scratch = Join-Path $root 'build\_work\_dist'
+    $finalDist = Join-Path $root 'dist'
     $common = @(
         '--noconfirm',
         '--clean',
         '--workpath', (Join-Path $root 'build\_work'),
-        '--distpath', (Join-Path $root 'dist')
+        '--distpath', $scratch
     )
 
     if (-not $OneFileOnly) {
@@ -42,28 +52,25 @@ try {
         & $python -m PyInstaller @common $spec
         if ($LASTEXITCODE -ne 0) { throw "folder build failed (exit $LASTEXITCODE)" }
 
-        # PyInstaller 会把启动器 exe 留在 dist 根目录一份（没有配套的 _internal，
-        # 双击必失败）。这里把它删掉，避免和单文件版混淆。
-        $stray = Join-Path $root 'dist\autoThuDeepSeekAPI.exe'
-        $inside = Join-Path $root 'dist\autoThuDeepSeekAPI\autoThuDeepSeekAPI.exe'
-        if ((Test-Path -LiteralPath $stray -PathType Leaf) -and (Test-Path -LiteralPath $inside -PathType Leaf)) {
-            Remove-Item -LiteralPath $stray -Force
-            Write-Host "removed stray launcher: $stray"
-        }
+        $folderTarget = Join-Path $finalDist 'autoThuDeepSeekAPI'
+        New-Item -ItemType Directory -Force -Path $folderTarget | Out-Null
+        Copy-Item -Path (Join-Path $scratch 'autoThuDeepSeekAPI\*') -Destination $folderTarget -Recurse -Force
     }
 
     if (-not $FolderOnly) {
         Write-Host '== building single-file version ==' -ForegroundColor Cyan
         $env:ATD_ONEFILE = '1'
-        $env:ATD_NAME = 'autoThuDeepSeekAPI-single'
+        $env:ATD_NAME = 'autoThuDeepSeekAPI'
         & $python -m PyInstaller @common $spec
         if ($LASTEXITCODE -ne 0) { throw "single-file build failed (exit $LASTEXITCODE)" }
+        Copy-Item -Path (Join-Path $scratch 'autoThuDeepSeekAPI.exe') -Destination (Join-Path $finalDist 'autoThuDeepSeekAPI.exe') -Force
     }
+
     $env:ATD_ONEFILE = ''
     $env:ATD_NAME = ''
 
     Write-Host '== done ==' -ForegroundColor Green
-    Get-ChildItem -LiteralPath (Join-Path $root 'dist') | Select-Object Mode, Length, Name | Format-Table -AutoSize
+    Get-ChildItem -LiteralPath $finalDist | Select-Object Mode, Length, Name | Format-Table -AutoSize
 }
 finally {
     Pop-Location

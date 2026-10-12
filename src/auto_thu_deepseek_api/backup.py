@@ -16,6 +16,7 @@ from . import paths
 logger = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
+SOURCE_MARKER = "source.txt"
 
 
 @dataclass
@@ -55,9 +56,53 @@ class BackupManager:
         try:
             raw = json.loads(self.index_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            logger.warning("备份索引损坏，忽略：%s", self.index_path)
+            logger.warning("备份索引损坏，稍后从快照目录重建：%s", self.index_path)
             return []
         return raw if isinstance(raw, list) else []
+
+    def _rebuild_index(self) -> list[dict]:
+        """索引丢了就从快照目录自愈。
+
+        每个快照目录里都写了 `source.txt` 记录它来自哪个文件（也方便人工翻备份），
+        没有这个标记的老快照无法判断该还原到哪，只能先跳过。
+        """
+
+        if not self.root.is_dir():
+            return []
+        rebuilt: list[dict] = []
+        for snapshot in sorted(self.root.iterdir()):
+            if not snapshot.is_dir():
+                continue
+            marker = snapshot / SOURCE_MARKER
+            try:
+                source = marker.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if not source:
+                continue
+            for payload in snapshot.iterdir():
+                if not payload.is_file() or payload.name == SOURCE_MARKER:
+                    continue
+                created = datetime.fromtimestamp(payload.stat().st_mtime).isoformat(timespec="milliseconds")
+                rebuilt.append(
+                    asdict(
+                        BackupEntry(
+                            label=snapshot.name,
+                            source=source,
+                            backup=str(payload),
+                            created=created,
+                            sha256=_sha256(payload),
+                            size=payload.stat().st_size,
+                        )
+                    )
+                )
+        if rebuilt:
+            logger.warning("已从快照目录重建备份索引，共 %d 条", len(rebuilt))
+            try:
+                self._save_index(rebuilt)
+            except OSError as exc:  # pragma: no cover
+                logger.warning("重建后的索引写不进去：%s", exc)
+        return rebuilt
 
     def _save_index(self, entries: list[dict]) -> None:
         # 原子写：索引被写坏会让"一键还原"找不到任何备份
@@ -65,7 +110,11 @@ class BackupManager:
 
     def entries(self) -> list[BackupEntry]:
         result: list[BackupEntry] = []
-        for item in self._load_index():
+        raw = self._load_index()
+        if not raw:
+            # 索引丢了/读不出来时，从快照目录自愈（只在读取路径做，写备份时不做）
+            raw = self._rebuild_index()
+        for item in raw:
             try:
                 result.append(BackupEntry(**item))
             except TypeError:
@@ -103,6 +152,7 @@ class BackupManager:
         snapshot = self._new_snapshot_dir(label)
         target = snapshot / source.name
         shutil.copy2(source, target)
+        self._write_source_marker(snapshot, source)
         self._record(
             BackupEntry(
                 label=label,
@@ -125,6 +175,7 @@ class BackupManager:
             return None
         snapshot = self._new_snapshot_dir(label)
         target = snapshot / source.name
+        self._write_source_marker(snapshot, source)
         try:
             src = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
             try:
@@ -154,6 +205,13 @@ class BackupManager:
         logger.info("已备份数据库 %s → %s", source, target)
         self.prune()
         return target
+
+    @staticmethod
+    def _write_source_marker(snapshot: Path, source: Path) -> None:
+        try:
+            (snapshot / SOURCE_MARKER).write_text(str(source), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - 只是方便自愈，写不进去不算失败
+            logger.warning("写备份来源标记失败：%s", exc)
 
     # —— 清理 ——
 

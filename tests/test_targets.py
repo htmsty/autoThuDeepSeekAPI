@@ -16,7 +16,7 @@ from auto_thu_deepseek_api.paths import TargetPaths  # noqa: E402
 from auto_thu_deepseek_api.targets.ccswitch import CcSwitchTarget  # noqa: E402
 from auto_thu_deepseek_api.targets.dsh import DshTarget  # noqa: E402
 
-from .sandbox import FAKE_NEW_TOKEN, FAKE_OLD_TOKEN, PROFILE_CROSSED, Sandbox  # noqa: E402
+from .sandbox import FAKE_NEW_TOKEN, FAKE_OLD_TOKEN, PROFILE_CROSSED, PROFILE_WITH_JS, Sandbox  # noqa: E402
 
 MODELS = [
     {"id": "DeepSeek-V4.1-Flash", "name": "DeepSeek-V4.1-Flash (THU)", "contextWindow": 1000000, "input": ["text", "image"]},
@@ -198,6 +198,38 @@ class TargetTestCase(unittest.TestCase):
         self.assertEqual(provider["models"][0]["name"], "DeepSeek-V4.1-Flash (THU)")
         self.assertIn("reasoningEfforts", provider["models"][0])
         self.assertEqual(entries["agent-default-model"]["config"]["model"], "DeepSeek-V4.1-Flash")
+
+    def test_dsh_keeps_js_tags_and_original_style(self) -> None:
+        """profile 里的 !!js 表达式与注释必须原样保留，顶层缩进风格也别整份重排。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(PROFILE_WITH_JS, encoding="utf-8")
+
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        text = profile.read_text(encoding="utf-8")
+        self.assertIn("!!js", text)
+        self.assertIn("process.env.DSH_VIEW", text)
+        self.assertIn("# 带 !!js 的补丁", text)
+        self.assertTrue(
+            any(line.startswith("- id: ui-chat") for line in text.splitlines()),
+            "顶层序列应保持顶格写法",
+        )
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="rt").load(text)  # 往返模式能读懂 !!js
+        entries = {entry["id"]: entry for entry in data}
+        provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
+        self.assertEqual([model["id"] for model in provider["models"]], ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
 
     def test_dsh_updates_provider_behind_local_forward(self) -> None:
         """provider 走本地转发（127.0.0.1/v1）时，按 apiKeyEnv 认出来，不再建重复的。"""

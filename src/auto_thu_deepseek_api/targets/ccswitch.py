@@ -10,9 +10,9 @@ from pathlib import Path
 
 from .. import constants
 from ..backup import BackupManager
-from ..paths import TargetPaths, write_text_atomic
+from ..paths import TargetPaths
 from ..token.jwt_utils import looks_like_jwt
-from .base import ApplyResult, RenderedFile, TargetStatus, emit
+from .base import ApplyResult, RenderedFile, TargetStatus, emit, write_with_rollback
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +61,9 @@ class CcSwitchTarget:
         emit(self, path, new_text, label, "json")
         if self.dry_run:
             return True
-        if path.exists():
-            backup.backup_file(path, label)
-        write_text_atomic(path, new_text)
+        ok, message = write_with_rollback(path, new_text, backup, label)
+        if not ok:
+            raise OSError(message)
         return True
 
     # —— 探测 ——
@@ -117,9 +117,11 @@ class CcSwitchTarget:
             connection.execute("PRAGMA foreign_keys = ON")
             columns = [row[1] for row in connection.execute("PRAGMA table_info(providers)")]
             has_current = "is_current" in columns
+            # 旧版 CC Switch 没有 is_current 这一列，查询里不能直接写它
+            current_expr = "is_current" if has_current else "0 AS is_current"
 
             row = connection.execute(
-                "SELECT settings_config, meta, name, is_current FROM providers WHERE id = ? AND app_type = ?",
+                f"SELECT settings_config, meta, name, {current_expr} FROM providers WHERE id = ? AND app_type = ?",
                 (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
             ).fetchone()
 
@@ -169,7 +171,7 @@ class CcSwitchTarget:
             try:
                 # 拿到写锁后再核对一次：预判与真正开写之间，别人可能刚改过这张卡片。
                 fresh = connection.execute(
-                    "SELECT settings_config, meta, name, is_current FROM providers WHERE id = ? AND app_type = ?",
+                    f"SELECT settings_config, meta, name, {current_expr} FROM providers WHERE id = ? AND app_type = ?",
                     (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
                 ).fetchone()
                 insert_mode = fresh is None

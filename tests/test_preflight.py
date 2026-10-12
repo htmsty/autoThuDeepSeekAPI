@@ -14,7 +14,7 @@ from auto_thu_deepseek_api.preflight import run_preflight  # noqa: E402
 from auto_thu_deepseek_api.settings import AppSettings  # noqa: E402
 from auto_thu_deepseek_api.sync import build_targets  # noqa: E402
 
-from .sandbox import FAKE_NEW_TOKEN, Sandbox  # noqa: E402
+from .sandbox import FAKE_NEW_TOKEN, PROFILE_WITH_JS, Sandbox  # noqa: E402
 
 MODELS = [
     {
@@ -86,6 +86,12 @@ class PreflightTest(unittest.TestCase):
         report = run_preflight(self.settings, FAKE_NEW_TOKEN, MODELS)
         self.assertFalse(report.ok)
         self.assertIn("dsh", report.blocked_targets())
+
+    def test_preflight_accepts_profile_with_js_expressions(self) -> None:
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(PROFILE_WITH_JS, encoding="utf-8")
+        report = run_preflight(self.settings, FAKE_NEW_TOKEN, MODELS)
+        self.assertTrue(report.ok, report.text())
 
     def test_rendered_content_matches_what_actually_gets_written(self) -> None:
         """预检渲染出来的文本，必须和真写下去的逐字一致。"""

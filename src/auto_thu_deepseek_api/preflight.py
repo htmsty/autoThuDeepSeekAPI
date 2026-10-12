@@ -71,7 +71,7 @@ def _check_credentials(text: str, token: str) -> tuple[bool, str]:
     from ruamel.yaml import YAML
 
     try:
-        data = YAML(typ="safe").load(text)
+        data = YAML(typ="rt").load(text)
     except Exception as exc:  # noqa: BLE001
         return False, f"YAML 解析失败：{type(exc).__name__}: {exc}"
     if not isinstance(data, dict):
@@ -91,7 +91,8 @@ def _check_profile(text: str) -> tuple[bool, str]:
     from ruamel.yaml import YAML
 
     try:
-        data = YAML(typ="safe").load(text)
+        # 往返模式：profile 里的 !!js 标签 safe 模式解析不了，那不算"内容不合法"
+        data = YAML(typ="rt").load(text)
     except Exception as exc:  # noqa: BLE001
         return False, f"YAML 解析失败：{type(exc).__name__}: {exc}"
     if not isinstance(data, list):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -48,7 +49,10 @@ def setup_logging(level: int = logging.INFO) -> Path:
     # 日志写不进去不该拖垮程序（只读目录、共享目录断掉都可能发生）
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        # 按大小轮转：长期挂着也不会把日志写到天上去
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
     except OSError:  # pragma: no cover - 依赖具体环境

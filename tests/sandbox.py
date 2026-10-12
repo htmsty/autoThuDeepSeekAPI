@@ -92,6 +92,35 @@ PROFILE_CROSSED = """# Your patch layer for this dsh profile
     model: DeepSeek (THU)
 """
 
+# DSH 的补丁允许 !!js 表达式；这种文件也必须能安全往返。
+PROFILE_WITH_JS = """# 带 !!js 的补丁
+- id: ui-chat
+  name: "@deepseek-ai/dsh-client-ui-chat"
+  config:
+    transcriptView: !!js process.env.DSH_VIEW || 'standard'
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: DeepSeek (THU)
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: madmodel
+    model: DeepSeek-V4.1-Flash
+"""
+
 CCSWITCH_SETTINGS = {
     "showInTray": True,
     "currentProviderCodex": "codex-official",

@@ -12,8 +12,8 @@ from ruamel.yaml import YAML
 
 from .. import constants
 from ..backup import BackupManager
-from ..paths import TargetPaths, write_text_atomic
-from .base import ApplyResult, RenderedFile, TargetStatus, emit
+from ..paths import TargetPaths
+from .base import ApplyResult, RenderedFile, TargetStatus, emit, write_with_rollback
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +22,20 @@ logger = logging.getLogger(__name__)
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,63}$")
 
 
-def _yaml() -> YAML:
+def _yaml(style_from: str | None = None) -> YAML:
+    """往返模式的 YAML 读写。
+
+    `style_from` 给的是文件原始文本：如果它顶层是"顶格写 `- `"的风格（DSH 自己写出来的
+    就是这种），dump 时也保持这个风格，别把整份文件重排一遍。
+    """
+
     yaml = YAML(typ="rt")
     yaml.preserve_quotes = True
     yaml.width = 4096
-    yaml.indent(mapping=2, sequence=4, offset=2)
+    if style_from and re.search(r"(?m)^- ", style_from):
+        yaml.indent(mapping=2, sequence=2, offset=0)
+    else:
+        yaml.indent(mapping=2, sequence=4, offset=2)
     return yaml
 
 
@@ -87,8 +96,8 @@ class DshTarget:
         backup: BackupManager,
         result: ApplyResult,
     ) -> bool:
-        yaml = _yaml()
         text = path.read_text(encoding="utf-8")
+        yaml = _yaml(text)
         rebuilt = False
         try:
             data = yaml.load(text)
@@ -137,9 +146,11 @@ class DshTarget:
             result.note(f"（预检）将更新凭据 {path}")
             return True
 
-        # 真实写入前先留底（重建的情况留的就是那份坏文件）
-        backup.backup_file(path, label)
-        write_text_atomic(path, new_text)
+        # 真实写入前先留底（重建的情况留的就是那份坏文件）；写坏了自动回滚
+        ok, message = write_with_rollback(path, new_text, backup, label)
+        if not ok:
+            result.fail(message)
+            return False
         result.note(f"已更新凭据 {path}")
         logger.info("DSH 凭据已更新：%s", path)
         return True
@@ -220,8 +231,8 @@ class DshTarget:
         backup: BackupManager,
         result: ApplyResult,
     ) -> bool:
-        yaml = _yaml()
         original = path.read_text(encoding="utf-8")
+        yaml = _yaml(original)
         data = yaml.load(original)
         if not isinstance(data, list):
             raise ValueError("补丁文件顶层不是数组")
@@ -309,10 +320,11 @@ class DshTarget:
             result.note(f"{path.parent.name}：供应商配置已是最新")
             return False
 
-        # 落盘前先确认 dump 出来的是合法的顶层数组，且我们的 provider 真在里面
+        # 落盘前先确认 dump 出来的是合法的顶层数组，且我们的 provider 真在里面。
+        # 这里用往返模式解析：profile 允许 !!js 标签，safe 模式会拒收。
         from ruamel.yaml import YAML as CheckYAML
 
-        check = CheckYAML(typ="safe").load(new_text)
+        check = CheckYAML(typ="rt").load(new_text)
         if not isinstance(check, list):
             raise ValueError("回读校验失败：写出的补丁不是顶层数组")
         check_entry = self._find_entry(check, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME)
@@ -326,8 +338,10 @@ class DshTarget:
             result.note(f"（预检）将更新供应商配置 {path}")
             return True
 
-        backup.backup_file(path, "dsh-profile")
-        write_text_atomic(path, new_text)
+        ok, message = write_with_rollback(path, new_text, backup, "dsh-profile")
+        if not ok:
+            result.fail(message)
+            return False
         result.note(f"已更新供应商配置 {path}")
         logger.info("DSH profile 已更新：%s", path)
         return True

@@ -1,0 +1,8 @@
+# 运行依赖
+PySide6==6.12.0
+PyYAML==6.0.3
+ruamel.yaml==0.19.1
+
+# 打包依赖
+pyinstaller==6.22.3
+

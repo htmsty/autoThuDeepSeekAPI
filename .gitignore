@@ -1,0 +1,25 @@
+# 运行数据与隐私（默认不提交）
+private/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物与中间文件
+dist/
+build/_work/
+*.spec.bak
+
+# 编辑器与系统
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+*.tmp
+

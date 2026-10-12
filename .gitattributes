@@ -1,0 +1,8 @@
+# 统一换行：仓库里存 LF，Windows 检出 CRLF
+* text=auto
+*.ps1 text eol=crlf
+
+# 二进制资源
+*.png binary
+*.ico binary
+*.icns binary

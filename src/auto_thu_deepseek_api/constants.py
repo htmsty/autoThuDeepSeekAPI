@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "autoThuDeepSeekAPI"
 APP_DISPLAY_NAME = "Auto THU DeepSeek API"
 APP_AUTHOR = "htmsty"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 REPO_URL = "https://github.com/htmsty/autoThuDeepSeekAPI"
 
 # —— 清华 MadModel ——
@@ -51,14 +51,35 @@ DEFAULT_MODELS: tuple[dict[str, object], ...] = (
         "name": "DeepSeek-V4.1-Flash (THU)",
         "contextWindow": 1000000,
         "input": ["text", "image"],
+        "reasoningEfforts": {"low": "low", "high": "high", "max": "max"},
     },
     {
         "id": "qwen3.8-27b",
         "name": "qwen3.8-27b (THU)",
         "contextWindow": 1000000,
         "input": ["text", "image"],
+        "reasoningEfforts": {"low": "low", "medium": "medium", "xhigh": "xhigh"},
     },
 )
+
+# 站点有、但我们故意不注册的模型（与 thu-tok-auto 保持一致）。
+EXCLUDED_MODEL_IDS = (
+    "DeepSeek-V4-Flash-Vision-Exp",  # V4.1-Flash 已经覆盖图片输入
+    "DeepSeek-R1-W8A8",
+)
+
+# 站点的思考档位取值；只有这些才写进 provider。
+THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+# 站点前端包里没标 supportImage、但我们实测支持图片的模型。
+IMAGE_CONFIRMED = ("DeepSeek-V4.1-Flash",)
+
+# 所有模型统一用这个上下文长度：模型侧 1,048,576 通过、网关 8 MiB 请求体通过，
+# 留约 4.8 万 token 给系统提示与工具定义（thu-tok-auto 2026-10-01 实测结论）。
+CONTEXT_WINDOW = 1000000
+
+# 站点前端包有几 MB，读一次缓存 6 小时。
+MODEL_CACHE_TTL_SECONDS = 6 * 3600
 
 # 注册表开机启动项名。
 STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"

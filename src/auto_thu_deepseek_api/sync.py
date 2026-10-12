@@ -10,7 +10,8 @@ from .backup import BackupManager
 from .settings import AppSettings
 from .targets import ApplyResult, CcSwitchTarget, DshTarget
 from .targets.base import TargetStatus
-from .token.verifier import VerifyResult, fetch_models, verify_token
+from .token import site_models
+from .token.verifier import VerifyResult, verify_token
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,8 @@ def run_sync(
 
     models: list[dict] = []
     if fetch_model_list:
-        models = fetch_models(token) or []
+        # 站点前端包 → /v1/models → 内置名单（详见 token/site_models.py）
+        models = site_models.resolve_models(token)
     report.models = models
 
     if verify:

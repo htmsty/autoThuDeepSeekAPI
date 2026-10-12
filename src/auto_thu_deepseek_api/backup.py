@@ -83,8 +83,15 @@ class BackupManager:
     def _new_snapshot_dir(self, label: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         safe_label = "".join(ch for ch in label if ch.isalnum() or ch in "-_") or "backup"
-        path = self.root / f"{stamp}-{safe_label}"
-        path.mkdir(parents=True, exist_ok=True)
+        base = f"{stamp}-{safe_label}"
+        path = self.root / base
+        counter = 1
+        # 毫秒级时间戳也可能撞（同一毫秒里连做几次备份），撞了就加序号，
+        # 否则两条记账会指向同一个文件，清理逻辑就数不清份数了。
+        while path.exists():
+            counter += 1
+            path = self.root / f"{base}-{counter}"
+        path.mkdir(parents=True, exist_ok=False)
         return path
 
     def backup_file(self, source: Path, label: str) -> Path | None:

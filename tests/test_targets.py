@@ -16,7 +16,7 @@ from auto_thu_deepseek_api.paths import TargetPaths  # noqa: E402
 from auto_thu_deepseek_api.targets.ccswitch import CcSwitchTarget  # noqa: E402
 from auto_thu_deepseek_api.targets.dsh import DshTarget  # noqa: E402
 
-from .sandbox import FAKE_NEW_TOKEN, FAKE_OLD_TOKEN, Sandbox  # noqa: E402
+from .sandbox import FAKE_NEW_TOKEN, FAKE_OLD_TOKEN, PROFILE_CROSSED, Sandbox  # noqa: E402
 
 MODELS = [
     {"id": "DeepSeek-V4.1-Flash", "name": "DeepSeek-V4.1-Flash (THU)", "contextWindow": 1000000, "input": ["text", "image"]},
@@ -89,6 +89,109 @@ class TargetTestCase(unittest.TestCase):
         web = (self.sandbox.dsh_dir / "profiles" / "web" / "cordis.patch.yml").read_text(encoding="utf-8")
         self.assertIn("madmodel", web)
         self.assertIn("provider: madmodel", web)
+
+    def test_dsh_repairs_crossed_fields(self) -> None:
+        """DSH 界面把显示名/模型 id 写串时，要能被修回可用的样子。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(PROFILE_CROSSED, encoding="utf-8")
+
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        self.assertTrue(result.changed)
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="safe").load(profile.read_text(encoding="utf-8"))
+        entries = {entry["id"]: entry for entry in data}
+        provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
+        self.assertEqual(provider["displayName"], "DeepSeek (THU)")
+        self.assertEqual(provider["reasoning"], "medium")
+        ids = [model["id"] for model in provider["models"]]
+        self.assertEqual(ids, ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
+        self.assertEqual(provider["models"][0]["name"], "DeepSeek-V4.1-Flash (THU)")
+        self.assertIn("reasoningEfforts", provider["models"][0])
+        self.assertEqual(entries["agent-default-model"]["config"]["model"], "DeepSeek-V4.1-Flash")
+
+    def test_dsh_updates_provider_behind_local_forward(self) -> None:
+        """provider 走本地转发（127.0.0.1/v1）时，按 apiKeyEnv 认出来，不再建重复的。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(
+            """# local forward profile
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      thu-local:
+        displayName: 我的中转
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/v1
+        models:
+          - id: old-model
+            name: 老模型
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: thu-local
+    model: old-model
+""",
+            encoding="utf-8",
+        )
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        self.assertTrue(any("已找到 provider thu-local" in note for note in result.messages), result.messages)
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="safe").load(profile.read_text(encoding="utf-8"))
+        entries = {entry["id"]: entry for entry in data}
+        providers = entries["llm-pi-ai"]["config"]["providers"]
+        self.assertEqual(list(providers.keys()), ["thu-local"], "不该另外建一个 madmodel")
+        self.assertEqual(providers["thu-local"]["displayName"], "我的中转", "不该覆盖用户自己的名称")
+        self.assertEqual([m["id"] for m in providers["thu-local"]["models"]], ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
+
+    def test_dsh_refuses_when_madmodel_key_is_taken(self) -> None:
+        """madmodel 这个键被别的配置占用时，宁可不写也不覆盖。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        original = """# occupied
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: 别人的配置
+        api: anthropic
+        baseURL: https://example.com/v1
+"""
+        profile.write_text(original, encoding="utf-8")
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("已被其它配置占用" in message for message in result.errors), result.errors)
+        self.assertEqual(profile.read_text(encoding="utf-8"), original, "文件应当原封不动")
 
     # —— CC Switch ——
 

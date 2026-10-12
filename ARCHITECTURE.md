@@ -59,14 +59,25 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   判断 Token —— 快、不消耗模型额度；401/403 或 `success:false` 判无效，200+`success:true` 判有效。
   只有它给不出结论（非 200、不是预期 JSON）时才兜底发一次最小对话请求；连不上站点就直接
   记"未知"，不再白等一次模型请求。`fetch_models()` 尝试读模型列表，读不到就回退内置名单。
+- `site_models.py`：**模型列表跟着站点走**。站点没有模型列表接口（`/v1/models` 会落回 SPA），
+  于是按 thu-tok-auto 的做法读站点自己的前端包：首页 → `assets/js/*.js` → 解析
+  `modelList:[{label,value,supportImage,effortOptions}…]` → 转成 provider 的 models 形状
+  （`contextWindow` 统一 1000000；排除 `DeepSeek-V4-Flash-Vision-Exp` 与 `DeepSeek-R1-W8A8`；
+  思考档只保留 pi-ai 认得的等级）。结果缓存 6 小时，读不到才退回 `/v1/models` 与内置名单。
 
 ### `targets/dsh.py`
 - 凭据：`<.dsh>/.credentials.yaml` 的 `refs.MADMODEL_API_KEY`。用 ruamel.yaml 往返模式读写，
   保留注释与其它键；写入后重新解析校验值一致。
-- 供应商：`<.dsh>/profiles/<profile>/cordis.patch.yml` 里 `llm-pi-ai` 的
-  `config.providers.madmodel`。默认只处理**已配置过 madmodel 的 profile**；
-  勾选"统一所有 profile 到 madmodel"后处理全部 profile，并把 `agent-default-model`
-  指向 `madmodel`。
+- 供应商：`<.dsh>/profiles/<profile>/cordis.patch.yml` 里 `llm-pi-ai` 的 `config.providers`。
+  先**按标记认领**已有 provider：`apiKeyEnv: MADMODEL_API_KEY` 优先，其次 `baseURL` 指向
+  `madmodel.cs.tsinghua.edu.cn`，再次本地转发 `http://127.0.0.1:xxxx/v1`（DSH 里常见的接法）——
+  认出谁就更新谁，不会在旁边再建一个重复的。找不到时，`madmodel` 键空着才新建；
+  键被别的配置占用则**报错并保持文件原样，不覆盖**。
+- 只合并我们负责的字段：`apiKeyEnv` 与 `models`；`displayName` 只在空、或被填成模型 id 时纠正，
+  `baseURL` / `api` / `reasoning` 只在缺失时补上，用户自己改过的值不动。
+- 模型 id 被写串（例如显示名被填进 id、或默认模型指向别的 provider 的模型）时自动修回；
+  勾选"统一所有 profile 到 madmodel"后处理全部 profile，并把 `agent-default-model` 指到
+  `madmodel`，同时保证它的 `model` 是 madmodel 下真实存在的 id。
 
 ### `targets/ccswitch.py`
 - 数据库 `cc-switch.db`：

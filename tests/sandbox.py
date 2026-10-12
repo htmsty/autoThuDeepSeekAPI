@@ -67,6 +67,31 @@ PROFILE_WEB = """# Your patch layer for this dsh profile
     welcomeNoticeVersion: 2026-09-28.1
 """
 
+# 字段被写串的样子：model id 里塞进了显示名，default model 也指到了不存在的 id。
+PROFILE_CROSSED = """# Your patch layer for this dsh profile
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: DeepSeek-V4.1-Flash
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek (THU)
+            name: DeepSeek-V4.1-Flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: madmodel
+    model: DeepSeek (THU)
+"""
+
 CCSWITCH_SETTINGS = {
     "showInTray": True,
     "currentProviderCodex": "codex-official",

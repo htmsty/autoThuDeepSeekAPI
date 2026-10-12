@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     lock = _single_instance_guard()
     if lock is None:
         logger.info("程序已经在运行，退出本次启动")
-        if QSystemTrayIcon.isSystemTrayAvailable():
+        # 开机启动（--minimized）是后台拉起，别弹窗打扰用户
+        if not start_minimized and QSystemTrayIcon.isSystemTrayAvailable():
             QMessageBox.information(None, constants.APP_DISPLAY_NAME, "程序已经在运行（请看系统托盘）。")
         return 0
 

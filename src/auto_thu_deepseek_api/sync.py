@@ -26,6 +26,16 @@ class SyncReport:
 
     @property
     def ok(self) -> bool:
+        """整体是否算成功。
+
+        站点明确拒绝 Token、或一个目标都没写成（例如都没安装）都不算成功——
+        免得界面上弹出"同步完成"让人以为一切正常。
+        """
+
+        if self.verified is not None and self.verified.ok is False:
+            return False
+        if not self.results:
+            return False
         return all(result.ok for result in self.results)
 
     def summary(self) -> str:

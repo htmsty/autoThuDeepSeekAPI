@@ -30,11 +30,7 @@ class AppState:
 
     def save(self) -> None:
         path = paths.state_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        paths.write_text_atomic(path, json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n")
 
     def remember_token(self, token: str) -> None:
         self.last_token = token

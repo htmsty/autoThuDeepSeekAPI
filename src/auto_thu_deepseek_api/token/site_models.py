@@ -15,6 +15,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+import copy
 from pathlib import Path
 
 from .. import constants, paths
@@ -311,4 +312,4 @@ def resolve_models(token: str | None = None, *, use_cache: bool = True) -> list[
         return live
 
     logger.info("模型列表读不到，回退内置名单")
-    return [dict(model) for model in constants.DEFAULT_MODELS]
+    return [copy.deepcopy(model) for model in constants.DEFAULT_MODELS]

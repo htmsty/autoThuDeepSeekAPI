@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from pathlib import Path
@@ -11,7 +12,7 @@ from ruamel.yaml import YAML
 
 from .. import constants
 from ..backup import BackupManager
-from ..paths import TargetPaths
+from ..paths import TargetPaths, write_text_atomic
 from .base import ApplyResult, TargetStatus
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ class DshTarget:
         if not isinstance(parsed, dict) or parsed.get("refs", {}).get(constants.DSH_CREDENTIAL_KEY) != token:
             raise ValueError("回读校验失败：写入后解析出的 Token 与预期不一致")
 
-        path.write_text(new_text, encoding="utf-8")
+        write_text_atomic(path, new_text)
         result.note(f"已更新凭据 {path}")
         logger.info("DSH 凭据已更新：%s", path)
         return True
@@ -294,8 +295,20 @@ class DshTarget:
             result.note(f"{path.parent.name}：供应商配置已是最新")
             return False
 
+        # 落盘前先确认 dump 出来的是合法的顶层数组，且我们的 provider 真在里面
+        from ruamel.yaml import YAML as CheckYAML
+
+        check = CheckYAML(typ="safe").load(new_text)
+        if not isinstance(check, list):
+            raise ValueError("回读校验失败：写出的补丁不是顶层数组")
+        check_entry = self._find_entry(check, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME)
+        check_providers = (check_entry or {}).get("config", {}).get("providers", {})
+        check_provider = check_providers.get(provider_key) if isinstance(check_providers, dict) else None
+        if not isinstance(check_provider, dict) or check_provider.get("apiKeyEnv") != constants.DSH_CREDENTIAL_KEY:
+            raise ValueError(f"回读校验失败：写出的补丁里找不到 provider {provider_key}")
+
         backup.backup_file(path, "dsh-profile")
-        path.write_text(new_text, encoding="utf-8")
+        write_text_atomic(path, new_text)
         result.note(f"已更新供应商配置 {path}")
         logger.info("DSH profile 已更新：%s", path)
         return True
@@ -362,7 +375,9 @@ class DshTarget:
         - 站点能读到模型列表时，以站点列表为准，但内容仍优先用清单里的完整条目。
         """
 
-        canonical = {str(model["id"]): dict(model) for model in constants.DEFAULT_MODELS}
+        # deepcopy：DEFAULT_MODELS 是模块级常量，浅拷贝会让嵌套的 input / reasoningEfforts
+        # 和常量共享对象，将来谁改一下就会污染全局。
+        canonical = {str(model["id"]): copy.deepcopy(model) for model in constants.DEFAULT_MODELS}
         base: list[dict] = []
         if isinstance(existing, list):
             for item in existing:
@@ -373,15 +388,15 @@ class DshTarget:
                 ):
                     model_id = str(item["id"])
                     if model_id in canonical:
-                        base.append(dict(canonical[model_id]))
+                        base.append(copy.deepcopy(canonical[model_id]))
                         continue
-                    entry = dict(item)
+                    entry = copy.deepcopy(item)
                     name = str(entry.get("name") or "").strip()
                     if not name or name == constants.PROVIDER_DISPLAY_NAME:
                         entry["name"] = f"{entry['id']} (THU)"
                     base.append(entry)
         if not base:
-            base = [dict(model) for model in constants.DEFAULT_MODELS]
+            base = [copy.deepcopy(model) for model in constants.DEFAULT_MODELS]
 
         if not fetched:
             return base

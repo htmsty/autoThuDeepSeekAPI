@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import paths
+
 logger = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
@@ -59,10 +61,8 @@ class BackupManager:
         return raw if isinstance(raw, list) else []
 
     def _save_index(self, entries: list[dict]) -> None:
-        self.index_path.write_text(
-            json.dumps(entries, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        # 原子写：索引被写坏会让"一键还原"找不到任何备份
+        paths.write_text_atomic(self.index_path, json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
 
     def entries(self) -> list[BackupEntry]:
         result: list[BackupEntry] = []

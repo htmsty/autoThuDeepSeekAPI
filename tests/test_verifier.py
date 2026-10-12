@@ -55,7 +55,7 @@ class VerifierTest(unittest.TestCase):
     def test_falls_back_to_chat_when_endpoint_shape_is_unknown(self) -> None:
         self._stub(
             [
-                (200, b"<html>not json</html>", ""),
+                (200, b"not json at all", ""),  # 不是 JSON，但也不是网页 → 值得再核对一次
                 (200, b'{"choices": []}', ""),
             ]
         )
@@ -63,6 +63,15 @@ class VerifierTest(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(len(self.calls), 2)
         self.assertIn("/v1/chat/completions", self.calls[1][0])
+
+    def test_html_reply_skips_the_slow_chat_probe(self) -> None:
+        """站点回网页（没登录 / 接口变了）时别再打一次模型请求白等 30 秒。"""
+
+        self._stub([(200, b"<!doctype html><html><body>login</body></html>", "")])
+        result = verifier.verify_token("tok")
+        self.assertIsNone(result.ok)
+        self.assertTrue(result.looks_like_html)
+        self.assertEqual(len(self.calls), 1, "回网页时不该再打模型请求")
 
 
 if __name__ == "__main__":

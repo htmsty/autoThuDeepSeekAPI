@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .. import constants
 from ..backup import BackupManager
-from ..paths import TargetPaths
+from ..paths import TargetPaths, write_text_atomic
 from ..token.jwt_utils import looks_like_jwt
 from .base import ApplyResult, TargetStatus
 
@@ -50,8 +50,7 @@ def _write_json(path: Path, data: dict, backup: BackupManager, label: str) -> bo
         return False
     if path.exists():
         backup.backup_file(path, label)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_text, encoding="utf-8")
+    write_text_atomic(path, new_text)
     return True
 
 

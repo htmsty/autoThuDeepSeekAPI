@@ -45,9 +45,14 @@ def setup_logging(level: int = logging.INFO) -> Path:
 
     formatter = logging.Formatter(LOG_FORMAT)
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
+    # 日志写不进去不该拖垮程序（只读目录、共享目录断掉都可能发生）
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError:  # pragma: no cover - 依赖具体环境
+        pass
 
     ui_handler = QtLogHandler()
     ui_handler.setFormatter(formatter)

@@ -55,6 +55,8 @@ class MainWindow(QMainWindow):
         # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
         try:
             self.settings.launch_at_startup = startup.is_enabled()
+            if self.settings.launch_at_startup:
+                startup.sync_command()
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取开机启动状态失败：%s", exc)
 

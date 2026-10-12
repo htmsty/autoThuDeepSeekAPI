@@ -13,6 +13,9 @@ dist/
 build/_work/
 *.spec.bak
 
+# 留档的发行版单文件程序（体积太大，不进 Git；只有 releases/README.md 进仓库）
+releases/*/
+
 # 编辑器与系统
 .idea/
 .vscode/

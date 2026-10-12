@@ -25,6 +25,7 @@ class VerifyResult:
     ok: bool | None
     detail: str
     status: int | None = None
+    looks_like_html: bool = False
 
 
 def _request(
@@ -82,7 +83,10 @@ def _light_verdict(token: str, timeout: int) -> VerifyResult:
     try:
         payload = json.loads(body.decode("utf-8", "replace"))
     except ValueError:
-        return VerifyResult(None, "校验接口没有返回预期的 JSON", status)
+        text = body[:64].decode("utf-8", "replace").lstrip()
+        html_like = text.startswith("<")
+        detail = "校验接口返回的是网页而不是 JSON（多半没登录或接口变了）" if html_like else "校验接口没有返回预期的 JSON"
+        return VerifyResult(None, detail, status, looks_like_html=html_like)
     if not isinstance(payload, dict) or not isinstance(payload.get("success"), bool):
         return VerifyResult(None, "校验接口的返回结构不是预期的样子", status)
     if payload["success"]:
@@ -122,6 +126,9 @@ def verify_token(token: str, model_id: str | None = None, timeout: int | None = 
 
     # 连不上站点时没必要再打一次：结论同样是"未知"，只是白等更久。
     if light.status is None:
+        return light
+    # 站点回的是网页（SPA / 登录页）时，再发一次对话请求也是白等 30 秒。
+    if light.looks_like_html:
         return light
 
     logger.info("会话校验未给出结论（%s），改用最小对话请求核对", light.detail)

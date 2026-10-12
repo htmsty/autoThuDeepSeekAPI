@@ -55,8 +55,12 @@ class SettingsDialog(QDialog):
         self.dsh_dir_edit.setPlaceholderText(str(paths.default_dsh_dir()))
         targets_form.addRow("DSH 目录", self._path_row(self.dsh_dir_edit, self._browse_dsh))
 
-        self.unify_profiles = QCheckBox("统一所有 profile 到 madmodel（默认只写已配置 madmodel 的 profile）")
+        self.unify_profiles = QCheckBox("统一所有 profile 到 madmodel（不勾选时只写已配置 madmodel 的 profile）")
         self.unify_profiles.setChecked(settings.unify_all_profiles)
+        self.unify_profiles.setToolTip(
+            "勾选：所有 profile 都写，并把默认模型切到 madmodel / DeepSeek-V4.1-Flash。\n"
+            "不勾：只更新已配置 madmodel 的 profile，默认模型保持你在 DSH 里选的那个。"
+        )
         targets_form.addRow(self.unify_profiles)
 
         self.ccswitch_enabled = QCheckBox("启用 CC Switch 写入（供应商卡片 + 当前路由）")
@@ -130,14 +134,40 @@ class SettingsDialog(QDialog):
         return container
 
     def _browse_dsh(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "选择 DSH 目录", str(paths.default_dsh_dir()))
+        chosen = QFileDialog.getExistingDirectory(self, "选择 DSH 目录", self._start_dir(self.dsh_dir_edit, paths.default_dsh_dir()))
         if chosen:
             self.dsh_dir_edit.setText(chosen)
 
     def _browse_ccswitch(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "选择 CC Switch 目录", str(paths.default_ccswitch_dir()))
+        chosen = QFileDialog.getExistingDirectory(
+            self, "选择 CC Switch 目录", self._start_dir(self.ccswitch_dir_edit, paths.default_ccswitch_dir())
+        )
         if chosen:
             self.ccswitch_dir_edit.setText(chosen)
+
+    @staticmethod
+    def _start_dir(edit: QLineEdit, fallback: Path) -> str:
+        current = edit.text().strip()
+        if current and Path(current).is_dir():
+            return current
+        return str(fallback)
+
+    def accept(self) -> None:  # noqa: D102 - QDialog 约定
+        problems: list[str] = []
+        for label, edit in (("DSH", self.dsh_dir_edit), ("CC Switch", self.ccswitch_dir_edit)):
+            value = edit.text().strip()
+            if value and not Path(value).is_dir():
+                problems.append(f"{label}：{value}")
+        if problems:
+            answer = QMessageBox.question(
+                self,
+                "目录不存在",
+                "这些自定义目录现在打不开，仍要保存吗？\n\n" + "\n".join(problems),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        super().accept()
 
     # —— 动作 ——
 

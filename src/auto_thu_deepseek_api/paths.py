@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import constants
+
+# 每次调用都去探测一次可写性太费（共享目录上尤其慢），而且两个实例同时探测时
+# 同名探针文件可能互相踩到，导致误判"不可写"、数据被分流到 LOCALAPPDATA。这里缓存一次。
+_DATA_ROOT_CACHE: Path | None = None
 
 
 def is_frozen() -> bool:
@@ -30,7 +35,7 @@ def app_dir() -> Path:
 def _is_writable(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".write-probe"
+        probe = path / f".write-probe-{os.getpid()}"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         return True
@@ -41,12 +46,48 @@ def _is_writable(path: Path) -> bool:
 def data_root() -> Path:
     """运行数据根目录：优先程序目录下的 private/，不可写时退回 LOCALAPPDATA。"""
 
+    global _DATA_ROOT_CACHE
+    if _DATA_ROOT_CACHE is not None:
+        return _DATA_ROOT_CACHE
+
     portable = app_dir() / "private"
-    if _is_writable(portable):
-        return portable
-    fallback = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / constants.APP_NAME / "private"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    local = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / constants.APP_NAME / "private"
+    for candidate in (portable, local):
+        if _is_writable(candidate):
+            _DATA_ROOT_CACHE = candidate
+            return candidate
+
+    # 最后兜底到临时目录：至少让程序跑得起来，而不是启动即崩。
+    last_resort = Path(tempfile.gettempdir()) / constants.APP_NAME / "private"
+    last_resort.mkdir(parents=True, exist_ok=True)
+    _DATA_ROOT_CACHE = last_resort
+    return last_resort
+
+
+def reset_data_root_cache() -> None:
+    """仅供测试：清掉缓存，让下一次重新探测。"""
+
+    global _DATA_ROOT_CACHE
+    _DATA_ROOT_CACHE = None
+
+
+def write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """先写 .tmp 再替换，避免写到一半崩掉把原文件弄成半截。
+
+    目标被别的进程占着（Windows 上 os.replace 会报错）时退回直接写，宁可牺牲原子性也不能不写。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        path.write_text(text, encoding=encoding)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def logs_dir() -> Path:

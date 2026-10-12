@@ -86,12 +86,8 @@ class AppSettings:
     def save(self) -> None:
         self.normalize()
         path = paths.settings_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = asdict(self)
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        paths.write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def normalize(self) -> None:
         try:

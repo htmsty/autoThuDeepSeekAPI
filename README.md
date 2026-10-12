@@ -30,6 +30,9 @@
 
 ### 设置里的「统一所有 profile 到 madmodel」
 
+**默认是勾上的**（想让 DSH 用官方 DeepSeek 或自己挑模型时再取消；取消后不会被重新勾上，
+只有从 0.1.4 之前的版本升级上来时会自动勾选一次）。
+
 | 勾选情况 | 程序会做什么 |
 | --- | --- |
 | 不勾（默认） | 只更新**已经配置过 madmodel** 的 profile（正文里有清华站点域名、`madmodel:` 或 `MADMODEL_API_KEY` 才算）：写 `apiKeyEnv` 与 `models`。**默认模型保持你在 DSH 里选的那个**，其它 profile 一律不碰。 |

@@ -49,6 +49,9 @@ main 启动
 DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Switch 运行中策略与提示开关、
 备份保留份数。
 
+设置文件带 `settings_version`：v2 起「统一所有 profile 到 madmodel」默认勾选，
+读到 v1（没有版本号）的旧设置时**一次性**迁移成勾选并写回，之后用户手动取消不会再被打回。
+
 ### `token/`
 - `jwt_utils.py`：不验签解码 JWT，取 `exp` 算剩余时间。
 - `capture.py`：QtWebEngine 内置窗口。页面脚本在 `DocumentCreation` 注入，

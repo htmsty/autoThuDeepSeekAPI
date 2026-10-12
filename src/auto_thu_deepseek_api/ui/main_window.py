@@ -52,6 +52,12 @@ class MainWindow(QMainWindow):
         self._browser_profile = None
         self._tray_hint_shown = False
 
+        # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
+        try:
+            self.settings.launch_at_startup = startup.is_enabled()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取开机启动状态失败：%s", exc)
+
         self.setWindowTitle(constants.APP_DISPLAY_NAME)
         self.setWindowIcon(app_icon())
         self.resize(880, 640)
@@ -296,10 +302,18 @@ class MainWindow(QMainWindow):
 
     def quit_app(self) -> None:
         self._quitting = True
+        self._auto_timer.stop()
         if self._capture is not None:
             self._capture.cancel()
-        if self._sync_worker is not None and self._sync_worker.isRunning():
-            self._sync_worker.wait(3000)
+        worker = self._sync_worker
+        if worker is not None and worker.isRunning():
+            # QThread 还在跑就销毁进程会直接崩，这里等一会儿；真等不到再强制收尾。
+            logger.info("退出前等待同步线程结束…")
+            if not worker.wait(5000):
+                logger.warning("同步线程 5 秒内没有结束，强制终止")
+                worker.terminate()
+                worker.wait(2000)
+        self._sync_worker = None
         self.settings.save()
         self.state.save()
         self.tray.hide()
@@ -417,7 +431,12 @@ class MainWindow(QMainWindow):
         self._capture.cancelled.connect(self._on_capture_cancelled)
         if silent:
             logger.info("开始静默取 Token（自动同步）")
-        self._capture.start()
+        try:
+            self._capture.start()
+        except Exception as exc:  # noqa: BLE001 - 起不来的话不能把 _capture 留在那儿
+            logger.exception("打开取 Token 流程失败")
+            self._capture = None
+            self.notify(f"取 Token 失败：{exc}", warning=True)
 
     def _on_token_captured(self, token: str) -> None:
         self._capture = None

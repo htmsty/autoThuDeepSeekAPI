@@ -215,7 +215,13 @@ class TokenCaptureSession(QObject):
 
     def _on_cookie_added(self, cookie) -> None:  # noqa: ANN001 - Qt 类型
         try:
-            value = bytes(cookie.value()).decode("utf-8", "replace")
+            raw = cookie.value()
+            if isinstance(raw, str):
+                value = raw
+            elif isinstance(raw, (bytes, bytearray)):
+                value = raw.decode("utf-8", "replace")
+            else:  # QByteArray 之类
+                value = bytes(raw).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
             return
         if looks_like_jwt(value):

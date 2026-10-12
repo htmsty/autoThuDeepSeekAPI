@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 
 from . import paths
@@ -11,10 +12,15 @@ from .constants import DEFAULT_SYNC_INTERVAL_MINUTES
 CCSWITCH_POLICY_PROMPT = "prompt"
 CCSWITCH_POLICY_DIRECT = "direct"
 
+# 设置文件版本。v2 起「统一所有 profile 到 madmodel」默认勾选（v1 的存量设置会被迁移一次）。
+SETTINGS_VERSION = 2
+
 
 @dataclass
 class AppSettings:
     """所有可调项。空字符串表示"自动探测"。"""
+
+    settings_version: int = SETTINGS_VERSION
 
     # 同步
     sync_interval_minutes: int = DEFAULT_SYNC_INTERVAL_MINUTES
@@ -32,7 +38,7 @@ class AppSettings:
     ccswitch_dir: str = ""
 
     # DSH 细节
-    unify_all_profiles: bool = False
+    unify_all_profiles: bool = True
 
     # CC Switch 细节
     ccswitch_running_policy: str = CCSWITCH_POLICY_PROMPT
@@ -57,9 +63,23 @@ class AppSettings:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return cls()
+        version = raw.get("settings_version")
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            version = 1
         known = {f for f in cls.__dataclass_fields__}
         data = {k: v for k, v in raw.items() if k in known}
         settings = cls(**data)
+        if version < SETTINGS_VERSION:
+            # v1 → v2：默认勾选「统一所有 profile 到 madmodel」。只迁一次，
+            # 之后再手动取消勾选就不会被打回。
+            settings.unify_all_profiles = True
+            settings.settings_version = SETTINGS_VERSION
+            settings.save()
+            logging.getLogger(__name__).info(
+                "设置已升级到 v%d：默认勾选「统一所有 profile 到 madmodel」", SETTINGS_VERSION
+            )
         settings.normalize()
         return settings
 

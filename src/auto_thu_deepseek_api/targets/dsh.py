@@ -233,7 +233,14 @@ class DshTarget:
         name = path.parent.name
 
         if found is None:
-            if constants.DSH_PROVIDER_KEY in providers:
+            occupied = providers.get(constants.DSH_PROVIDER_KEY)
+            if occupied is not None and not isinstance(occupied, dict):
+                result.fail(
+                    f"{name}：providers.madmodel 已被其它配置占用"
+                    "（它的 apiKeyEnv 与 baseURL 都不指向清华站点），按约定不覆盖它"
+                )
+                return False
+            if isinstance(occupied, dict) and occupied:
                 result.fail(
                     f"{name}：providers.madmodel 已被其它配置占用"
                     "（它的 apiKeyEnv 与 baseURL 都不指向清华站点），按约定不覆盖它"
@@ -245,9 +252,11 @@ class DshTarget:
             provider["api"] = "openai-completions"
             provider["reasoning"] = "medium"
             provider["baseURL"] = constants.MADMODEL_API_BASE
+            provider_key = constants.DSH_PROVIDER_KEY
             result.note(f"{name}：已新建 provider madmodel")
         else:
             key, provider = found
+            provider_key = key
             result.note(f"{name}：已找到 provider {key}")
 
         # 只合并我们负责的字段：apiKeyEnv 与 models。其余字段只在缺失时补上，
@@ -272,9 +281,9 @@ class DshTarget:
             provider["displayName"] = constants.PROVIDER_DISPLAY_NAME
 
         if self.unify_all_profiles:
-            self._point_default_model(data, merged)
+            self._point_default_model(data, merged, provider_key)
         else:
-            self._repair_default_model(data, merged)
+            self._repair_default_model(data, merged, provider_key)
 
         import io
 
@@ -395,7 +404,7 @@ class DshTarget:
             )
         return merged or base
 
-    def _repair_default_model(self, data: list, models: list[dict]) -> None:
+    def _repair_default_model(self, data: list, models: list[dict], provider_key: str) -> None:
         """默认模型指向 madmodel 时，保证它的 model 是真实存在的模型 id。
 
         用户在 DSH 界面里换过 provider 又没换 model 时，会留下
@@ -411,13 +420,13 @@ class DshTarget:
         if entry is None:
             return
         config = entry.get("config")
-        if not isinstance(config, dict) or config.get("provider") != constants.DSH_PROVIDER_KEY:
+        if not isinstance(config, dict) or config.get("provider") != provider_key:
             return
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
             config["model"] = model_ids[0]
 
-    def _point_default_model(self, data: list, models: list[dict]) -> None:
+    def _point_default_model(self, data: list, models: list[dict], provider_key: str) -> None:
         entry = self._find_entry(
             data,
             constants.DSH_DEFAULT_MODEL_ENTRY_ID,
@@ -434,7 +443,7 @@ class DshTarget:
         if not isinstance(config, dict):
             config = {}
             entry["config"] = config
-        config["provider"] = constants.DSH_PROVIDER_KEY
+        config["provider"] = provider_key
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
             # 换 provider 时必须一起换 model，否则会留下"指着 madmodel 却填别的模型 id"的组合

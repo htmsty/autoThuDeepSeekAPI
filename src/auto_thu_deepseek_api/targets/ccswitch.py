@@ -146,21 +146,66 @@ class CcSwitchTarget:
             backup.backup_sqlite(db, "ccswitch-db")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                if row is None:
+                # 拿到写锁后再核对一次：预判与真正开写之间，别人可能刚改过这张卡片。
+                fresh = connection.execute(
+                    "SELECT settings_config, meta, name, is_current FROM providers WHERE id = ? AND app_type = ?",
+                    (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
+                ).fetchone()
+                insert_mode = fresh is None
+                if insert_mode:
+                    card_needs_write = True
+                else:
+                    raw_settings, raw_meta, name, is_current = fresh
+                    settings_config = self._json_object(raw_settings)
+                    meta = self._json_object(raw_meta)
+                    # 注意：这里必须分开调用，不能写成 a() or b() ——
+                    # 短路会让 b() 根本不执行，meta（apiFormat）就会一直漏写。
+                    changed_settings = self._update_settings_config(settings_config, token, models)
+                    changed_meta = self._update_meta(meta)
+                    card_needs_write = (
+                        changed_settings
+                        or changed_meta
+                        or name != constants.PROVIDER_DISPLAY_NAME
+                        or (has_current and is_current != 1)
+                    )
+                current_fix = bool(has_current and self._other_current_cards(connection))
+                refresh_targets = self._collect_refresh_targets(connection, token)
+                if not card_needs_write and not current_fix and not refresh_targets:
+                    connection.rollback()
+                    result.note("加锁后发现已经是最新，未改动 CC Switch 数据库")
+                    return
+
+                if insert_mode:
+                    insert_columns = [
+                        "id",
+                        "app_type",
+                        "name",
+                        "settings_config",
+                        "website_url",
+                        "category",
+                        "created_at",
+                        "sort_index",
+                        "meta",
+                    ]
+                    insert_values: list[object] = [
+                        constants.CCSWITCH_PROVIDER_ID,
+                        constants.CCSWITCH_APP_TYPE,
+                        constants.PROVIDER_DISPLAY_NAME,
+                        json.dumps(settings_config, ensure_ascii=False),
+                        constants.MADMODEL_ORIGIN,
+                        "custom",
+                        0,
+                        json.dumps(meta, ensure_ascii=False),
+                    ]
+                    placeholders = ["?", "?", "?", "?", "?", "?", "strftime('%s','now')*1000", "?", "?"]
+                    if has_current:
+                        # 旧版 CC Switch 没有 is_current 这一列，有才写
+                        insert_columns.append("is_current")
+                        placeholders.append("1")
                     connection.execute(
-                        "INSERT INTO providers (id, app_type, name, settings_config, website_url, category,"
-                        " created_at, sort_index, meta, is_current)"
-                        " VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now')*1000, ?, ?, 1)",
-                        (
-                            constants.CCSWITCH_PROVIDER_ID,
-                            constants.CCSWITCH_APP_TYPE,
-                            constants.PROVIDER_DISPLAY_NAME,
-                            json.dumps(settings_config, ensure_ascii=False),
-                            constants.MADMODEL_ORIGIN,
-                            "custom",
-                            0,
-                            json.dumps(meta, ensure_ascii=False),
-                        ),
+                        f"INSERT INTO providers ({', '.join(insert_columns)})"
+                        f" VALUES ({', '.join(placeholders)})",
+                        tuple(insert_values),
                     )
                     result.note("已新建 CC Switch 供应商卡片 DeepSeek (THU)")
                 elif card_needs_write:

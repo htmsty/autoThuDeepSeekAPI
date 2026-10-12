@@ -128,6 +128,47 @@ class TargetTestCase(unittest.TestCase):
         self.assertIn("madmodel", web)
         self.assertIn("provider: madmodel", web)
 
+    def test_unify_points_default_model_at_the_provider_we_updated(self) -> None:
+        """统一时默认模型要指向真正被更新的那个 provider，而不是死写 madmodel。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(
+            """# local forward + unify
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      thu-local:
+        displayName: 我的中转
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/v1
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: tsinghua
+    model: "1"
+""",
+            encoding="utf-8",
+        )
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            ),
+            unify_all_profiles=True,
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="safe").load(profile.read_text(encoding="utf-8"))
+        entries = {entry["id"]: entry for entry in data}
+        self.assertEqual(entries["agent-default-model"]["config"]["provider"], "thu-local")
+        self.assertEqual(entries["agent-default-model"]["config"]["model"], "DeepSeek-V4.1-Flash")
+
     def test_dsh_repairs_crossed_fields(self) -> None:
         """DSH 界面把显示名/模型 id 写串时，要能被修回可用的样子。"""
 

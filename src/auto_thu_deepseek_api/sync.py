@@ -12,6 +12,7 @@ from .settings import AppSettings
 from .targets import ApplyResult, CcSwitchTarget, DshTarget
 from .targets.base import TargetStatus
 from .token import site_models
+from .token.jwt_utils import fingerprint
 from .token.verifier import VerifyResult, verify_token
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,11 @@ def run_sync(
 
     if verify:
         report.verified = verify_token(token, models[0]["id"] if models else None)
-        logger.info("Token 校验：%s", report.verified.detail)
+        logger.info(
+            "Token 校验（向站点发起会话校验请求，指纹 %s）：%s",
+            fingerprint(token),
+            report.verified.detail,
+        )
         if report.verified.ok is False:
             report.skipped.append("Token 被站点拒绝，未写入任何目标")
             return report

@@ -1,5 +1,53 @@
 # 更新记录
 
+## 2.3 — 修"发消息报 doesn't support reasoning effort medium"
+
+### 根因（在 DSH 本体 app.asar 里找到的原文）
+
+```js
+const reasoning = resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning);
+```
+
+请求没带显式思考档时会**回落到 provider 的 `reasoning`**；我们之前固定写 `medium`，
+而 `DeepSeek-V4.1-Flash` 只声明 `low/high/max`，于是 `resolveReasoningLevel` 直接抛
+`pi-ai provider "madmodel" model "DeepSeek-V4.1-Flash" does not support reasoning effort "medium"`。
+第一次运行最容易踩到：那时 `agent-default-model` 里还没有 `reasoningEffort`，一定走回落。
+
+### 修法（三条一起，避免再出现同类问题）
+
+1. **provider 级 `reasoning` 只写所有模型都支持的档位**（取各模型 `reasoningEfforts` 的交集；
+   没有公共档位就干脆不写，交给 pi-ai 自己决定）。当前两个模型的交集是 `low`，
+   所以原来写死的 `medium` 会改成 `low`。
+2. **默认模型总是带显式且合法的 `reasoningEffort`**：已有值合法就保留，非法/缺失时按
+   `high → max → medium → low → xhigh → minimal` 挑一个该模型支持的档位。
+   （`DeepSeek-V4.1-Flash` 会选 `high`；它同时支持 `max`。）
+3. **预检新增两条断言**：provider 的 `reasoning` 必须被所有模型支持；默认模型的
+   `reasoningEffort` 必须在所选模型的支持集合里。任一不满足就拦住这次写入。
+
+### 顺带把日志口径说清楚
+
+- `凭据里的 MADMODEL_API_KEY 与本次相同（指纹 xxxxxxxx），无需改写；本目标不做网络校验`
+  —— 这句只是"文件里的值和本次拿到的一样"，不发起任何请求；Token 有效性由另一条日志负责。
+- Token 校验那条日志改成 `Token 校验（向站点发起会话校验请求，指纹 xxxxxxxx）：站点确认 Token 可用`，
+  一眼能看出到底哪一步真的问了站点。
+
+### 本机真实配置已修
+
+| profile | provider.reasoning | 默认模型 / 思考档 |
+| --- | --- | --- |
+| desktop | `medium` → `low`（公共档位） | `DeepSeek-V4.1-Flash` / `max`（原本合法，保留） |
+| web | `medium` → `low` | `DeepSeek-V4.1-Flash` / `high`（原来没写，已补） |
+
+改动前都留了备份（`private/manual-backup/20261013-223026/` 与 `private/backups/`）。
+
+### 验证
+
+| 项目 | 结果 |
+| --- | --- |
+| 单元测试 | 56 项全绿（新增：思考档挑选、公共档位、用户报错场景回归、日志口径） |
+| 真实配置复检 | 两份 profile 的 provider 档位与默认模型档位都落在支持集合内 |
+| 打包版自检 | 文件夹版与单文件版 `--selftest` 通过 |
+
 ## 2.2 — 再一轮大范围排查与加固
 
 ### 修掉的 bug（这一轮排查出来的）

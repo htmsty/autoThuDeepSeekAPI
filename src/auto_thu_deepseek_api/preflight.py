@@ -123,6 +123,7 @@ def _check_profile(text: str) -> tuple[bool, str]:
         problems.append("api 为空")
 
     model_ids: list[str] = []
+    supported_by_model: dict[str, set[str]] = {}
     models = provider.get("models")
     if not isinstance(models, list) or not models:
         problems.append("models 为空")
@@ -150,8 +151,24 @@ def _check_profile(text: str) -> tuple[bool, str]:
                     value not in constants.THINKING_LEVELS for value in efforts.values()
                 ):
                     problems.append(f"{model_id} 的 reasoningEfforts 不合法")
+                elif isinstance(efforts, dict):
+                    supported_by_model[model_id] = {str(level) for level in efforts.keys()}
         if len(model_ids) != len(set(model_ids)):
             problems.append("模型 id 有重复")
+
+    # provider 级 reasoning 是"请求没带思考档时的兜底"：必须所有模型都支持，
+    # 否则 DSH 会直接抛 UNSUPPORTED_REASONING_EFFORT（用户第一次运行就踩过这个坑）。
+    provider_reasoning = provider.get("reasoning")
+    if provider_reasoning:
+        unsupported = [
+            model_id
+            for model_id, supported in supported_by_model.items()
+            if supported and provider_reasoning not in supported
+        ]
+        if unsupported:
+            problems.append(
+                f"provider 的 reasoning={provider_reasoning} 不被这些模型支持：{'、'.join(unsupported)}"
+            )
 
     default_entry = entries.get(constants.DSH_DEFAULT_MODEL_ENTRY_ID)
     default_config = (default_entry or {}).get("config") if isinstance(default_entry, dict) else None
@@ -161,6 +178,18 @@ def _check_profile(text: str) -> tuple[bool, str]:
             problems.append(f"默认模型指向的 provider 不存在：{provider_of_default!r}")
         elif provider_of_default == provider_key and default_config.get("model") not in model_ids:
             problems.append(f"默认模型的 model 不在清单里：{default_config.get('model')!r}")
+        elif provider_of_default == provider_key:
+            chosen = str(default_config.get("model") or "")
+            supported = supported_by_model.get(chosen, set())
+            effort = default_config.get("reasoningEffort")
+            if supported and effort is None:
+                problems.append(
+                    f"默认模型 {chosen} 没写思考档，DSH 会回落到 provider 的 reasoning"
+                )
+            elif supported and effort not in supported:
+                problems.append(
+                    f"默认模型的思考档 {effort!r} 不被 {chosen} 支持（支持：{sorted(supported)}）"
+                )
 
     if problems:
         return False, "；".join(problems)

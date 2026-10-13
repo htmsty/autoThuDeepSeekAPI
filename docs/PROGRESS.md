@@ -9,6 +9,7 @@
 | 2.0 | 全面排查 bug 并修复，发布第二个大版本；跑通"取 Token → 校验 → 写入 → 备份还原"全流程 | ✅ 已发布（提交 `0e2b338`，tag `v2.0`，单文件版留档 `releases/2.0/`） |
 | 2.1 | 发布后校验"将要写入模型文件的内容"是否合法；一键还原 / 手动备份按钮；增多可配置项 | ✅ 已完成，待提交（tag `v2.1`） |
 | 2.2 | 再一轮大范围 bug 排查与加固 | ✅ 已完成（tag `v2.2`，单文件版留档 `releases/2.2/`） |
+| 2.3 | 修"发消息报 reasoning effort medium 不被接受"；思考档不再写模型不支持的档位 | ✅ 已完成（tag `v2.3`） |
 
 两个版本的**单文件程序**都要留档在 `releases/<版本>/`（不进 Git：单文件 180 MB 超过 GitHub
 单文件 100 MB 上限，改用 `releases/<版本>/SHA256.txt` 记录校验和）。
@@ -85,6 +86,22 @@
   多重兜底（Web Storage / fetch / XHR / Cookie / 页面文本）与"取不到就如实报错"。
 
 ## 后续排查清单（下一轮按需再走）
+
+## 2.3 阶段（本轮）
+
+### 已完成
+
+1. **定位根因**：DSH 本体里 `resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning)`
+   —— 没有显式思考档时会回落到 provider 的 `reasoning`，而 `DeepSeek-V4.1-Flash` 只支持
+   `low/high/max`，所以固定写 `medium` 必然报 `UNSUPPORTED_REASONING_EFFORT`；第一次运行
+   还没写 `agent-default-model.reasoningEffort`，一定走回落，所以"第一次运行"最容易中招。
+2. **三条修法**：provider 级 `reasoning` 取所有模型支持档位的交集（没有就不写）；
+   默认模型总是写显式且合法的 `reasoningEffort`；预检把这两条作为硬性检查。
+3. **日志口径**：把"无需改写"那句明确成文件比对（带 Token 指纹、注明不做网络校验），
+   并把真正的站点校验那条日志标成"向站点发起会话校验请求"。
+4. **真实配置已修**：desktop/web 的 `provider.reasoning` 由 `medium` 改为 `low`，
+   web 的默认模型补上 `high`；改动前留底。
+5. 测试 52 → 56 项；打包并留档 `releases/2.3/`，提交并打 tag `v2.3`。
 
 **回归与边界**
 

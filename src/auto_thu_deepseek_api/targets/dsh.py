@@ -13,6 +13,7 @@ from ruamel.yaml import YAML
 from .. import constants
 from ..backup import BackupManager
 from ..paths import TargetPaths
+from ..token.jwt_utils import fingerprint
 from .base import ApplyResult, RenderedFile, TargetStatus, emit, write_with_rollback
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,12 @@ class DshTarget:
             raise ValueError("凭据文件的 refs 不是映射")
 
         if not rebuilt and refs.get(constants.DSH_CREDENTIAL_KEY) == token:
-            result.note("凭据里的 MADMODEL_API_KEY 已是该 Token，无需改动")
+            # 这句只说明"文件里的值和本次拿到的一样、不用改写"，不涉及任何网络请求；
+            # Token 有效性由 sync.run_sync 里的「Token 校验」负责，所以这里带上指纹方便对账。
+            result.note(
+                "凭据里的 MADMODEL_API_KEY 与本次相同（指纹 "
+                f"{fingerprint(token)}），无需改写；本目标不做网络校验"
+            )
             return False
 
         label = "dsh-credentials-broken" if rebuilt else "dsh-credentials"
@@ -299,6 +305,16 @@ class DshTarget:
         if merged:
             provider["models"] = merged
 
+        # provider 级 reasoning 是"请求没带思考档时的兜底默认"——DSH 里是
+        # resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning)。
+        # 只要这个值有哪个模型不支持，请求就会直接报 UNSUPPORTED_REASONING_EFFORT，
+        # 所以这里只写"所有已注册模型都支持"的档位；没有公共档位就干脆不写。
+        safe_reasoning = self._safe_provider_reasoning(merged or [])
+        if safe_reasoning:
+            provider["reasoning"] = safe_reasoning
+        else:
+            provider.pop("reasoning", None)
+
         # 名称是空、或被写成了某个模型 id（DSH 界面把字段填串的典型样子）才纠正，
         # 用户自己起的名字不动。
         display_name = str(provider.get("displayName") or "").strip()
@@ -473,6 +489,59 @@ class DshTarget:
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
             config["model"] = self._preferred_model_id(model_ids)
+        self._ensure_default_effort(config, models)
+
+    # —— 思考档（reasoning effort）——
+
+    @staticmethod
+    def _supported_efforts(model: dict | None) -> list[str]:
+        """这个模型声明了哪些思考档。"""
+
+        efforts = (model or {}).get("reasoningEfforts")
+        if not isinstance(efforts, dict):
+            return []
+        return [str(level) for level in efforts.keys() if str(level) in constants.THINKING_LEVELS]
+
+    @classmethod
+    def _pick_effort(cls, supported: list[str]) -> str:
+        """从支持的档位里挑一个当默认：思考得够用，但不顶到最贵。"""
+
+        for level in ("high", "max", "medium", "low", "xhigh", "minimal"):
+            if level in supported:
+                return level
+        return supported[0] if supported else ""
+
+    @classmethod
+    def _safe_provider_reasoning(cls, models: list[dict]) -> str:
+        """provider 级默认真要写时，只能写所有模型都支持的档位。"""
+
+        sets = [set(cls._supported_efforts(model)) for model in models]
+        sets = [item for item in sets if item]
+        if not sets:
+            return ""
+        common = set.intersection(*sets)
+        if not common:
+            return ""
+        for level in ("medium", "high", "low", "max", "xhigh", "minimal"):
+            if level in common:
+                return level
+        return sorted(common)[0]
+
+    def _ensure_default_effort(self, config: dict, models: list[dict]) -> None:
+        """默认模型的思考档必须是该模型支持的——不支持就换一个支持的。
+
+        这正是"第一次运行就报 doesn't support reasoning effort medium"的根因：
+        没有显式档位时会回落到 provider 的 reasoning，而 DeepSeek-V4.1-Flash 只支持 low/high/max。
+        """
+
+        model_id = str(config.get("model") or "")
+        model = next((item for item in models if str(item.get("id")) == model_id), None)
+        supported = self._supported_efforts(model)
+        if not supported:
+            return  # 该模型没有思考档，别硬写
+        if config.get("reasoningEffort") in supported:
+            return
+        config["reasoningEffort"] = self._pick_effort(supported)
 
     def _preferred_model_id(self, model_ids: list[str]) -> str:
         """设置里指定了默认模型就用它，否则用清单里的第一个。"""
@@ -503,4 +572,5 @@ class DshTarget:
         if model_ids and config.get("model") not in model_ids:
             # 换 provider 时必须一起换 model，否则会留下"指着 madmodel 却填别的模型 id"的组合
             config["model"] = self._preferred_model_id(model_ids)
+        self._ensure_default_effort(config, models)
 

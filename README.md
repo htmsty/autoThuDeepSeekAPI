@@ -47,6 +47,22 @@
 默认模型是否指向存在的 provider 与 model。**预检不通过时，这次就跳过对应目标的写入**——
 宁可少写一次，也不写坏文件。设置里可以关掉"同步前预检"，也可以随时用「校验写入内容」手动跑一次。
 
+### 思考档（reasoning）怎么写的
+
+DSH 在请求没带显式思考档时会回落到 provider 的 `reasoning`
+（本体代码：`resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning)`）。
+如果这个值有哪个模型不支持，DSH 会直接报 `does not support reasoning effort "…"`，
+所以程序按这两条规则写：
+
+- provider 级 `reasoning` 只写**所有已注册模型都支持**的档位（取交集；当前两个模型的交集是
+  `low`）。没有公共档位就干脆不写，交给 pi-ai 自己决定。你自己往 provider 里加模型后，
+  下次同步会重新算一遍。
+- `agent-default-model` **总是**带一个显式且合法的 `reasoningEffort`：已有值合法就保留，
+  非法或缺失时按 `high → max → medium → low → xhigh → minimal` 挑一个该模型支持的档位
+  （`DeepSeek-V4.1-Flash` 会选 `high`；它同时支持 `max`）。
+
+这两条也进了预检：不满足就拦住这次写入，不会再出现"第一次运行发消息就报思考档不支持"。
+
 ### 设置里的「统一所有 profile 到 madmodel」
 
 **默认是勾上的**（想让 DSH 用官方 DeepSeek 或自己挑模型时再取消；取消后不会被重新勾上，

@@ -84,3 +84,21 @@ def describe_remaining(token: str) -> str:
         return f"剩余 {hours} 小时 {minutes} 分"
     return f"剩余 {minutes} 分"
 
+
+def fingerprint(token: str) -> str:
+    """给 Token 算一段 16 位十六进制指纹。
+
+    只用来在日志里确认"两处是不是同一个 Token"，**不能**反推 Token 本身；
+    算法与 thu-tok-auto 的 tokenFp 一致（两轮 32 位 FNV-1a 混合）。
+    """
+
+    if not token:
+        return ""
+    first = 0x811C9DC5
+    second = 0x01000193
+    for index, char in enumerate(token):
+        code = ord(char)
+        first = ((first ^ code) * 0x01000193) & 0xFFFFFFFF
+        second = ((second ^ (code + index)) * 0x85EBCA6B) & 0xFFFFFFFF
+    return f"{first:08x}{second:08x}"
+

@@ -192,7 +192,13 @@ class TargetTestCase(unittest.TestCase):
         entries = {entry["id"]: entry for entry in data}
         provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
         self.assertEqual(provider["displayName"], "DeepSeek (THU)")
-        self.assertEqual(provider["reasoning"], "medium")
+        # provider 级 reasoning 只能是所有模型都支持的档位（否则请求会被 DSH 直接拒掉）
+        supported_sets = [
+            {str(level) for level in model["reasoningEfforts"].keys()}
+            for model in provider["models"]
+            if model.get("reasoningEfforts")
+        ]
+        self.assertIn(provider.get("reasoning"), set.intersection(*supported_sets))
         ids = [model["id"] for model in provider["models"]]
         self.assertEqual(ids, ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
         self.assertEqual(provider["models"][0]["name"], "DeepSeek-V4.1-Flash (THU)")
@@ -230,6 +236,128 @@ class TargetTestCase(unittest.TestCase):
         entries = {entry["id"]: entry for entry in data}
         provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
         self.assertEqual([model["id"] for model in provider["models"]], ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
+
+    # —— 思考档：用户报的 "does not support reasoning effort medium" ——
+
+    def test_pick_effort_prefers_supported_levels(self) -> None:
+        self.assertEqual(DshTarget._pick_effort(["low", "high", "max"]), "high")
+        self.assertEqual(DshTarget._pick_effort(["low", "medium", "xhigh"]), "medium")
+        self.assertEqual(DshTarget._pick_effort(["minimal"]), "minimal")
+        self.assertEqual(DshTarget._pick_effort([]), "")
+
+    def test_safe_provider_reasoning_only_uses_common_levels(self) -> None:
+        models = [
+            {"id": "A", "reasoningEfforts": {"low": "low", "high": "high", "max": "max"}},
+            {"id": "B", "reasoningEfforts": {"low": "low", "medium": "medium", "xhigh": "xhigh"}},
+        ]
+        self.assertEqual(DshTarget._safe_provider_reasoning(models), "low", "只有 low 是公共档位")
+        self.assertEqual(DshTarget._safe_provider_reasoning([{"id": "A", "reasoningEfforts": {"high": "high"}}]), "high")
+        self.assertEqual(DshTarget._safe_provider_reasoning([{"id": "A"}, {"id": "B"}]), "", "都没有档位就别写")
+        self.assertEqual(
+            DshTarget._safe_provider_reasoning(
+                [
+                    {"id": "A", "reasoningEfforts": {"high": "high"}},
+                    {"id": "B", "reasoningEfforts": {"low": "low"}},
+                ]
+            ),
+            "",
+            "没有公共档位就不写 provider 级 reasoning",
+        )
+
+    def test_dsh_writes_only_supported_reasoning(self) -> None:
+        """复现用户第一次运行就报错的场景：provider reasoning=medium + DeepSeek-V4.1-Flash 只支持 low/high/max。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(
+            """# 第一次运行的样子
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: DeepSeek (THU)
+        api: openai-completions
+        reasoning: medium
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        apiKeyEnv: MADMODEL_API_KEY
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: qwen3.8-27b
+            name: qwen3.8-27b (THU)
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              xhigh: xhigh
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: madmodel
+    model: DeepSeek-V4.1-Flash
+""",
+            encoding="utf-8",
+        )
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="rt").load(profile.read_text(encoding="utf-8"))
+        entries = {entry["id"]: entry for entry in data}
+        provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
+        supported_sets = [
+            {str(level) for level in model["reasoningEfforts"].keys()}
+            for model in provider["models"]
+            if model.get("reasoningEfforts")
+        ]
+        common = set.intersection(*supported_sets)
+        self.assertIn(provider.get("reasoning"), common, "provider 级 reasoning 必须所有模型都支持")
+
+        config = entries["agent-default-model"]["config"]
+        chosen = next(model for model in provider["models"] if model["id"] == config["model"])
+        self.assertIn(
+            config.get("reasoningEffort"),
+            {str(level) for level in chosen["reasoningEfforts"].keys()},
+            "默认模型必须显式写一个它支持的思考档",
+        )
+
+    def test_credentials_note_says_it_is_not_a_validation(self) -> None:
+        """日志里"已是该 Token，无需改动"只是文件比对，不是 API 校验——文案要说清楚。"""
+
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        first = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(first.ok, first.errors)
+
+        second = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        note = next((message for message in second.messages if "无需改写" in message), "")
+        self.assertTrue(note, second.messages)
+        self.assertIn("本目标不做网络校验", note)
+        self.assertIn("指纹", note)
 
     def test_dsh_updates_provider_behind_local_forward(self) -> None:
         """provider 走本地转发（127.0.0.1/v1）时，按 apiKeyEnv 认出来，不再建重复的。"""

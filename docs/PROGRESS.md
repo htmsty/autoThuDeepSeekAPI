@@ -103,6 +103,20 @@
    web 的默认模型补上 `high`；改动前留底。
 5. 测试 52 → 56 项；打包并留档 `releases/2.3/`，提交并打 tag `v2.3`。
 
+### 待办（推送被网络挡住）
+
+- 本地提交 `92184e9`（已 rebase 到你手改的 `4060add Update README` 之上）与本地 tag `v2.3`
+  都已就绪，但 `github.com:443` 连续多次连不上，`git push origin main` 与
+  `git push --force origin v2.3` 都没成功。
+- 恢复网络后需要按顺序执行：
+
+  ```powershell
+  git push origin main
+  git push --force origin v2.3   # 远端那个 v2.3 还指向 rebase 前的旧对象
+  ```
+
+- 另外顺手清掉了误提交的垃圾文件 `$null`（bash 里 `2>$null` 被当成重定向写出来的）。
+
 **回归与边界**
 
 - [ ] 全量回归：把 2.0 / 2.1 之后的改动在脏数据、并发、权限不足、断网、超时五种情况下各走一遍

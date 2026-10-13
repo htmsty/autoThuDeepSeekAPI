@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -27,10 +28,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import paths, startup
+from .. import paths, startup, uninstall
 from ..backup import BackupManager
 from ..constants import DEFAULT_MODELS
-from ..settings import CCSWITCH_POLICY_DIRECT, CCSWITCH_POLICY_PROMPT, AppSettings
+from ..settings import (
+    CCSWITCH_POLICY_DIRECT,
+    CCSWITCH_POLICY_PROMPT,
+    AppSettings,
+    reset_to_defaults,
+)
 from ..token.jwt_utils import looks_like_jwt
 
 logger = logging.getLogger(__name__)
@@ -130,6 +136,42 @@ class SettingsDialog(QDialog):
         self.paste_button.clicked.connect(self._paste_token)
         backup_layout.addWidget(self.paste_button)
         layout.addWidget(backup_box)
+
+        # —— 运行数据与维护 ——
+        maintenance_box = QGroupBox("运行数据与维护")
+        maintenance_layout = QVBoxLayout(maintenance_box)
+
+        private_row = QHBoxLayout()
+        private_row.addWidget(QLabel("private 数据文件夹"))
+        # 用只读输入框而不是 QLabel：长路径不会把整个对话框撑出横向滚动条，也能直接选中复制
+        self.private_path_label = QLineEdit(str(paths.data_root()))
+        self.private_path_label.setReadOnly(True)
+        self.private_path_label.setCursorPosition(0)
+        self.private_path_label.setToolTip(
+            "Token、设置、状态、日志、备份和浏览器会话都放在这里。\n"
+            "默认在程序目录旁；也可以放到别处（比如不放桌面、不放系统盘）。"
+        )
+        private_row.addWidget(self.private_path_label, 1)
+        self.private_button = QPushButton("更改位置…")
+        self.private_button.setToolTip("把运行数据搬到别的文件夹（重启后生效）")
+        self.private_button.clicked.connect(self._change_private_dir)
+        private_row.addWidget(self.private_button)
+        maintenance_layout.addLayout(private_row)
+
+        maintain_row = QHBoxLayout()
+        self.defaults_button = QPushButton("恢复默认设置")
+        self.defaults_button.setToolTip("把所有设置恢复成程序默认值（开机启动项不动）")
+        self.defaults_button.clicked.connect(self._restore_defaults)
+        self.uninstall_button = QPushButton("干净卸载…")
+        self.uninstall_button.setToolTip(
+            "可选还原 DSH / CC Switch 到首次备份，然后清掉程序的全部运行数据（不删程序自己）"
+        )
+        self.uninstall_button.clicked.connect(self._clean_uninstall)
+        maintain_row.addWidget(self.defaults_button)
+        maintain_row.addWidget(self.uninstall_button)
+        maintain_row.addStretch(1)
+        maintenance_layout.addLayout(maintain_row)
+        layout.addWidget(maintenance_box)
 
         # —— 更多 ——
         more_box = QGroupBox("更多")
@@ -289,6 +331,169 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "创建桌面快捷方式", message)
         else:
             QMessageBox.warning(self, "创建桌面快捷方式", message)
+
+    # —— 运行数据位置 / 维护 ——
+
+    def _change_private_dir(self) -> None:
+        """把 private 运行数据换到别的文件夹（重启后生效）。"""
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "choose_private_dir"):
+            parent.choose_private_dir()
+        else:  # pragma: no cover - 正常都有主窗口
+            QMessageBox.information(
+                self, "更改 private 位置", "请从主界面打开设置后再更改 private 位置。"
+            )
+        self.private_path_label.setText(str(paths.data_root()))
+
+    def _request_restart(self) -> None:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "restart_app"):
+            parent.restart_app()
+        else:  # pragma: no cover - 正常都有主窗口
+            QMessageBox.information(self, "重启程序", "请手动关闭再打开程序，新位置才会生效。")
+
+    def _restore_defaults(self) -> None:
+        """一键恢复默认设置（开机启动项不动；private 位置会另外问）。"""
+
+        if QMessageBox.question(
+            self,
+            "恢复默认设置",
+            "将把设置恢复成默认值：\n"
+            "· 自动同步：开，间隔 180 分钟，启动时立即同步：开\n"
+            "· 统一所有 profile 到 madmodel：勾选\n"
+            "· 同步前预检：开；CC Switch 运行中：不弹提醒、直接改\n"
+            "· 备份保留 10 份；静默取 Token 超时 40 秒；日志级别 INFO；关窗最小化到托盘\n\n"
+            "开机启动项（注册表）保持现状，不会被动。\n确定恢复吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        settings = reset_to_defaults(self.settings)
+        settings.save()
+        logger.info("设置已恢复为默认值")
+
+        self._reset_widgets_to_defaults()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "apply_settings_to_ui"):
+            parent.apply_settings_to_ui()
+        QMessageBox.information(self, "恢复默认设置", "已恢复默认设置。")
+        self._offer_reset_private_dir()
+
+    def _reset_widgets_to_defaults(self) -> None:
+        """把对话框里的控件刷成当前 settings 的值（恢复默认后立刻能看到）。"""
+
+        settings = self.settings
+        self.dsh_enabled.setChecked(settings.enable_dsh)
+        self.dsh_dir_edit.setText(settings.dsh_dir)
+        self.unify_profiles.setChecked(settings.unify_all_profiles)
+        self.ccswitch_enabled.setChecked(settings.enable_ccswitch)
+        self.ccswitch_dir_edit.setText(settings.ccswitch_dir)
+        if settings.ccswitch_running_policy == CCSWITCH_POLICY_DIRECT:
+            self.policy_direct.setChecked(True)
+        else:
+            self.policy_prompt.setChecked(True)
+        self.suppress_warning.setChecked(settings.suppress_ccswitch_running_warning)
+        self.keep_spin.setValue(settings.backup_keep)
+        self.preflight_check.setChecked(settings.preflight_enabled)
+        self.close_to_tray_check.setChecked(settings.close_to_tray)
+        self.silent_timeout_spin.setValue(settings.silent_capture_timeout_seconds)
+        self.default_model_combo.setCurrentText(
+            settings.default_model_id or str(DEFAULT_MODELS[0]["id"])
+        )
+        self.log_level_combo.setCurrentText(settings.log_level)
+        self.private_path_label.setText(str(paths.data_root()))
+
+    def _offer_reset_private_dir(self) -> None:
+        """恢复默认设置的联动：问一句要不要把 private 位置也还原。"""
+
+        if paths.read_private_override() is None:
+            return
+        current = paths.data_root()
+        if QMessageBox.question(
+            self,
+            "恢复默认设置",
+            f"private 数据文件夹现在在：\n{current}\n\n"
+            "要顺便还原成默认位置（程序目录旁）吗？\n"
+            "还原同样要搬数据并重启程序，确定的话现在就开始搬。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok, message = paths.switch_private_root(paths.default_private_dir())
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            QMessageBox.warning(self, "恢复默认设置", message)
+            return
+        logger.info(message)
+        self.private_path_label.setText(str(paths.data_root()))
+        if QMessageBox.question(
+            self,
+            "恢复默认设置",
+            message + "\n\n现在重启程序吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self._request_restart()
+
+    def _clean_uninstall(self) -> None:
+        """干净卸载：二次确认，可选还原 DSH / CC Switch，只删程序自己的东西。"""
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_busy") and parent._busy():
+            QMessageBox.warning(
+                self, "干净卸载", "正在同步或正在取 Token，等它结束（或强行终止）再卸载。"
+            )
+            return
+        if QMessageBox.warning(
+            self,
+            "干净卸载",
+            "将清掉程序的全部运行数据：Token、设置、状态、日志、备份、浏览器会话、模型缓存、提醒状态。\n\n"
+            "程序自身的 exe **不会**被删除（需要你自己手动删）。\n"
+            "自选目录里属于你自己的文件也不会动，只会删程序管理的那几项。\n\n继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        restore = QMessageBox.question(
+            self,
+            "干净卸载",
+            "要把 DSH / CC Switch 还原到本程序**第一次修改之前**的备份吗？\n\n"
+            "风险：会覆盖这两个应用当前的配置，正在用的模型/令牌可能一起被换回旧值；\n"
+            "如果它们正在运行，建议先退出。\n\n"
+            "选「No」= 只清程序自己的运行数据，不动 DSH / CC Switch。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if QMessageBox.warning(
+            self,
+            "干净卸载",
+            "最后确认：清掉之后无法恢复（备份也会一起删掉）。现在执行吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        ok, lines = uninstall.clean_uninstall(
+            self.settings, restore_targets=(restore == QMessageBox.StandardButton.Yes)
+        )
+        detail = "\n".join(lines) or "没有需要清理的内容。"
+        if not ok:
+            detail += "\n\n（有几项没删干净，详见上面的说明。）"
+        QMessageBox.information(
+            self,
+            "干净卸载",
+            detail
+            + "\n\n请手动删除程序文件：\n"
+            + uninstall.program_exe_hint()
+            + "\n\n程序现在会退出。",
+        )
+
+        if parent is not None and hasattr(parent, "quit_after_uninstall"):
+            parent.quit_after_uninstall()
+        else:  # pragma: no cover - 正常都有主窗口
+            self.reject()
 
     # —— 结果 ——
 

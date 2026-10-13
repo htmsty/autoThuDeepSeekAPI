@@ -15,6 +15,9 @@ class AppState:
     last_token_at: str = ""
     last_verified_at: str = ""
     last_status: str = ""
+    # 启动提醒的"已处理"状态（按用户要求写在 private 里，处理过就不再提醒）
+    desktop_note_ack: bool = False  # 程序在桌面根目录的提醒
+    targets_note_ack: bool = False  # DSH / CC Switch 都没检出的提醒
 
     @classmethod
     def load(cls) -> "AppState":

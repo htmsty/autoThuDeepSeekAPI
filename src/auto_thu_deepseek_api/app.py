@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
 
 from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from . import constants, paths
+from . import constants, paths, startup
 from .logging_setup import setup_logging
 from .settings import AppSettings
 from .state_store import AppState
@@ -45,6 +46,11 @@ def main(argv: list[str] | None = None) -> int:
     application.setQuitOnLastWindowClosed(False)
 
     paths.ensure_runtime_dirs()
+    # 上次换过 private 位置的话，把旧位置里的残留补删一下（删不掉不影响使用）
+    try:
+        paths.finish_pending_migration()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("补清理旧 private 位置失败：%s", exc)
     setup_logging()
 
     lock = _single_instance_guard()
@@ -80,10 +86,20 @@ def main(argv: list[str] | None = None) -> int:
     else:
         window.show()
 
-    if settings.sync_on_start:
-        QTimer.singleShot(1200, lambda: window.start_sync(interactive=False))
-        logger.info("启动后 1.2 秒自动同步一次")
+    # 启动检查（程序在桌面 / 两个目标都没装）走完再决定要不要同步；
+    # 顺序固定：先"程序在桌面"，再"都没装"。
+    QTimer.singleShot(300, window.startup_then_sync)
+    logger.info("启动检查与自动同步将在窗口显示后开始")
 
     logger.info("%s %s 已启动（作者：%s）", constants.APP_DISPLAY_NAME, constants.APP_VERSION, constants.APP_AUTHOR)
-    return application.exec()
+    code = application.exec()
+
+    if window.restart_requested:
+        try:
+            command = startup.launch_command()
+            subprocess.Popen(command, cwd=str(paths.app_dir()))  # noqa: S603 - 拉起自己
+            logger.info("已按你的要求重新启动程序")
+        except OSError as exc:
+            logger.warning("自动重启失败，请手动打开程序：%s", exc)
+    return code
 

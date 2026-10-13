@@ -12,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, QUrl, Signal, QObject
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QLabel, QMainWindow, QVBoxLayout, QWidget
 
 from .. import constants
@@ -22,6 +23,17 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL_MS = 1200
 DEFAULT_INTERACTIVE_TIMEOUT_S = 300
 DEFAULT_SILENT_TIMEOUT_S = 40
+
+
+class CaptureWindow(QMainWindow):
+    """登录窗口。用户自己点 X 关掉时要能让上层知道（否则状态会一直卡在"正在取 Token"）。"""
+
+    user_closed = Signal()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
+        super().closeEvent(event)
+        if event.isAccepted():
+            self.user_closed.emit()
 
 # 页面脚本：只读，不点击。
 CAPTURE_SCRIPT = r"""
@@ -149,6 +161,8 @@ class TokenCaptureSession(QObject):
         self._view: QWebEngineView | None = None
         if not silent:
             self._window, self._view = self._build_window()
+            if isinstance(self._window, CaptureWindow):
+                self._window.user_closed.connect(self._on_window_closed)
 
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_INTERVAL_MS)
@@ -163,7 +177,7 @@ class TokenCaptureSession(QObject):
     # —— 界面 ——
 
     def _build_window(self) -> tuple[QMainWindow, QWebEngineView]:
-        window = QMainWindow()
+        window = CaptureWindow()
         window.setWindowTitle(f"登录清华 MadModel — {constants.APP_DISPLAY_NAME}")
         window.resize(980, 760)
 
@@ -181,6 +195,18 @@ class TokenCaptureSession(QObject):
         layout.addWidget(view, 1)
         window.setCentralWidget(central)
         return window, view
+
+    def _on_window_closed(self) -> None:
+        """用户点 X 关掉了登录窗口：按"取消本次取 Token"处理。
+
+        以前这里什么都不做，`_capture` 会一直留着，之后每次同步都被当成"还在忙"忽略掉。
+        """
+
+        if self._finished:
+            return
+        logger.info("用户关闭了登录窗口，取消本次取 Token")
+        self.finish()
+        self.cancelled.emit()
 
     # —— 生命周期 ——
 

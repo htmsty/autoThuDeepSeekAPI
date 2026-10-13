@@ -44,6 +44,19 @@ main 启动
 程序目录、`private/` 根目录、各默认目标路径与探测辅助。程序目录不可写时自动退回
 `%LOCALAPPDATA%\autoThuDeepSeekAPI`。**不写死任何机器相关的位置。**
 
+private 的位置**可以改**（2.5 起）：
+
+- 解析顺序：位置指针 → 程序目录下的 `private/` → `%LOCALAPPDATA%` → 临时目录兜底。
+- 指针文件：`%LOCALAPPDATA%\autoThuDeepSeekAPI\private-location.json`，只记 `path` 与
+  `migrated_from`。放在 `LOCALAPPDATA` 的原因：不能放在 private 里（换了位置就找不回来），
+  也尽量不在桌面留文件；「干净卸载」会删掉它。
+- `validate_private_dir()` 拒绝系统目录（Windows / System32）、Program Files、ProgramData、
+  盘符根、临时目录、桌面，并要求可写。
+- `switch_private_root()`：把 `MANAGED_ENTRIES` 复制到新位置 → 写指针 → 尽力清掉旧位置，
+  用户自己的文件不动、目录不整个删；`finish_pending_migration()` 在下次启动时补删残留。
+- `MANAGED_ENTRIES` 是"程序自己的东西"的唯一定义：设置、状态、模型缓存、锁、日志、备份、
+  浏览器会话。换位置与卸载都按它来。
+
 ### `settings.py`
 用户设置（JSON）：同步间隔、自动同步、开机启动、启动即同步、同步后最小化、
 DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Switch 运行中策略与提示开关、
@@ -123,11 +136,26 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 给界面用的封装：手动备份、一键还原、以及 `auto_backup_on_first_run()`——
 程序第一次运行时给每个目标文件留一份带 `original` 标记的原始备份，重复调用不会重复记账。
 
+### `uninstall.py`
+「干净卸载」：可选先还原 DSH / CC Switch 到第一次备份，再按 `paths.MANAGED_ENTRIES`
+清掉程序自己的运行数据与位置指针。**不删程序自身**（界面提示用户手动删），
+只用正常的文件操作，不写自删除脚本、不调用 `rd` / `del` / `reg`。
+
+### `procinfo.py`
+查当前在跑的进程名（`tasklist`，查一次缓存一次）。只用于"某个程序到底装没装"这类判断：
+装了但还没生成配置文件时，进程名是一条有用的线索。
+
 ### `startup.py`
 开机启动（HKCU 的 Run 项）与桌面快捷方式。启动时会核对注册表实际值：路径变了自动纠正，
 值为空（被别处写坏）直接重写。`create_desktop_shortcut()` 用系统自带的
 PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以免中文/空格被命令行弄坏，
-并隐藏子进程窗口。
+并隐藏子进程窗口。`is_app_on_desktop()` 判断程序是不是**直接**在桌面根目录（子文件夹不算），
+`launch_command()` 供"重启程序"用。
+
+### `state_store.py`
+`state.json`（在 private 里）：最近 Token、时间戳、上次同步摘要，以及两条启动提醒的
+"已处理"标记（`desktop_note_ack` / `targets_note_ack`）——按需求写在 private，
+所以它们也会随"换位置"一起搬走、被"干净卸载"一起清掉。
 
 ### `sync.py`
 编排：校验 Token → 逐个目标探测 → 备份 → 写入 → 汇总报告。不依赖 Qt，可单独测试。
@@ -136,13 +164,28 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 "CC Switch 正在运行"对话框关闭后会**再查一次**，避免等待对话框期间自动同步已经跑起来、
 又被点一次按钮导致两轮同步并行。
 
+2.5 起还负责两件事：
+
+- **安全终止**：`run_sync(..., cancel_event=...)` 在步骤之间检查取消信号（校验前后、
+  每个目标之前），被取消时如实标记 `report.cancelled` 并停止，不会留下写了一半的文件。
+  界面上的「强行终止并重试」走的就是这条路，**从不**调用 `QThread.terminate()`。
+- **启动提醒的判据**：`target_traces()` / `both_targets_missing()` 判断 DSH 与 CC Switch
+  是不是"一点痕迹都没有"（配置目录、进程、常见安装目录任一命中就算有），
+  只有真的两边都没有才提醒"先安装"。
+
 ### `ui/`
 - `main_window.py`：状态区 + 操作按钮（含「创建桌面快捷方式」）+ 设置项 + 日志视图 + 托盘。
   托盘图标左键开窗、右键菜单；关闭窗口即隐藏到托盘。
+  启动流程（2.5 起）：`startup_then_sync()` → 先 `_check_desktop_private()`（程序在桌面根目录
+  时提醒一次，三个选择），再 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
+  都通过才跑"启动时立即同步"。两条提醒的"已处理"状态写在 private 的 `state.json` 里。
+  「强行终止并重试」也在这里：`_ask_force_retry()` + `_retry_after_stop`。
 - `settings_dialog.py`：**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
   千万不要再造第二个 `QVBoxLayout(self)`：后建的会把先挂的布局顶掉，对话框会变成空窗口
   （2.4 踩过一次，`test_settings_dialog_is_actually_openable` 是这条的回归用例）。
+  2.5 起多了「运行数据与维护」一块：private 位置（+ 更改位置）、恢复默认设置、干净卸载。
 - `workers.py`：把同步放到 `QThread`，避免界面卡死。
+  `request_cancel()` 只是给同步流程一个"请停下"的信号（协作式取消，见 `sync.py`）。
 
 ## 每一步要做什么（里程碑）
 

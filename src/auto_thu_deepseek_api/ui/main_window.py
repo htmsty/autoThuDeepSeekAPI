@@ -11,7 +11,9 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -31,7 +33,7 @@ from .. import backup_ops, constants, paths, preflight, startup
 from ..logging_setup import log_bus
 from ..settings import CCSWITCH_POLICY_DIRECT, AppSettings
 from ..state_store import AppState
-from ..sync import SyncReport, detect_targets
+from ..sync import SyncReport, both_targets_missing, detect_targets
 from ..targets.ccswitch import is_running as ccswitch_is_running
 from ..token.capture import TokenCaptureSession, build_profile
 from ..token.jwt_utils import describe_expiry, is_expired
@@ -52,6 +54,11 @@ class MainWindow(QMainWindow):
         self._capture: TokenCaptureSession | None = None
         self._browser_profile = None
         self._tray_hint_shown = False
+        # 「强行终止并重试」：等当前同步线程安全停下后再补一次同步
+        self._retry_after_stop = False
+        # private 位置改了要重启才生效；干净卸载后不要再把设置写回磁盘
+        self._restart_requested = False
+        self._skip_save_on_quit = False
 
         # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
         try:
@@ -281,6 +288,9 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() != SettingsDialog.DialogCode.Accepted:
             return
+        if self._skip_save_on_quit or self._quitting:
+            # 设置对话框里刚做过"干净卸载"或正在退出：别再写设置文件，否则刚删的会被建回来
+            return
         dialog.apply_to(self.settings)
         self.settings.save()
         logger.info("设置已保存")
@@ -310,6 +320,172 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "创建桌面快捷方式", message)
         else:
             QMessageBox.warning(self, "创建桌面快捷方式", message)
+
+    # —— 启动检查（先"程序在桌面"，再"两个目标都没装"） ——
+
+    def startup_then_sync(self) -> None:
+        """启动后的第一件事：先跑两条提醒，再决定要不要跑启动同步。"""
+
+        if not self.run_startup_checks():
+            return
+        if self.settings.sync_on_start:
+            logger.info("启动后自动同步一次")
+            self.start_sync(interactive=False)
+        else:
+            logger.info("设置里关掉了「启动时立即同步」，本次不自动同步")
+
+    def run_startup_checks(self) -> bool:
+        """返回 True 表示可以继续这次启动同步。"""
+
+        if not self._check_desktop_private():
+            return False
+        return self._check_targets_missing()
+
+    def _check_desktop_private(self) -> bool:
+        """程序直接在桌面根目录时提醒用户；返回 False 表示已经退出程序。"""
+
+        if self.state.desktop_note_ack:
+            return True
+        if paths.read_private_override() is not None:
+            # private 已经挪到别处，桌面不会再生成它，不用提醒
+            return True
+        if not startup.is_app_on_desktop():
+            return True
+
+        logger.info("程序放在桌面根目录，提醒用户 private 数据文件夹会建在桌面上")
+        box = QMessageBox(self)
+        box.setWindowTitle("程序放在桌面上运行")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("程序现在直接放在桌面上，继续运行会在桌面生成并使用 private 数据文件夹。")
+        box.setInformativeText(
+            f"private 里放着 Token、设置、备份和浏览器会话（默认位置：{paths.data_root()}）。\n"
+            "请不要删除它，删了这些数据就没了。\n"
+            "建议把它放到别的地方，例如 D 盘一个固定的文件夹。"
+        )
+        choose_button = box.addButton("选择 private 位置…", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("仍然继续", QMessageBox.ButtonRole.DestructiveRole)
+        leave_button = box.addButton("退出程序去换位置", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is leave_button:
+            logger.info("用户选择退出程序去换位置（不记「已处理」，下次仍会提醒）")
+            self.quit_app()
+            return False
+        if clicked is choose_button and not self.choose_private_dir():
+            return True  # 没选成，下次启动再提醒
+
+        self.state.desktop_note_ack = True
+        self.state.save()
+        logger.info("已记住「程序在桌面」这件事，以后不再提醒")
+        return True
+
+    def _check_targets_missing(self) -> bool:
+        """DSH 与 CC Switch 都没检出时提醒一次并跳过这次同步；返回是否继续同步。"""
+
+        missing, traces = both_targets_missing(self.settings)
+        if not missing:
+            return True
+        logger.info("DSH 与 CC Switch 都没有痕迹，跳过这次同步：%s", traces)
+        if not self.state.targets_note_ack:
+            box = QMessageBox(self)
+            box.setWindowTitle("没有检测到 DSH / CC Switch")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                "未检测到 DSH / CC Switch 的配置：如果已安装，请先分别运行一次让它们生成配置然后退出，"
+                "或在上方指定路径，"
+            )
+            box.setInformativeText("这一次同步已经跳过。")
+            box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
+            box.exec()
+            self.state.targets_note_ack = True
+            self.state.save()
+            logger.info("已提醒过「都没检出」，以后不再弹这个提醒")
+        return False
+
+    def choose_private_dir(self) -> bool:
+        """选一个新的 private 位置并搬过去。返回是否搬成功。"""
+
+        if self._busy():
+            QMessageBox.warning(
+                self, "更改 private 位置", "正在同步或正在取 Token，等它结束再改 private 位置。"
+            )
+            return False
+        current = paths.data_root()
+        chosen = QFileDialog.getExistingDirectory(self, "选择 private 数据文件夹", str(current))
+        if not chosen:
+            return False
+        target = Path(chosen)
+        ok, message = paths.validate_private_dir(target)
+        if not ok:
+            QMessageBox.warning(self, "更改 private 位置", message)
+            return False
+        if QMessageBox.question(
+            self,
+            "更改 private 位置",
+            "会把现在的运行数据（Token、设置、状态、日志、备份、浏览器会话）复制到：\n"
+            f"{target}\n\n"
+            "复制后需要重启程序才生效；旧位置里属于程序的文件会顺手清掉，"
+            "你自己放在那里的文件不会动。\n\n现在开始搬吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return False
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok, message = paths.switch_private_root(target)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not ok:
+            QMessageBox.warning(self, "更改 private 位置", message)
+            return False
+
+        logger.info(message)
+        if QMessageBox.question(
+            self,
+            "更改 private 位置",
+            message + "\n\n现在重启程序吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self.restart_app()
+        return True
+
+    # —— 维护动作 ——
+
+    def apply_settings_to_ui(self) -> None:
+        """把 settings 的值刷到主界面控件上（「恢复默认设置」之后要立刻看到）。"""
+
+        for widget, value in (
+            (self.sync_on_start_check, self.settings.sync_on_start),
+            (self.auto_sync_check, self.settings.auto_sync_enabled),
+            (self.minimize_after_check, self.settings.minimize_after_sync),
+        ):
+            widget.blockSignals(True)
+            widget.setChecked(value)
+            widget.blockSignals(False)
+        self.interval_spin.blockSignals(True)
+        self.interval_spin.setValue(self.settings.sync_interval_minutes)
+        self.interval_spin.blockSignals(False)
+        self._apply_auto_timer()
+        self.refresh_status()
+
+    def restart_app(self) -> None:
+        """重启自己（private 位置改了需要重启才生效）。"""
+
+        self._restart_requested = True
+        logger.info("按要求重启程序")
+        self.quit_app()
+
+    @property
+    def restart_requested(self) -> bool:
+        return self._restart_requested
+
+    def quit_after_uninstall(self) -> None:
+        """干净卸载后退出：不要再写设置/状态，否则刚删掉的文件会被重新创建。"""
+
+        self._skip_save_on_quit = True
+        logger.info("干净卸载完成，退出程序（不再写回设置文件）")
+        self.quit_app()
 
     # —— 预检 / 备份 / 还原 ——
 
@@ -432,15 +608,18 @@ class MainWindow(QMainWindow):
             self._capture.cancel()
         worker = self._sync_worker
         if worker is not None and worker.isRunning():
-            # QThread 还在跑就销毁进程会直接崩，这里等一会儿；真等不到再强制收尾。
-            logger.info("退出前等待同步线程结束…")
-            if not worker.wait(5000):
-                logger.warning("同步线程 5 秒内没有结束，强制终止")
+            # QThread 还在跑就销毁进程会直接崩。先请它在步骤之间安全停下，再等它；
+            # 只有实在等不到才强制收尾（这时可能正在写文件，日志里必须说清）。
+            logger.info("退出前请同步线程在安全位置停下…")
+            worker.request_cancel()
+            if not worker.wait(20000):
+                logger.warning("同步线程 20 秒内没有停下，只能强制结束（可能正在写文件）")
                 worker.terminate()
                 worker.wait(2000)
         self._sync_worker = None
-        self.settings.save()
-        self.state.save()
+        if not self._skip_save_on_quit:
+            self.settings.save()
+            self.state.save()
         self.tray.hide()
         self.close()
         from PySide6.QtWidgets import QApplication
@@ -485,8 +664,16 @@ class MainWindow(QMainWindow):
 
     def start_sync(self, interactive: bool = True) -> None:
         if self._busy():
-            logger.info("上一次同步还没结束，忽略这次请求")
-            return
+            logger.info("上一次同步还没结束，询问是否强行终止并重试")
+            if not self._ask_force_retry():
+                return
+            # 强行终止只是"请它停下"：取 Token 能立刻取消；同步线程会在步骤之间停下。
+            # 线程还没结束就先记一笔，等它真正结束再重试（见 _on_sync_thread_finished）。
+            worker = self._sync_worker
+            if worker is not None and worker.isRunning():
+                self._retry_after_stop = True
+                logger.info("已请求安全停止，等它结束后自动重试")
+                return
         if interactive and not self._ask_about_ccswitch():
             return
         # 上面那个对话框是阻塞的，等待期间自动同步可能已经跑起来了，这里再确认一次
@@ -500,6 +687,36 @@ class MainWindow(QMainWindow):
             self._open_capture(silent=False)
             return
         self._open_capture(silent=not interactive)
+
+    def _ask_force_retry(self) -> bool:
+        """上一次还没结束时问用户：强行终止并按原样重试，还是取消。"""
+
+        box = QMessageBox(self)
+        box.setWindowTitle("上一次同步还没结束")
+        box.setIcon(QMessageBox.Icon.Warning)
+        if self._capture is not None:
+            box.setText("上一次取 Token 还没结束（登录窗口可能还开着）。")
+        else:
+            box.setText("上一次同步还在处理，目标文件可能正写到一半。")
+        box.setInformativeText(
+            "「强行终止并重试」会在安全的位置停下当前动作，然后重新开始同步。\n"
+            "正在写入的那一份文件会先写完（失败会自动回滚），不会写坏配置。"
+        )
+        force_button = box.addButton("强行终止并重试", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not force_button:
+            logger.info("用户取消了强行终止")
+            return False
+
+        if self._capture is not None:
+            # 取 Token 的取消是同步完成的，cancel() 里会把 _capture 清掉
+            self._capture.cancel()
+        worker = self._sync_worker
+        if worker is not None and worker.isRunning():
+            logger.info("已请求同步线程安全停止（不杀线程）")
+            worker.request_cancel()
+        return True
 
     def _should_capture_silently(self, interactive: bool) -> bool:
         """自动同步时是否静默取 Token。
@@ -622,6 +839,10 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self.state.remember_status(summary)
         self.refresh_status()
+        if report.cancelled:
+            # 是我们自己请它停下的，别弹"同步完成"的通知吓人
+            logger.info("同步已按你的要求安全停下")
+            return
         logger.info("同步完成：%s", summary)
         self.notify(summary, warning=not report.ok)
         if self.settings.minimize_after_sync:
@@ -634,4 +855,14 @@ class MainWindow(QMainWindow):
     def _on_sync_thread_finished(self) -> None:
         self.sync_button.setEnabled(True)
         self._sync_worker = None
+        if self._retry_after_stop:
+            self._retry_after_stop = False
+            logger.info("上一次同步已安全停下，按你的要求重新开始")
+            # 用绑定方法而不是 lambda：窗口已经关掉/程序正在退出时，这里能立刻安全返回
+            QTimer.singleShot(0, self._retry_sync_now)
+
+    def _retry_sync_now(self) -> None:
+        if self._quitting:
+            return
+        self.start_sync(interactive=True)
 

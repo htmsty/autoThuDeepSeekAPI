@@ -12,6 +12,7 @@
 | 2.3 | 修"发消息报 reasoning effort medium 不被接受"；思考档不再写模型不支持的档位 | ✅ 已完成（tag `v2.3`） |
 | 2.4 | 首次运行直接开窗口；首次备份永不清；默认自动同步/180 分钟/不弹提醒；Token 显示到期时刻；桌面快捷方式 | ✅ 已发布（tag `v2.4`）；**设置界面有 bug，勿用，见 2.4.1** |
 | 2.4.1 | 修「设置界面打不开」；把创建桌面快捷方式提到主界面；大检查 | ✅ 已完成（tag `v2.4.1`，留档 `releases/2.4.1/`） |
+| 2.5 | 修"上一次同步还没结束"卡死 + 强行终止并重试；恢复默认设置；private 位置可改；干净卸载；启动提醒 | 🚧 本轮进行中（需求见 `docs/REQUIREMENTS-2.5.md`） |
 
 两个版本的**单文件程序**都要留档在 `releases/<版本>/`（不进 Git：单文件 180 MB 超过 GitHub
 单文件 100 MB 上限，改用 `releases/<版本>/SHA256.txt` 记录校验和）。
@@ -171,6 +172,36 @@
 - [ ] 双击打包版，点「打开配置」确认设置窗口正常显示
 - [ ] 点「创建桌面快捷方式」，确认桌面出现 `.lnk` 且双击能启动
 - [ ] 首次运行时不再静默等超时，而是直接弹出浏览器窗口
+
+## 2.5 阶段（本轮）
+
+需求、决策与验收清单单独写在 [`REQUIREMENTS-2.5.md`](REQUIREMENTS-2.5.md)（用户逐条确认过）。
+
+### 已完成
+
+1. **修卡死**：关掉登录窗口即按"取消取 Token"处理（新增 `CaptureWindow.user_closed`），
+   状态立刻释放；并新增「强行终止并重试」确认框（安全停止，不杀线程）。
+2. **恢复默认设置**：`settings.reset_to_defaults()` + 设置对话框入口；
+   开机启动项与"上次同步"记录不动，并联动询问是否还原 private 位置。
+3. **private 位置可改**：位置指针放 `%LOCALAPPDATA%\autoThuDeepSeekAPI\private-location.json`；
+   `validate_private_dir()` 拒绝系统目录/Program Files/ProgramData/盘符根/临时目录/桌面；
+   `switch_private_root()` 搬迁 + 清理旧位置（用户文件不动），下次启动补删残留。
+4. **默认 180 分钟**：核对默认值与迁移逻辑（不覆盖用户自定义间隔），用例覆盖。
+5. **干净卸载**：`uninstall.clean_uninstall()`，二次确认 + 可选还原首次备份 + 风险提示；
+   只删程序管理的东西，不删 exe（提示手动删），不写自删除脚本。
+6. **启动提醒**：`target_traces()` / `both_targets_missing()` 判断"毫无痕迹"；
+   提醒一次后写状态（`state.json` 的 `targets_note_ack`），之后静默跳过同步。
+7. **顺序**：`startup_then_sync()` 先桌面提醒、再没装提醒；桌面提醒的"已处理"
+   写在 `desktop_note_ack`。
+8. 测试 69 → 88 项全绿；设置对话框截图核对版式（no webengine 依赖的用例避免离屏崩溃）。
+
+### 待办
+
+- [x] 打包 2.5 并留档 `releases/2.5/`（文件夹版与单文件版 `--selftest` 均通过；
+      从 exe 里解出 `PYZ` 核对：版本 `2.5`，且 main_window / paths / uninstall /
+      settings_dialog 里都有 2.5 的关键代码）
+- [x] 端到端模拟点击：换 private 位置、恢复默认设置、干净卸载、两条启动提醒都按预期
+- [ ] 真机人工确认：关窗后能重试、桌面提醒三选一、private 换位置、干净卸载
 
 ## 大检查清单（按需再走）
 

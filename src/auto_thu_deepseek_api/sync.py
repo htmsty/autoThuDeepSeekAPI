@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from . import paths
+from . import paths, procinfo
 from .backup import BackupManager
 from .preflight import PreflightReport, run_preflight
 from .settings import AppSettings
@@ -26,6 +29,8 @@ class SyncReport:
     models: list[dict] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     preflight: PreflightReport | None = None
+    # 用户点了「强行终止并重试」：这次同步在步骤之间安全停下
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -36,6 +41,8 @@ class SyncReport:
         """
 
         if self.verified is not None and self.verified.ok is False:
+            return False
+        if self.cancelled:
             return False
         if not self.results:
             return False
@@ -59,6 +66,8 @@ class SyncReport:
                 parts.append(f"{result.label} 无变化")
         if self.skipped:
             parts.append("跳过：" + "、".join(self.skipped))
+        if self.cancelled:
+            parts.insert(0, "已被用户终止（安全停下）")
         return "；".join(parts) if parts else "没有任何目标被写入"
 
 
@@ -81,16 +90,100 @@ def detect_targets(settings: AppSettings) -> list[TargetStatus]:
     return [target.detect() for target in build_targets(settings)]
 
 
+def _installed_like_dir(keywords: tuple[str, ...]) -> Path | None:
+    """在常见安装位置里找一个名字对得上的目录。
+
+    只做浅层扫描（一层），别为了"到底装没装"把启动拖慢。
+    """
+
+    roots: list[Path] = []
+    for variable in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "APPDATA"):
+        value = os.environ.get(variable, "").strip()
+        if not value:
+            continue
+        base = Path(value)
+        roots.append(base / "Programs" if variable in ("LOCALAPPDATA", "APPDATA") else base)
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for entry in root.iterdir():
+                if entry.is_dir() and any(word in entry.name.lower() for word in keywords):
+                    return entry
+        except OSError:  # pragma: no cover - 扫不动就当没有
+            continue
+    return None
+
+
+def target_traces(settings: AppSettings) -> dict[str, str]:
+    """两个目标各自"有没有任何痕迹"，用于启动时判断要不要提醒"先安装"。
+
+    返回 {"dsh": 说明, "ccswitch": 说明}：说明为空串 = 一点痕迹都没有。
+    判据尽量放宽（配置目录、进程、常见安装目录任一命中就算有痕迹）——宁可少提醒，
+    也别在用户已经装好的时候冤枉人家。
+    """
+
+    traces = {"dsh": "", "ccswitch": ""}
+
+    dsh = paths.resolve_dsh_paths(settings.dsh_dir).base_dir
+    if dsh.is_dir():
+        traces["dsh"] = f"DSH 目录存在：{dsh}"
+    else:
+        process = procinfo.any_running("deepseek", "dsh")
+        if process:
+            traces["dsh"] = f"检测到正在运行的进程：{process}"
+        else:
+            found = _installed_like_dir(("deepseek", "harness"))
+            if found is not None:
+                traces["dsh"] = f"安装目录存在：{found}"
+
+    ccswitch = paths.resolve_ccswitch_paths(settings.ccswitch_dir).base_dir
+    if ccswitch.is_dir():
+        traces["ccswitch"] = f"CC Switch 目录存在：{ccswitch}"
+    else:
+        process = procinfo.any_running("cc-switch", "ccswitch")
+        if process:
+            traces["ccswitch"] = f"检测到正在运行的进程：{process}"
+        else:
+            found = _installed_like_dir(("cc-switch", "ccswitch"))
+            if found is not None:
+                traces["ccswitch"] = f"安装目录存在：{found}"
+
+    return traces
+
+
+def both_targets_missing(settings: AppSettings) -> tuple[bool, dict[str, str]]:
+    """两边是不是都"一点痕迹都没有"。"""
+
+    traces = target_traces(settings)
+    return (not traces["dsh"] and not traces["ccswitch"]), traces
+
+
 def run_sync(
     settings: AppSettings,
     token: str,
     *,
     verify: bool = True,
     fetch_model_list: bool = True,
+    cancel_event: threading.Event | None = None,
 ) -> SyncReport:
-    """把 Token 写进所有启用且已安装的目标。"""
+    """把 Token 写进所有启用且已安装的目标。
+
+    `cancel_event` 被置位时在**步骤之间**安全停下：正在写的那一份文件会先原子写完
+    （失败还有回滚兜底），不会中途丢下写了一半的文件。
+    """
 
     report = SyncReport()
+
+    def stopped() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    if stopped():
+        report.cancelled = True
+        report.skipped.append("已被用户终止")
+        return report
+
     targets = build_targets(settings)
 
     models: list[dict] = []
@@ -98,6 +191,11 @@ def run_sync(
         # 站点前端包 → /v1/models → 内置名单（详见 token/site_models.py）
         models = site_models.resolve_models(token)
     report.models = models
+
+    if stopped():
+        report.cancelled = True
+        report.skipped.append("已被用户终止，未写入任何目标")
+        return report
 
     if verify:
         report.verified = verify_token(token, models[0]["id"] if models else None)
@@ -110,6 +208,11 @@ def run_sync(
             report.skipped.append("Token 被站点拒绝，未写入任何目标")
             return report
 
+    if stopped():
+        report.cancelled = True
+        report.skipped.append("已被用户终止，未写入任何目标")
+        return report
+
     blocked: set[str] = set()
     if settings.preflight_enabled:
         report.preflight = run_preflight(settings, token, models)
@@ -121,6 +224,10 @@ def run_sync(
 
     backup = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
     for target in targets:
+        if stopped():
+            report.cancelled = True
+            report.skipped.append("已被用户终止，剩余目标未写入")
+            break
         status = target.detect()
         report.statuses.append(status)
         if not status.detected:

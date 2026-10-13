@@ -176,6 +176,124 @@ class UiSmokeTest(unittest.TestCase):
         window._quitting = True
         window.close()
 
+    # —— 2.5：关窗取消 / 安全终止重试 / 启动检查顺序 ——
+
+    def test_capture_window_close_cancels_session(self) -> None:
+        """回归：点 X 关掉登录窗口后，不能还卡在"正在取 Token"。"""
+
+        # 这里不碰真的 QWebEngine（离屏测试里再跑嵌套事件循环会崩），
+        # 用假的 page/view 把"关窗"这条链路走通即可。
+        from PySide6.QtCore import QObject, Signal
+        from PySide6.QtWidgets import QWidget
+
+        import auto_thu_deepseek_api.token.capture as capture
+
+        class FakeCookieStore(QObject):
+            cookieAdded = Signal(object)
+
+        class FakeProfile(QObject):
+            def __init__(self) -> None:
+                super().__init__()
+                self._store = FakeCookieStore()
+
+            def cookieStore(self):  # noqa: ANN201
+                return self._store
+
+        class FakePage:
+            def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+                pass
+
+        class FakeView(QWidget):
+            def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+                super().__init__()
+                self.page = None
+
+            def setPage(self, page) -> None:  # noqa: ANN001, N802
+                self.page = page
+
+        original_page = capture.QWebEnginePage
+        original_view = capture.QWebEngineView
+        capture.QWebEnginePage = FakePage  # type: ignore[assignment]
+        capture.QWebEngineView = FakeView  # type: ignore[assignment]
+        try:
+            session = capture.TokenCaptureSession(FakeProfile())
+            cancelled: list[bool] = []
+            session.cancelled.connect(lambda: cancelled.append(True))
+            assert session._window is not None
+            session._window.close()
+            self.assertEqual(cancelled, [True], "用户关窗应当按取消处理")
+            self.assertTrue(session._finished)
+        finally:
+            capture.QWebEnginePage = original_page  # type: ignore[assignment]
+            capture.QWebEngineView = original_view  # type: ignore[assignment]
+
+    def test_startup_checks_run_desktop_before_missing_targets(self) -> None:
+        window = MainWindow(AppSettings(), AppState())
+        order: list[str] = []
+        window._check_desktop_private = lambda: (order.append("desktop"), True)[1]  # type: ignore[assignment]
+        window._check_targets_missing = lambda: (order.append("targets"), False)[1]  # type: ignore[assignment]
+        window.start_sync = lambda interactive=True: order.append("sync")  # type: ignore[assignment]
+        try:
+            window.startup_then_sync()
+            self.assertEqual(order, ["desktop", "targets"], "顺序固定：先桌面、再都没装")
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_startup_sync_skipped_when_targets_missing(self) -> None:
+        window = MainWindow(AppSettings(), AppState())
+        order: list[str] = []
+        window._check_desktop_private = lambda: True  # type: ignore[assignment]
+        window._check_targets_missing = lambda: False  # type: ignore[assignment]
+        window.start_sync = lambda interactive=True: order.append("sync")  # type: ignore[assignment]
+        try:
+            window.startup_then_sync()
+            self.assertEqual(order, [], "两个目标都没检出时不该开始同步")
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_reminders_respect_acknowledged_state(self) -> None:
+        """处理过的提醒不该再弹（弹窗会阻塞测试，所以这里只走"已确认"的分支）。"""
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        state = AppState()
+        state.desktop_note_ack = True
+        state.targets_note_ack = True
+        window = MainWindow(AppSettings(), state)
+        original = main_window_module.both_targets_missing
+        main_window_module.both_targets_missing = lambda settings: (True, {"dsh": "", "ccswitch": ""})  # type: ignore[assignment]
+        try:
+            self.assertTrue(window._check_desktop_private(), "已确认过就不再弹桌面提醒")
+            self.assertFalse(window._check_targets_missing(), "都没装仍然要跳过同步")
+        finally:
+            main_window_module.both_targets_missing = original  # type: ignore[assignment]
+            window._quitting = True
+            window.close()
+
+    def test_retry_after_safe_stop(self) -> None:
+        from PySide6.QtTest import QTest
+
+        window = MainWindow(AppSettings(), AppState())
+        calls: list[bool] = []
+        window.start_sync = lambda interactive=True: calls.append(interactive)  # type: ignore[assignment]
+        try:
+            window._retry_after_stop = True
+            window._on_sync_thread_finished()
+            QTest.qWait(50)  # 让 singleShot 的重试真正跑起来
+            self.assertEqual(calls, [True], "安全停下后应当按用户要求重试一次")
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_sync_worker_has_safe_cancel(self) -> None:
+        from auto_thu_deepseek_api.ui.workers import SyncWorker
+
+        worker = SyncWorker(AppSettings(), "token")
+        worker.request_cancel()
+        self.assertTrue(worker._cancel.is_set(), "终止请求应当是「请它停下」，不是杀线程")
+
 
 if __name__ == "__main__":
     unittest.main()

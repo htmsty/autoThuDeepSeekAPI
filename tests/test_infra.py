@@ -84,6 +84,26 @@ class StartupCommandTest(unittest.TestCase):
             self.assertTrue(ok, message)
             self.assertTrue((Path(tmp) / "AutoTHU 测试快捷方式.lnk").exists())
 
+    def test_app_on_desktop_only_accepts_desktop_root(self) -> None:
+        """2.5：只认 exe 直接在桌面根目录，桌面下的子文件夹不算。"""
+
+        from auto_thu_deepseek_api import paths as paths_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            desktop = Path(tmp) / "Desktop"
+            desktop.mkdir()
+            original_desktop = startup.desktop_dir
+            original_app_dir = paths_module.app_dir
+            startup.desktop_dir = lambda: desktop  # type: ignore[assignment]
+            try:
+                paths_module.app_dir = lambda: desktop  # type: ignore[assignment]
+                self.assertTrue(startup.is_app_on_desktop())
+                paths_module.app_dir = lambda: desktop / "autoThuDeepSeekAPI"  # type: ignore[assignment]
+                self.assertFalse(startup.is_app_on_desktop(), "桌面下的子文件夹不算")
+            finally:
+                startup.desktop_dir = original_desktop  # type: ignore[assignment]
+                paths_module.app_dir = original_app_dir  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

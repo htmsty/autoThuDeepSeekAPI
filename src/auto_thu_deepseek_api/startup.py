@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from . import constants, paths
+from .paths import desktop_dir  # 桌面目录的探测统一放在 paths 里（private 位置校验也要用）
 
 logger = logging.getLogger(__name__)
 
@@ -107,27 +108,25 @@ def _target_command() -> tuple[str, str, str]:
     return str(interpreter), f'"{script}"', str(script.parent)
 
 
-def desktop_dir() -> Path | None:
-    """桌面目录：优先问 Windows 的 Shell，失败再退回常见路径。"""
+def is_app_on_desktop() -> bool:
+    """程序是不是**直接**放在桌面根目录（桌面下的子文件夹不算）。"""
 
+    desktop = desktop_dir()
+    if desktop is None:
+        return False
     try:
-        import winreg
+        return paths.app_dir().resolve() == desktop.resolve()
+    except OSError:  # pragma: no cover - 路径解析失败就当不在桌面
+        return False
 
-        key_name = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_name) as key:
-            value, _ = winreg.QueryValueEx(key, "Desktop")
-            expanded = Path(str(value)).expanduser()
-            # 注册表里可能带 %USERPROFILE% 之类的环境变量
-            expanded = Path(os.path.expandvars(str(expanded)))
-            if expanded.is_dir():
-                return expanded
-    except (ImportError, OSError):
-        pass
-    candidates = [Path.home() / "Desktop", Path.home() / "桌面"]
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return None
+
+def launch_command(extra: tuple[str, ...] = ()) -> list[str]:
+    """重新拉起自己的命令行（重启程序用；源码模式指回 run_dev.py）。"""
+
+    if paths.is_frozen():
+        return [str(Path(sys.executable).resolve()), *extra]
+    script = Path(__file__).resolve().parents[2] / "run_dev.py"
+    return [str(Path(sys.executable).resolve()), str(script), *extra]
 
 
 def create_desktop_shortcut(name: str = constants.APP_DISPLAY_NAME) -> tuple[bool, str]:

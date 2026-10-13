@@ -17,6 +17,15 @@ CCSWITCH_POLICY_DIRECT = "direct"
 #   v3：默认开启自动同步、间隔 180 分钟，并默认不弹「CC Switch 正在运行」提醒。
 SETTINGS_VERSION = 3
 
+# 「恢复默认设置」时**不**动的字段：它们不是"设置项"，而是运行状态或系统状态。
+RESET_KEEP_FIELDS = (
+    "settings_version",
+    "launch_at_startup",  # 开机启动写在注册表里，恢复默认不该动系统
+    "last_sync_at",
+    "last_sync_summary",
+    "extra",
+)
+
 
 @dataclass
 class AppSettings:
@@ -147,4 +156,16 @@ class AppSettings:
         self.default_model_id = (self.default_model_id or "").strip()
         self.dsh_dir = (self.dsh_dir or "").strip()
         self.ccswitch_dir = (self.ccswitch_dir or "").strip()
+
+
+def reset_to_defaults(settings: AppSettings) -> AppSettings:
+    """把设置恢复成默认值（保留开机启动与最近同步记录），返回同一个对象。"""
+
+    defaults = AppSettings()
+    for name in settings.__dataclass_fields__:
+        if name in RESET_KEEP_FIELDS:
+            continue
+        setattr(settings, name, getattr(defaults, name))
+    settings.settings_version = SETTINGS_VERSION
+    return settings
 

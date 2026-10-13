@@ -135,6 +135,30 @@ class UiSmokeTest(unittest.TestCase):
         self.assertTrue(hasattr(dialog, "shortcut_button"))
         dialog.close()
 
+    def test_settings_dialog_is_actually_openable(self) -> None:
+        """回归：2.4 曾经把设置对话框的布局顶掉，点「打开配置」什么都看不到。"""
+
+        window = MainWindow(AppSettings(), AppState())
+        dialog = SettingsDialog(window.settings, window)
+        layout = dialog.layout()
+        self.assertIsNotNone(layout, "对话框必须有布局")
+        self.assertGreaterEqual(layout.count(), 2, "布局里至少要有滚动区与底部按钮")
+        dialog.show()
+        self.assertTrue(dialog.isVisible(), "show() 之后应当可见")
+        self.assertTrue(dialog._content.isVisible(), "内容区应当显示出来")
+        self.assertTrue(dialog.unify_profiles.isVisible(), "设置项应当显示出来")
+        dialog.close()
+        window._quitting = True
+        window.close()
+
+    def test_main_window_has_desktop_shortcut_button(self) -> None:
+        window = MainWindow(AppSettings(), AppState())
+        self.assertTrue(hasattr(window, "shortcut_button"))
+        self.assertIn("快捷方式", window.shortcut_button.text())
+        self.assertTrue(callable(getattr(window, "create_shortcut", None)))
+        window._quitting = True
+        window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

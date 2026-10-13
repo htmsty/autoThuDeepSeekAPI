@@ -132,10 +132,18 @@ class MainWindow(QMainWindow):
 
         second_row = QHBoxLayout()
         self.config_button = QPushButton("打开配置")
+        self.shortcut_button = QPushButton("创建桌面快捷方式")
+        self.shortcut_button.setToolTip("在桌面生成一个指向本程序的快捷方式，双击即可启动")
         self.log_button = QPushButton("打开日志")
         self.data_button = QPushButton("打开数据目录")
         self.exit_button = QPushButton("退出")
-        for button in (self.config_button, self.log_button, self.data_button, self.exit_button):
+        for button in (
+            self.config_button,
+            self.shortcut_button,
+            self.log_button,
+            self.data_button,
+            self.exit_button,
+        ):
             second_row.addWidget(button)
         second_row.addStretch(1)
         actions_layout.addLayout(second_row)
@@ -216,6 +224,7 @@ class MainWindow(QMainWindow):
         self.backup_button.clicked.connect(self.manual_backup)
         self.restore_button.clicked.connect(self.restore_backup)
         self.config_button.clicked.connect(self.open_settings)
+        self.shortcut_button.clicked.connect(self.create_shortcut)
         self.log_button.clicked.connect(self.open_log)
         self.data_button.clicked.connect(lambda: self._open_path(paths.data_root()))
         self.exit_button.clicked.connect(self.quit_app)
@@ -286,6 +295,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "打开日志", f"日志目录还不存在：{log_dir}")
             return
         self._open_path(log_dir)
+
+    def create_shortcut(self) -> None:
+        """在桌面生成一个指向本程序的快捷方式（主界面与设置里都能点）。"""
+
+        try:
+            ok, message = startup.create_desktop_shortcut()
+        except Exception as exc:  # noqa: BLE001 - 建不了快捷方式也要如实说
+            logger.exception("创建桌面快捷方式失败")
+            QMessageBox.warning(self, "创建桌面快捷方式", f"创建失败：{exc}")
+            return
+        logger.info(message)
+        if ok:
+            QMessageBox.information(self, "创建桌面快捷方式", message)
+        else:
+            QMessageBox.warning(self, "创建桌面快捷方式", message)
 
     # —— 预检 / 备份 / 还原 ——
 

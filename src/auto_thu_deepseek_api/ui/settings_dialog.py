@@ -45,22 +45,23 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(620)
         self.resize(680, 720)
 
-        layout = QVBoxLayout(self)
+        # 只有一个挂在对话框上的布局：滚动区 + 底部按钮。
+        # 注意别再造第二个 QVBoxLayout(self)——后建的那个会把先挂的布局顶掉，
+        # 结果对话框没有布局、点「打开配置」就什么也看不到（2.4 的真实 bug）。
+        self.outer = QVBoxLayout(self)
 
         # 内容比一屏高，放进滚动区，窗口小的时候也能看到「创建桌面快捷方式」等底部选项
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         content = QWidget()
-        content.setParent(scroll)  # 让 C++ 侧持有它，避免 Python 临时变量被回收
-        # 留住 Python 引用：不能只靠父控件关系，否则局部变量出栈时可能连子控件一起被回收
+        # 留住 Python 引用：只靠父控件关系的话，局部变量出栈时控件可能一起被回收
         self._scroll = scroll
         self._content = content
-        layout = QVBoxLayout(content)
+        content_layout = QVBoxLayout(content)
         scroll.setWidget(content)
-        outer = QVBoxLayout()
-        self.setLayout(outer)
-        outer.addWidget(scroll, 1)
+        self.outer.addWidget(scroll, 1)
+        layout = content_layout
 
         # —— 目标 ——
         targets_box = QGroupBox("写入目标（检测到哪个写哪个，可分别关闭）")
@@ -189,7 +190,7 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         # 按钮固定在窗口底部，不跟着内容一起滚
-        outer.addWidget(buttons)
+        self.outer.addWidget(buttons)
 
     # —— 小工具 ——
 
@@ -276,6 +277,11 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, "手动粘贴 Token", "已记录该 Token，关闭设置后会用它同步。")
 
     def _create_shortcut(self) -> None:
+        # 主界面已经有这个功能，直接复用它的入口（弹窗、日志口径保持一致）
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "create_shortcut"):
+            parent.create_shortcut()
+            return
         ok, message = startup.create_desktop_shortcut()
         logger.info(message)
         if ok:

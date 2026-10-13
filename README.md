@@ -3,9 +3,10 @@
 自动获取清华大学 MadModel 平台（<https://madmodel.cs.tsinghua.edu.cn/>）的 API Token，
 并写入 DeepSeek Harness（DSH）与 CC Switch 的配置。Windows 便携程序，双击即用。
 
+**?!无限Token?!**
+
 - 作者：htmsty
 - 许可证：AGPL-3.0（见 [LICENSE](LICENSE)）
-- 设计与需求备忘：[`../DESIGN_AND_REQUIREMENTS.md`](../DESIGN_AND_REQUIREMENTS.md)
 
 ## 它做什么
 
@@ -135,7 +136,7 @@ python -m venv .venv
 
 - 程序不模拟鼠标键盘，也不代替你点击页面：登录永远由你本人在内置浏览器窗口里完成。
 - Token 由站点前端签发，有效期约 5 小时（以站点实际为准）；会话过期后需要你重新登录一次。
-- Token 校验优先走站点的会话接口（`GET /model-api/auth-login`，快且不消耗模型额度）；
+- Token 校验优先走站点的会话接口（`GET /model-api/auth-login`）；
   只有它给不出结论时才会兜底发一次最小对话请求，连不上站点则如实记成"未能校验"而不是失败。
 - 模型列表跟着站点走：读站点前端包里的模型清单（缓存 6 小时），`contextWindow` 统一 1000000，
   并排除站点上那两个不注册的模型；读不到才用内置名单。DSH 里已有的 provider 按 `apiKeyEnv` /

@@ -1,4 +1,10 @@
-"""离屏渲染主界面并截图，用于人工检查版式。"""
+"""离屏渲染主界面与设置对话框并截图，用于人工检查版式。
+
+用法：
+    python tools/screenshot_ui.py                 # 主界面 → ui-screenshot.png
+    python tools/screenshot_ui.py out.png         # 指定输出名
+    python tools/screenshot_ui.py --settings      # 设置对话框 → ui-screenshot-settings.png
+"""
 
 from __future__ import annotations
 
@@ -14,10 +20,14 @@ from auto_thu_deepseek_api.logging_setup import setup_logging  # noqa: E402
 from auto_thu_deepseek_api.settings import AppSettings  # noqa: E402
 from auto_thu_deepseek_api.state_store import AppState  # noqa: E402
 from auto_thu_deepseek_api.ui.main_window import MainWindow  # noqa: E402
+from auto_thu_deepseek_api.ui.settings_dialog import SettingsDialog  # noqa: E402
 
 
 def main() -> int:
-    output = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("ui-screenshot.png")
+    arguments = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+    wants_settings = "--settings" in sys.argv
+    default_name = "ui-screenshot-settings.png" if wants_settings else "ui-screenshot.png"
+    output = Path(arguments[0]) if arguments else Path(default_name)
     paths.ensure_runtime_dirs()
     setup_logging()
 
@@ -25,10 +35,17 @@ def main() -> int:
     settings = AppSettings()
     state = AppState()
     window = MainWindow(settings, state)
-    window.resize(900, 660)
-    window.show()
-    application.processEvents()
-    window.grab().save(str(output))
+    if wants_settings:
+        dialog = SettingsDialog(settings, window)
+        dialog.show()
+        application.processEvents()
+        dialog.grab().save(str(output))
+        dialog.close()
+    else:
+        window.resize(900, 660)
+        window.show()
+        application.processEvents()
+        window.grab().save(str(output))
     print(f"已截图：{output}")
     window.quit_app()
     return 0

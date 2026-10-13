@@ -42,8 +42,9 @@ class SettingsDialog(QDialog):
         self.settings = settings
         self.manual_token = ""
         self.setWindowTitle("设置")
-        self.setMinimumWidth(620)
-        self.resize(680, 720)
+        # 宽度要放得下最长的复选框文案，窄了右边会被截断；高度交给滚动区
+        self.setMinimumWidth(900)
+        self.resize(920, 760)
 
         # 只有一个挂在对话框上的布局：滚动区 + 底部按钮。
         # 注意别再造第二个 QVBoxLayout(self)——后建的那个会把先挂的布局顶掉，

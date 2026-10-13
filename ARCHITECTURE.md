@@ -47,13 +47,22 @@ main 启动
 ### `settings.py`
 用户设置（JSON）：同步间隔、自动同步、开机启动、启动即同步、同步后最小化、
 DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Switch 运行中策略与提示开关、
-备份保留份数。
+备份保留份数、静默取 Token 超时、日志级别、关窗行为、预检开关、DSH 默认模型。
 
-设置文件带 `settings_version`：v2 起「统一所有 profile 到 madmodel」默认勾选，
-读到 v1（没有版本号）的旧设置时**一次性**迁移成勾选并写回，之后用户手动取消不会再被打回。
+设置文件带 `settings_version`，读到旧版本时**一次性**迁移并写回（`AppSettings.load`）：
+
+| 版本 | 迁移内容 |
+| --- | --- |
+| v2 | 「统一所有 profile 到 madmodel」默认勾选 |
+| v3 | 默认开启自动同步、间隔默认 180 分钟、默认不弹「CC Switch 正在运行」提醒 |
+
+迁移只发生一次：之后用户手动取消勾选、自己填的间隔都不会被默认值打回。
 
 ### `token/`
 - `jwt_utils.py`：不验签解码 JWT，取 `exp` 算剩余时间。
+  界面显示用 `describe_expiry()`：JWT 自带 `exp` 就用它，没有就按"取回时刻 + 5 小时"
+  给出到期时刻（`TOKEN_LIFETIME_HOURS`）。`is_expired()` 返回 `None` 表示"看不出来"，
+  这种情况按"仍可用、交给站点校验"处理，不能当成已过期。
 - `capture.py`：QtWebEngine 内置窗口。页面脚本在 `DocumentCreation` 注入，
   只做三件事：扫 `localStorage` / `sessionStorage`、钩 `fetch` 与 `XHR` 的响应体、
   扫一次页面文本；命中 JWT 即写入 `window.__atdToken`，Python 侧轮询取走。
@@ -100,9 +109,25 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 
 ### `backup.py`
 每次写入前把原文件复制到 `private/backups/<时间戳>-<标签>/`，并写入
-`private/backups/index.json`（源路径、备份路径、时间、sha256）。SQLite 用
+`private/backups/index.json`（源路径、备份路径、时间、sha256、是否原始备份）。SQLite 用
 `Connection.backup()` 保证一致性。"还原"按钮恢复每个源文件**最早**的那份备份
 （即首次修改前的状态），还原前会先把当前状态也备份一份。
+
+- `begin_snapshot(label)`：让同一次操作的多份文件共用一个快照目录。
+- `_snapshot_target()`：同一目录里重名（多个 profile 都叫 `cordis.patch.yml`）时自动
+  加 `-2`、`-3` 序号，避免互相覆盖导致还原错位。
+- `prune()`：每个源文件**最早那份永远保留**（无论有没有 `original` 标记），其余按
+  `backup_keep` 轮换。
+
+### `backup_ops.py`
+给界面用的封装：手动备份、一键还原、以及 `auto_backup_on_first_run()`——
+程序第一次运行时给每个目标文件留一份带 `original` 标记的原始备份，重复调用不会重复记账。
+
+### `startup.py`
+开机启动（HKCU 的 Run 项）与桌面快捷方式。启动时会核对注册表实际值：路径变了自动纠正，
+值为空（被别处写坏）直接重写。`create_desktop_shortcut()` 用系统自带的
+PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以免中文/空格被命令行弄坏，
+并隐藏子进程窗口。
 
 ### `sync.py`
 编排：校验 Token → 逐个目标探测 → 备份 → 写入 → 汇总报告。不依赖 Qt，可单独测试。
@@ -112,9 +137,11 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 又被点一次按钮导致两轮同步并行。
 
 ### `ui/`
-- `main_window.py`：状态区 + 操作按钮 + 设置项 + 日志视图。
-- `tray.py`：托盘图标与菜单；左键开窗、右键菜单；关闭窗口即隐藏到托盘。
-- `settings_dialog.py`：路径、开关、CC Switch 策略、备份还原、手动粘贴 Token。
+- `main_window.py`：状态区 + 操作按钮（含「创建桌面快捷方式」）+ 设置项 + 日志视图 + 托盘。
+  托盘图标左键开窗、右键菜单；关闭窗口即隐藏到托盘。
+- `settings_dialog.py`：**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
+  千万不要再造第二个 `QVBoxLayout(self)`：后建的会把先挂的布局顶掉，对话框会变成空窗口
+  （2.4 踩过一次，`test_settings_dialog_is_actually_openable` 是这条的回归用例）。
 - `workers.py`：把同步放到 `QThread`，避免界面卡死。
 
 ## 每一步要做什么（里程碑）

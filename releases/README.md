@@ -22,3 +22,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\build\build_app.ps1 -OneFileOnly
 ```
+
+## 已知有问题的留档
+
+| 版本 | 问题 |
+| --- | --- |
+| 2.4 | **设置界面打不开**（点「打开配置」出来空白窗口）。请用 2.4.1 或更新版本。 |

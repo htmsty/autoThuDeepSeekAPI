@@ -159,6 +159,23 @@ class UiSmokeTest(unittest.TestCase):
         window._quitting = True
         window.close()
 
+    def test_every_button_is_wired(self) -> None:
+        """大检查：界面上每个按钮都得接上槽，不能有"点了没反应"的装饰按钮。"""
+
+        from PySide6.QtWidgets import QPushButton
+
+        window = MainWindow(AppSettings(), AppState())
+        dialog = SettingsDialog(window.settings, window)
+        for widget, name in ((window, "主界面"), (dialog, "设置对话框")):
+            for button in widget.findChildren(QPushButton):
+                receivers = button.receivers("2clicked(bool)")
+                self.assertGreater(
+                    receivers, 0, f"{name}的按钮「{button.text()}」没有接任何槽函数"
+                )
+        dialog.close()
+        window._quitting = True
+        window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

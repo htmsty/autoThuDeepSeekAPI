@@ -46,6 +46,7 @@
 | 校验写入内容 | **只读**预检：把将要写入 DSH / CC Switch 的内容渲染出来逐项校验，不动任何文件 |
 | 手动备份 | 立刻把 DSH 凭据、各 profile、CC Switch 数据库与路由文件各留一份备份 |
 | 一键还原 | 把各文件恢复成最早的备份（= 第一次修改前的状态）；还原前会先把当前状态再留一份 |
+| 创建桌面快捷方式 | 在桌面生成一个指向本程序的快捷方式，双击即可启动（设置里也有同一个入口） |
 | 打开配置 / 打开日志 / 打开数据目录 | 打开设置对话框、日志目录、`private/` 数据目录 |
 | 退出 | 真正退出程序（点 `×` 默认只是最小化到托盘，可在设置里改成直接退出） |
 
@@ -121,7 +122,47 @@ private/
 如果程序目录不可写（例如装在只读位置），会自动改用
 `%LOCALAPPDATA%\autoThuDeepSeekAPI\private\`。
 
-## 从源码运行
+## 项目结构与开发
+
+按这个顺序看最快（每份文档负责的事不重叠）：
+
+| 文档 | 内容 |
+| --- | --- |
+| `README.md`（本文） | 怎么用、有哪些开关、边界与限制 |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | 每个模块负责什么、数据怎么流动、改代码要注意的坑 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 每个版本改了什么、修了哪些 bug |
+| [`docs/PROGRESS.md`](docs/PROGRESS.md) | 当前进度、待办清单、怎么回退到旧版本 |
+| [`releases/README.md`](releases/README.md) | 打包产物怎么留档与重建（产物本身不进 Git） |
+
+目录速查：
+
+```
+src/auto_thu_deepseek_api/
+  app.py            程序入口：设置、日志、主窗口、定时同步
+  settings.py       用户设置与版本迁移
+  sync.py           同步编排：校验 Token → 逐目标备份写入
+  preflight.py      写入前预检（只读干跑）
+  backup.py         备份、清理、一键还原
+  backup_ops.py     手动备份 / 首次自动备份（界面用）
+  startup.py        开机启动、桌面快捷方式
+  token/            内置浏览器取 Token、JWT、站点校验、模型清单
+  targets/          DSH 与 CC Switch 的探测与写入
+  ui/               主窗口、托盘、设置对话框、后台线程
+tests/              单元测试（当前 69 项）
+tools/              图标生成、界面截图、打包诊断等小工具
+build/              PyInstaller 规格与打包脚本
+private/            运行数据（Token、日志、备份、浏览器会话），不进 Git
+```
+
+跑测试与截图（都在项目根目录执行）：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -t .
+.\.venv\Scripts\python.exe tools\screenshot_ui.py                # 主界面截图
+.\.venv\Scripts\python.exe tools\screenshot_ui.py --settings     # 设置对话框截图
+```
+
+### 从源码运行
 
 ```powershell
 python -m venv .venv

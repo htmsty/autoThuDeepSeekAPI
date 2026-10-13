@@ -69,6 +69,21 @@ class StartupCommandTest(unittest.TestCase):
         assert match is not None
         self.assertTrue(Path(match.group(1)).is_file(), f"开机启动指向的脚本不存在：{match.group(1)}")
 
+    def test_desktop_shortcut_is_created_in_target_dir(self) -> None:
+        """真的走一遍 WScript.Shell，但桌面目录换成临时目录，不碰用户桌面。"""
+
+        if sys.platform != "win32":
+            self.skipTest("只有 Windows 有 .lnk 快捷方式")
+        with tempfile.TemporaryDirectory() as tmp:
+            original = startup.desktop_dir
+            startup.desktop_dir = lambda: Path(tmp)  # type: ignore[assignment]
+            try:
+                ok, message = startup.create_desktop_shortcut("AutoTHU 测试快捷方式")
+            finally:
+                startup.desktop_dir = original  # type: ignore[assignment]
+            self.assertTrue(ok, message)
+            self.assertTrue((Path(tmp) / "AutoTHU 测试快捷方式.lnk").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

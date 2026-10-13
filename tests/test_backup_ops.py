@@ -57,6 +57,29 @@ class BackupOpsTest(unittest.TestCase):
         self.assertEqual(done, 0)
         self.assertTrue(any("没有找到可备份的文件" in line for line in lines), lines)
 
+    def test_first_run_auto_backup_is_idempotent_and_restorable(self) -> None:
+        credentials = self.sandbox.dsh_dir / ".credentials.yaml"
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        original_credentials = credentials.read_text(encoding="utf-8")
+        original_profile = profile.read_text(encoding="utf-8")
+
+        first = backup_ops.auto_backup_on_first_run(self.settings)
+        self.assertGreaterEqual(first, 4, "首次运行应当给每个目标文件都留一份原始备份")
+        second = backup_ops.auto_backup_on_first_run(self.settings)
+        self.assertEqual(second, 0, "第二次运行不该重复记账")
+
+        originals = backup_ops.original_backed_up_sources(self.settings)
+        self.assertIn(str(credentials), originals)
+        self.assertIn(str(profile), originals)
+
+        # 改坏之后一键还原，要回到"第一次动它之前"
+        credentials.write_text("broken\n", encoding="utf-8")
+        profile.write_text("# gone\n", encoding="utf-8")
+        messages = backup_ops.restore_original(self.settings)
+        self.assertTrue(messages)
+        self.assertEqual(credentials.read_text(encoding="utf-8"), original_credentials)
+        self.assertEqual(profile.read_text(encoding="utf-8"), original_profile)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,8 +12,10 @@ from .constants import DEFAULT_SYNC_INTERVAL_MINUTES
 CCSWITCH_POLICY_PROMPT = "prompt"
 CCSWITCH_POLICY_DIRECT = "direct"
 
-# 设置文件版本。v2 起「统一所有 profile 到 madmodel」默认勾选（v1 的存量设置会被迁移一次）。
-SETTINGS_VERSION = 2
+# 设置文件版本。
+#   v2：默认勾选「统一所有 profile 到 madmodel」。
+#   v3：默认开启自动同步、间隔 180 分钟，并默认不弹「CC Switch 正在运行」提醒。
+SETTINGS_VERSION = 3
 
 
 @dataclass
@@ -24,7 +26,7 @@ class AppSettings:
 
     # 同步
     sync_interval_minutes: int = DEFAULT_SYNC_INTERVAL_MINUTES
-    auto_sync_enabled: bool = False
+    auto_sync_enabled: bool = True
     sync_on_start: bool = True
     minimize_after_sync: bool = False
     launch_at_startup: bool = False
@@ -55,7 +57,7 @@ class AppSettings:
 
     # CC Switch 细节
     ccswitch_running_policy: str = CCSWITCH_POLICY_PROMPT
-    suppress_ccswitch_running_warning: bool = False
+    suppress_ccswitch_running_warning: bool = True
 
     # 备份
     backup_keep: int = 10
@@ -84,15 +86,30 @@ class AppSettings:
         known = {f for f in cls.__dataclass_fields__}
         data = {k: v for k, v in raw.items() if k in known}
         settings = cls(**data)
-        if version < SETTINGS_VERSION:
+        migrated = False
+        if version < 2:
             # v1 → v2：默认勾选「统一所有 profile 到 madmodel」。只迁一次，
             # 之后再手动取消勾选就不会被打回。
             settings.unify_all_profiles = True
-            settings.settings_version = SETTINGS_VERSION
-            settings.save()
+            migrated = True
             logging.getLogger(__name__).info(
                 "设置已升级到 v%d：默认勾选「统一所有 profile 到 madmodel」", SETTINGS_VERSION
             )
+        if version < 3:
+            # v2 → v3：默认开启自动同步，并默认不弹 CC Switch 运行中提醒。
+            # 间隔默认值已在 dataclass 里改成 180；用户自己填过的分钟数保留，不覆盖。
+            settings.auto_sync_enabled = True
+            settings.suppress_ccswitch_running_warning = True
+            migrated = True
+            logging.getLogger(__name__).info(
+                "设置已升级到 v%d：默认开启自动同步，不再提示 CC Switch 正在运行（当前间隔 %d 分钟）",
+                SETTINGS_VERSION,
+                settings.sync_interval_minutes,
+            )
+        if version < SETTINGS_VERSION:
+            settings.settings_version = SETTINGS_VERSION
+            if migrated:
+                settings.save()
         settings.normalize()
         return settings
 

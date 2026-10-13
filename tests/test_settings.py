@@ -1,4 +1,4 @@
-"""设置：默认值与 v1 → v2 迁移。"""
+"""设置：默认值与旧版本迁移。"""
 
 from __future__ import annotations
 
@@ -39,11 +39,39 @@ class SettingsTest(unittest.TestCase):
         migrated = AppSettings.load()
         self.assertTrue(migrated.unify_all_profiles, "老设置要一次性迁移成勾选")
         self.assertEqual(migrated.settings_version, SETTINGS_VERSION)
-        self.assertEqual(migrated.sync_interval_minutes, 15, "其它设置不能被改掉")
+        self.assertEqual(migrated.sync_interval_minutes, 15, "用户自己填过的间隔不能被改掉")
+        self.assertTrue(migrated.auto_sync_enabled, "迁移后默认开启自动同步")
+        self.assertTrue(migrated.suppress_ccswitch_running_warning, "默认不再弹 CC Switch 运行提醒")
 
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["settings_version"], SETTINGS_VERSION)
         self.assertTrue(saved["unify_all_profiles"])
+
+    def test_defaults_match_goal(self) -> None:
+        """目标要求：默认开启自动同步、间隔 180 分钟、默认不弹 CC Switch 提醒。"""
+
+        settings = AppSettings()
+        self.assertTrue(settings.auto_sync_enabled)
+        self.assertEqual(settings.sync_interval_minutes, 180)
+        self.assertTrue(settings.suppress_ccswitch_running_warning)
+
+    def test_v2_settings_keep_user_interval(self) -> None:
+        settings_path = self.root / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "settings_version": 2,
+                    "sync_interval_minutes": 45,
+                    "auto_sync_enabled": False,
+                    "unify_all_profiles": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        migrated = AppSettings.load()
+        self.assertEqual(migrated.sync_interval_minutes, 45, "v2 升 v3 不改用户填的间隔")
+        self.assertTrue(migrated.auto_sync_enabled)
+        self.assertFalse(migrated.unify_all_profiles, "v2 已经迁过的选项不该被二次覆盖")
 
     def test_manual_uncheck_survives_reload(self) -> None:
         settings_path = self.root / "settings.json"

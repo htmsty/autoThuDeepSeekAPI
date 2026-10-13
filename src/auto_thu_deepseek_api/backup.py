@@ -27,6 +27,15 @@ class BackupEntry:
     created: str
     sha256: str
     size: int
+    # 是否是"原始"备份（程序第一次动这个文件之前的状态）。老索引里没有这个字段，
+    # 默认 False，靠快照目录名里的 original 标记也能识别。
+    is_original: bool = False
+
+
+def is_original_label(label: str) -> bool:
+    """快照标签是否属于"首份/原始备份"（目录名会带 -original 标记）。"""
+
+    return "original" in (label or "")
 
 
 def _sha256(path: Path) -> str:
@@ -47,6 +56,8 @@ class BackupManager:
         self.root = Path(root)
         self.keep = max(1, int(keep))
         self.index_path = self.root / INDEX_NAME
+        self._session_snapshot: Path | None = None
+        self._session_label = ""
 
     # —— 索引 ——
 
@@ -128,8 +139,33 @@ class BackupManager:
 
     # —— 备份 ——
 
-    def _new_snapshot_dir(self, label: str) -> Path:
+    @staticmethod
+    def _snapshot_target(snapshot: Path, base_name: str) -> Path:
+        """同一快照目录里给文件挑一个不重名的落点。
+
+        多个 profile 都叫 `cordis.patch.yml`，如果直接按原文件名放进去会互相覆盖，
+        「一键还原」就会把 A 的备份还原到 B。这里改成 `名字-2.yml`、`名字-3.yml`。
+        """
+
+        target = snapshot / base_name
+        if not target.exists():
+            return target
+        stem = Path(base_name).stem
+        suffix = Path(base_name).suffix
+        counter = 2
+        while True:
+            candidate = snapshot / f"{stem}-{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def _new_snapshot_dir(self, label: str, *, reuse: bool = True) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
+        if reuse and self._session_snapshot is not None and self._session_label == label:
+            # 会话目录可能已经被清理掉（例如连续同名备份触发 prune），确认还在才复用
+            if self._session_snapshot.is_dir():
+                return self._session_snapshot
+            self._session_snapshot = None
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         safe_label = "".join(ch for ch in label if ch.isalnum() or ch in "-_") or "backup"
         base = f"{stamp}-{safe_label}"
@@ -141,7 +177,14 @@ class BackupManager:
             counter += 1
             path = self.root / f"{base}-{counter}"
         path.mkdir(parents=True, exist_ok=False)
+        self._session_snapshot = path
+        self._session_label = label
         return path
+
+    def begin_snapshot(self, label: str) -> None:
+        """让接下来同一标签的多次备份共用同一个快照目录（同一次操作的多份文件）。"""
+
+        self._new_snapshot_dir(label, reuse=False)
 
     def backup_file(self, source: Path, label: str) -> Path | None:
         """普通文件备份；文件不存在返回 None。"""
@@ -150,7 +193,7 @@ class BackupManager:
         if not source.exists():
             return None
         snapshot = self._new_snapshot_dir(label)
-        target = snapshot / source.name
+        target = self._snapshot_target(snapshot, source.name)
         shutil.copy2(source, target)
         self._write_source_marker(snapshot, source)
         self._record(
@@ -161,6 +204,7 @@ class BackupManager:
                 created=datetime.now().isoformat(timespec="milliseconds"),
                 sha256=_sha256(target),
                 size=target.stat().st_size,
+                is_original=is_original_label(label),
             )
         )
         logger.info("已备份 %s → %s", source, target)
@@ -174,7 +218,7 @@ class BackupManager:
         if not source.exists():
             return None
         snapshot = self._new_snapshot_dir(label)
-        target = snapshot / source.name
+        target = self._snapshot_target(snapshot, source.name)
         self._write_source_marker(snapshot, source)
         try:
             src = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
@@ -200,6 +244,7 @@ class BackupManager:
                 created=datetime.now().isoformat(timespec="milliseconds"),
                 sha256=_sha256(target),
                 size=target.stat().st_size if target.exists() else 0,
+                is_original=is_original_label(label),
             )
         )
         logger.info("已备份数据库 %s → %s", source, target)
@@ -222,8 +267,30 @@ class BackupManager:
         backup_path = Path(item.get("backup", ""))
         return (backup_path.parent.name, item.get("created", ""))
 
+    @staticmethod
+    def _is_original(item: dict) -> bool:
+        """首份（原始）备份：快照目录名带 original 标记。
+
+        这类备份是"程序第一次动这个文件之前"的状态，永远不参与清理，
+        保证「一键还原」随时能回到最初。
+        """
+
+        if item.get("is_original"):
+            return True
+        return Path(item.get("backup", "")).parent.name.endswith("-original")
+
+    @classmethod
+    def _oldest(cls, items: list[dict]) -> dict | None:
+        """一个源文件里时间最早的那条（= 程序第一次动它之前的状态）。"""
+
+        return min(items, key=cls._sort_key) if items else None
+
     def prune(self) -> None:
-        """每个源文件只保留最近 keep 份，避免无限增长。"""
+        """每个源文件保留最早的那份备份 + 最近 `keep-1` 份，避免无限增长。
+
+        "最早的那份"就是"程序第一次动这个文件之前"的状态，无论它是否带 original 标记，
+        都不参与清理；这样「一键还原」在任何时候都能回到最初。
+        """
 
         entries = self._load_index()
         by_source: dict[str, list[dict]] = {}
@@ -232,8 +299,19 @@ class BackupManager:
 
         keep_paths: set[str] = set()
         for items in by_source.values():
-            items.sort(key=self._sort_key)
-            keep_paths.update(item.get("backup", "") for item in items[-self.keep :])
+            originals = [item for item in items if self._is_original(item)]
+            rest = [item for item in items if not self._is_original(item)]
+            rest.sort(key=self._sort_key)
+            keep_paths.update(item.get("backup", "") for item in originals)
+            already = len(originals)
+            # 没有 original 标记的老索引：把时间最早的一条当作受保护的原始备份
+            if not originals:
+                oldest = self._oldest(items)
+                if oldest is not None:
+                    keep_paths.add(oldest.get("backup", ""))
+                    rest = [item for item in rest if item is not oldest]
+                    already = 1
+            keep_paths.update(item.get("backup", "") for item in rest[-max(0, self.keep - already) :])
 
         removed_dirs: set[str] = set()
         for item in entries:
@@ -245,6 +323,9 @@ class BackupManager:
 
         for directory in removed_dirs:
             path = Path(directory)
+            # 正在用的会话快照不能删：同一次操作可能还要往它里面写下一份文件
+            if self._session_snapshot is not None and path == self._session_snapshot:
+                continue
             try:
                 if path.is_dir() and path.parent == self.root:
                     shutil.rmtree(path)

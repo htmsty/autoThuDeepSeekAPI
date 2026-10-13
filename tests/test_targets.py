@@ -552,7 +552,36 @@ class TargetTestCase(unittest.TestCase):
             (self.root / f"copy-{token}.yaml").write_text(credentials.read_text(encoding="utf-8"), encoding="utf-8")
         for _ in range(7):
             self.backup.backup_file(credentials, "dsh-credentials")
-        self.assertLessEqual(len(self.backup.entries()), 5)
+        # 第一条是"第一次修改前"的原始备份，之后按 keep 保留最近的普通备份
+        entries = self.backup.entries()
+        self.assertEqual(len(entries), 5, "原始备份 1 份 + 普通备份 keep-1 份")
+        oldest = min(entries, key=lambda item: Path(item.backup).parent.name)
+        self.assertEqual(
+            Path(oldest.backup).read_text(encoding="utf-8"),
+            credentials.read_text(encoding="utf-8"),
+            "最早那份必须始终保留",
+        )
+
+    def test_original_backup_is_never_pruned(self) -> None:
+        """首份（original）备份是"第一次修改前"的状态，备份再多也不能被清掉。"""
+
+        credentials = self.sandbox.dsh_dir / ".credentials.yaml"
+        original_text = credentials.read_text(encoding="utf-8")
+        first = self.backup.backup_file(credentials, "original-first-run")
+        self.assertIsNotNone(first)
+        for _ in range(10):
+            credentials.write_text(credentials.read_text(encoding="utf-8") + "# 改动\n", encoding="utf-8")
+            self.backup.backup_file(credentials, "auto-sync")
+
+        entries = self.backup.entries()
+        originals = [entry for entry in entries if entry.is_original]
+        self.assertEqual(len(originals), 1, entries)
+        self.assertEqual(Path(originals[0].backup).read_text(encoding="utf-8"), original_text)
+
+        # 一键还原必须回到最初那份，而不是最近一份
+        messages = BackupManager(self.sandbox.backups_dir, keep=5).restore()
+        self.assertTrue(any("credentials" in message for message in messages), messages)
+        self.assertEqual(credentials.read_text(encoding="utf-8"), original_text)
 
 
 if __name__ == "__main__":

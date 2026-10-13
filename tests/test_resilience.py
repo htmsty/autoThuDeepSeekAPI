@@ -287,6 +287,31 @@ class TokenTimeTest(unittest.TestCase):
         self.assertIn("剩余", described)
         self.assertIn("小时", described)
 
+    def test_expiry_moment_prefers_jwt_exp(self) -> None:
+        import base64
+        import json as jsonlib
+
+        exp = datetime(2030, 1, 2, 3, 4, tzinfo=timezone.utc)
+        payload = (
+            base64.urlsafe_b64encode(jsonlib.dumps({"exp": int(exp.timestamp())}).encode())
+            .decode()
+            .rstrip("=")
+        )
+        token = f"eyJhbGciOiJIUzI1NiJ9.{payload}.signaturepart"
+        moment = jwt_utils.expiry_moment(token, "2026-10-13T00:00:00")
+        assert moment is not None
+        self.assertEqual(int(moment.timestamp()), int(exp.timestamp()))
+        self.assertIn("有效至", jwt_utils.describe_expiry(token, "2026-10-13T00:00:00"))
+
+    def test_expiry_moment_falls_back_to_five_hours(self) -> None:
+        """Token 没带 exp 时，按"取回时刻 + 5 小时"估算到期时刻。"""
+
+        no_exp = "eyJhbGciOiJIUzI1NiJ9.eyJjb2RlIjoiMCJ9.signaturepart"
+        moment = jwt_utils.expiry_moment(no_exp, "2026-10-13T20:00:00")
+        assert moment is not None
+        self.assertEqual(moment.strftime("%Y-%m-%d %H:%M"), "2026-10-14 01:00")
+        self.assertEqual(jwt_utils.expiry_moment(no_exp, ""), None)
+
 
 if __name__ == "__main__":
     unittest.main()

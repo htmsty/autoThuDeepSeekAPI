@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 
 from . import paths
-from .backup import BackupEntry, BackupManager
+from .backup import BackupEntry, BackupManager, is_original_label
 from .settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,54 @@ def manual_backup(settings: AppSettings) -> tuple[int, list[str]]:
         lines.append("没有找到可备份的文件（检查 DSH / CC Switch 目录与开关）")
     logger.info("手动备份完成：%d 份", done)
     return done, lines
+
+
+def original_backed_up_sources(settings: AppSettings) -> set[str]:
+    """已经留过"原始备份"（程序第一次动它之前）的源文件集合。"""
+
+    manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
+    return {entry.source for entry in manager.entries() if entry.is_original or is_original_label(entry.label)}
+
+
+def auto_backup_on_first_run(settings: AppSettings) -> int:
+    """首次运行自动备份：给每个还没留过原始备份的文件各留一份。
+
+    原始备份带 `original` 标签，不会被清理逻辑删掉（见 BackupManager.prune），
+    所以在配置里始终能一键还原到"程序第一次动它之前"的状态。
+    已经留过的文件跳过，重复调用不会重复记账。
+    """
+
+    manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
+    already = {entry.source for entry in manager.entries() if entry.is_original or is_original_label(entry.label)}
+    # 同一次操作的文件共用一个快照目录，方便人工翻看"首次备份那一批"
+    snapshot_label = "original-first-run"
+    pending = [
+        (path, is_sqlite)
+        for path, _label, is_sqlite in _target_files(settings)
+        if str(path) not in already
+    ]
+    if not pending:
+        return 0
+
+    manager.begin_snapshot(snapshot_label)
+    done = 0
+    for path, is_sqlite in pending:
+        try:
+            target = (
+                manager.backup_sqlite(path, snapshot_label)
+                if is_sqlite
+                else manager.backup_file(path, snapshot_label)
+            )
+        except OSError as exc:
+            logger.warning("首次运行备份失败：%s（%s）", path, exc)
+            continue
+        if target:
+            done += 1
+    if done:
+        logger.info(
+            "首次运行已自动备份 %d 份原始配置（保留不清理，可在设置里一键还原）", done
+        )
+    return done
 
 
 def pending_restore(settings: AppSettings) -> dict[str, BackupEntry]:

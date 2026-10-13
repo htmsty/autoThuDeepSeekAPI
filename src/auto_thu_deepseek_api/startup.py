@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -92,4 +94,99 @@ def set_enabled(enabled: bool) -> tuple[bool, str]:
             return True, "已取消开机启动"
     except OSError as exc:
         return False, f"设置开机启动失败：{exc}"
+
+
+def _target_command() -> tuple[str, str, str]:
+    """返回 (目标路径, 参数, 工作目录)，供快捷方式使用。"""
+
+    if paths.is_frozen():
+        exe = str(Path(sys.executable).resolve())
+        return exe, "", str(Path(exe).parent)
+    interpreter = Path(sys.executable).resolve()
+    script = Path(__file__).resolve().parents[2] / "run_dev.py"
+    return str(interpreter), f'"{script}"', str(script.parent)
+
+
+def desktop_dir() -> Path | None:
+    """桌面目录：优先问 Windows 的 Shell，失败再退回常见路径。"""
+
+    try:
+        import winreg
+
+        key_name = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_name) as key:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+            expanded = Path(str(value)).expanduser()
+            # 注册表里可能带 %USERPROFILE% 之类的环境变量
+            expanded = Path(os.path.expandvars(str(expanded)))
+            if expanded.is_dir():
+                return expanded
+    except (ImportError, OSError):
+        pass
+    candidates = [Path.home() / "Desktop", Path.home() / "桌面"]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def create_desktop_shortcut(name: str = constants.APP_DISPLAY_NAME) -> tuple[bool, str]:
+    """在桌面建一个指向本程序的快捷方式（.lnk）。返回 (是否成功, 说明)。"""
+
+    desktop = desktop_dir()
+    if desktop is None:
+        return False, "找不到桌面目录，无法创建快捷方式"
+    safe_name = "".join(ch for ch in name if ch not in '\\/:*?"<>|').strip() or constants.APP_NAME
+    shortcut = desktop / f"{safe_name}.lnk"
+    exe, arguments, workdir = _target_command()
+    if not Path(exe).exists():
+        return False, f"程序路径不存在：{exe}"
+
+    # 用 PowerShell 调系统自带的 WScript.Shell 生成 .lnk，避免依赖 pywin32。
+    # 各路径通过环境变量传入，免得命令行 / 编码把中文或空格弄坏。
+    script = (
+        "$shell = New-Object -ComObject WScript.Shell\r\n"
+        "$link = $shell.CreateShortcut($env:ATD_LNK)\r\n"
+        "$link.TargetPath = $env:ATD_TARGET\r\n"
+        "$link.Arguments = $env:ATD_ARGS\r\n"
+        "$link.WorkingDirectory = $env:ATD_WORKDIR\r\n"
+        "$link.IconLocation = \"$env:ATD_TARGET,0\"\r\n"
+        "$link.Save()\r\n"
+    )
+    env = dict(os.environ)
+    env.update(
+        {
+            "ATD_LNK": str(shortcut),
+            "ATD_TARGET": exe,
+            "ATD_ARGS": arguments,
+            "ATD_WORKDIR": workdir,
+        }
+    )
+    try:
+        # 打包版没有控制台，这里也把 PowerShell 的窗口藏掉，免得闪一下黑框
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"创建快捷方式失败：{exc}"
+
+    if completed.returncode != 0 or not shortcut.exists():
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return False, f"创建快捷方式失败：{detail or 'PowerShell 未生成文件'}"
+    return True, f"已在桌面创建快捷方式：{shortcut}"
 

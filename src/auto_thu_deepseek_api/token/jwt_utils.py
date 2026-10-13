@@ -7,6 +7,8 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
+from ..constants import TOKEN_LIFETIME_HOURS
+
 JWT_PATTERN = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 
 
@@ -83,6 +85,36 @@ def describe_remaining(token: str) -> str:
     if hours:
         return f"剩余 {hours} 小时 {minutes} 分"
     return f"剩余 {minutes} 分"
+
+
+def expiry_moment(token: str, obtained_at: str | None = None) -> datetime | None:
+    """估算 Token 的到期时刻（本地时区）。
+
+    优先用 Token 自带的 exp；没有 exp 时按"取回时刻 + TOKEN_LIFETIME_HOURS 小时"算，
+    这正是站点"有效期 5 小时"的口径。两种依据都拿不到就返回 None。
+    """
+
+    exp = expiry(token)
+    if exp is not None:
+        return exp.astimezone()
+    if not obtained_at:
+        return None
+    try:
+        base = datetime.fromisoformat(obtained_at)
+    except ValueError:
+        return None
+    if base.tzinfo is None:
+        base = base.astimezone()
+    return (base + timedelta(hours=TOKEN_LIFETIME_HOURS)).astimezone()
+
+
+def describe_expiry(token: str, obtained_at: str | None = None) -> str:
+    """给界面用的到期时刻描述，例如「有效至 2026-10-13 08:05」。"""
+
+    moment = expiry_moment(token, obtained_at)
+    if moment is None:
+        return "到期时间未知"
+    return f"有效至 {moment:%Y-%m-%d %H:%M}"
 
 
 def fingerprint(token: str) -> str:

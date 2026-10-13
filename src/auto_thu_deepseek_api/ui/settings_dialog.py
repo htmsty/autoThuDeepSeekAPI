@@ -21,12 +21,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import paths
+from .. import paths, startup
 from ..backup import BackupManager
 from ..constants import DEFAULT_MODELS
 from ..settings import CCSWITCH_POLICY_DIRECT, CCSWITCH_POLICY_PROMPT, AppSettings
@@ -42,8 +43,24 @@ class SettingsDialog(QDialog):
         self.manual_token = ""
         self.setWindowTitle("设置")
         self.setMinimumWidth(620)
+        self.resize(680, 720)
 
         layout = QVBoxLayout(self)
+
+        # 内容比一屏高，放进滚动区，窗口小的时候也能看到「创建桌面快捷方式」等底部选项
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        content.setParent(scroll)  # 让 C++ 侧持有它，避免 Python 临时变量被回收
+        # 留住 Python 引用：不能只靠父控件关系，否则局部变量出栈时可能连子控件一起被回收
+        self._scroll = scroll
+        self._content = content
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer = QVBoxLayout()
+        self.setLayout(outer)
+        outer.addWidget(scroll, 1)
 
         # —— 目标 ——
         targets_box = QGroupBox("写入目标（检测到哪个写哪个，可分别关闭）")
@@ -86,8 +103,12 @@ class SettingsDialog(QDialog):
             self.policy_prompt.setChecked(True)
         policy_layout.addWidget(self.policy_prompt)
         policy_layout.addWidget(self.policy_direct)
-        self.suppress_warning = QCheckBox("不再显示关闭提醒（等同直接改）")
+        self.suppress_warning = QCheckBox("检测到运行时直接改，不再弹提醒（默认勾选）")
         self.suppress_warning.setChecked(settings.suppress_ccswitch_running_warning)
+        self.suppress_warning.setToolTip(
+            "勾选：CC Switch 正在运行也直接写数据库，不弹提醒。\n"
+            "不勾：每次同步前先提示，由你选「关闭好了，继续」「直接改」还是「取消」。"
+        )
         policy_layout.addWidget(self.suppress_warning)
         layout.addWidget(policy_box)
 
@@ -147,6 +168,11 @@ class SettingsDialog(QDialog):
         self.log_level_combo.setToolTip("DEBUG 会记录更多细节，排查问题时再开")
         more_form.addRow("日志级别", self.log_level_combo)
 
+        self.shortcut_button = QPushButton("创建桌面快捷方式")
+        self.shortcut_button.setToolTip("在桌面生成一个指向本程序的快捷方式，双击即可启动")
+        self.shortcut_button.clicked.connect(self._create_shortcut)
+        more_form.addRow("快捷方式", self.shortcut_button)
+
         layout.addWidget(more_box)
 
         note = QLabel(
@@ -162,7 +188,8 @@ class SettingsDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # 按钮固定在窗口底部，不跟着内容一起滚
+        outer.addWidget(buttons)
 
     # —— 小工具 ——
 
@@ -247,6 +274,14 @@ class SettingsDialog(QDialog):
             return
         self.manual_token = candidate
         QMessageBox.information(self, "手动粘贴 Token", "已记录该 Token，关闭设置后会用它同步。")
+
+    def _create_shortcut(self) -> None:
+        ok, message = startup.create_desktop_shortcut()
+        logger.info(message)
+        if ok:
+            QMessageBox.information(self, "创建桌面快捷方式", message)
+        else:
+            QMessageBox.warning(self, "创建桌面快捷方式", message)
 
     # —— 结果 ——
 

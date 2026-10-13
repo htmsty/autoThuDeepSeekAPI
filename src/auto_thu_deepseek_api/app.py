@@ -65,6 +65,16 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("系统托盘不可用：关闭窗口会直接退出程序")
 
     window = MainWindow(settings, state)
+
+    # 首次运行自动留一份原始配置，且这份备份不会被清理逻辑删掉，
+    # 用户随时能在设置里"一键还原"到程序第一次动它之前的状态。
+    try:
+        from .backup_ops import auto_backup_on_first_run
+
+        auto_backup_on_first_run(settings)
+    except Exception as exc:  # noqa: BLE001 - 首次备份失败不该拖垮启动
+        logger.warning("首次运行自动备份失败：%s", exc)
+
     if start_minimized:
         logger.info("以最小化方式启动")
     else:

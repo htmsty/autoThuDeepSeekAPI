@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "autoThuDeepSeekAPI"
 APP_DISPLAY_NAME = "Auto THU DeepSeek API"
 APP_AUTHOR = "htmsty"
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 REPO_URL = "https://github.com/htmsty/autoThuDeepSeekAPI"
 
 # —— 清华 MadModel ——
@@ -41,8 +41,11 @@ CCSWITCH_API_FORMAT = "openai_chat"
 PROVIDER_DISPLAY_NAME = "DeepSeek (THU)"
 
 # 默认同步间隔（分钟）。站点会话约 45 分钟后可能失效、Token 约 5 小时到期，
-# 20 分钟是"来得来得及、又不至于太频繁"的折中，用户可自行修改。
-DEFAULT_SYNC_INTERVAL_MINUTES = 20
+# 180 分钟是"来得来得及、又不至于太频繁"的折中，用户可自行修改。
+DEFAULT_SYNC_INTERVAL_MINUTES = 180
+
+# 站点 Token 的有效期（小时）。只在 Token 自身没带 exp 时用来估算到期时刻。
+TOKEN_LIFETIME_HOURS = 5
 
 # 站点模型列表读不到时的兜底（2026-10 实测值）。
 DEFAULT_MODELS: tuple[dict[str, object], ...] = (

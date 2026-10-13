@@ -34,7 +34,7 @@ from ..state_store import AppState
 from ..sync import SyncReport, detect_targets
 from ..targets.ccswitch import is_running as ccswitch_is_running
 from ..token.capture import TokenCaptureSession, build_profile
-from ..token.jwt_utils import describe_remaining, is_expired
+from ..token.jwt_utils import describe_expiry, is_expired
 from .icon import app_icon
 from .settings_dialog import SettingsDialog
 from .workers import SyncWorker
@@ -57,7 +57,14 @@ class MainWindow(QMainWindow):
         try:
             self.settings.launch_at_startup = startup.is_enabled()
             if self.settings.launch_at_startup:
-                startup.sync_command()
+                # 路径变了就改成当前路径；值为空（被别处写坏）就直接重写一遍。
+                current = startup.current_command()
+                if current is None or not current.strip():
+                    ok, message = startup.set_enabled(True)
+                    if not ok:
+                        logger.warning("修开机启动项失败：%s", message)
+                else:
+                    startup.sync_command()
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取开机启动状态失败：%s", exc)
 
@@ -286,9 +293,11 @@ class MainWindow(QMainWindow):
         """当前还能用的 Token；没有就返回空串。"""
 
         token = self.state.last_token
-        if token and not is_expired(token):
-            return token
-        return ""
+        # is_expired 返回 None 表示"Token 没带 exp、判断不了"，这种情况当还能用来处理，
+        # 真正的有效性交给站点校验；只有明确已过期（True）才拒绝。
+        if not token or is_expired(token) is True:
+            return ""
+        return token
 
     def check_preflight(self) -> None:
         token = self.current_token()
@@ -436,8 +445,11 @@ class MainWindow(QMainWindow):
             self.ccswitch_status.setText("已关闭写入（设置里可重新开启）")
 
         token = self.state.last_token
-        if token and not is_expired(token):
-            self.token_status.setText(f"{describe_remaining(token)}（{self.state.last_token_at or '时间未知'} 取回）")
+        if token and is_expired(token) is not True:
+            self.token_status.setText(
+                f"{describe_expiry(token, self.state.last_token_at)}"
+                f"（{self.state.last_token_at or '时间未知'} 取回）"
+            )
         elif token:
             self.token_status.setText("已过期，需要重新获取")
         else:
@@ -457,10 +469,24 @@ class MainWindow(QMainWindow):
         if self._busy():
             logger.info("等待对话框期间已经开始了同步，忽略这次请求")
             return
-        if interactive:
+        # 第一次运行、还没有任何历史 Token 时，浏览器档案里也没有可复用的登录会话，
+        # 静默取只会白等超时。这种情况直接开浏览器窗口让用户登录；之后有了缓存就静默取。
+        if not self._should_capture_silently(interactive):
+            logger.info("还没有缓存 Token，改开浏览器窗口完成首次登录")
             self._open_capture(silent=False)
-        else:
-            self._open_capture(silent=True)
+            return
+        self._open_capture(silent=not interactive)
+
+    def _should_capture_silently(self, interactive: bool) -> bool:
+        """自动同步时是否静默取 Token。
+
+        第一次运行还没有任何历史 Token，浏览器档案里没有可复用的登录会话，
+        静默只会白等超时，所以直接开窗口；之后有缓存就走静默。
+        """
+
+        if interactive:
+            return False
+        return bool(self.state.last_token) or bool(self.current_token())
 
     def _busy(self) -> bool:
         """正在同步，或正在取 Token。"""

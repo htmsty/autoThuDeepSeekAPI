@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,8 +18,28 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from auto_thu_deepseek_api import paths  # noqa: E402
 from auto_thu_deepseek_api.settings import CCSWITCH_POLICY_DIRECT, AppSettings  # noqa: E402
 from auto_thu_deepseek_api.state_store import AppState  # noqa: E402
+from auto_thu_deepseek_api.token.jwt_utils import expiry_moment  # noqa: E402
 from auto_thu_deepseek_api.ui.main_window import MainWindow  # noqa: E402
 from auto_thu_deepseek_api.ui.settings_dialog import SettingsDialog  # noqa: E402
+
+from .sandbox import FAKE_OLD_TOKEN  # noqa: E402
+
+
+def _fake_token(expires_in: timedelta) -> str:
+    """造一条带 exp 的假 JWT（结构对就行，我们不验签）。"""
+
+    import base64
+    import json as jsonlib
+
+    header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+    payload = (
+        base64.urlsafe_b64encode(
+            jsonlib.dumps({"exp": int((datetime.now(timezone.utc) + expires_in).timestamp())}).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    return f"{header}.{payload}.signaturepart"
 
 
 class UiSmokeTest(unittest.TestCase):
@@ -80,6 +101,39 @@ class UiSmokeTest(unittest.TestCase):
         root = paths.data_root()
         self.assertTrue(root.is_dir())
         self.assertIn("private", str(root).lower())
+
+    def test_token_status_shows_expiry_moment(self) -> None:
+        token = _fake_token(timedelta(hours=3))
+        state = AppState()
+        state.remember_token(token)
+        window = MainWindow(AppSettings(), state)
+        # 界面显示的是到期时刻，而不是剩余时长
+        self.assertIn("有效至", window.token_status.text())
+        expected = expiry_moment(token, state.last_token_at)
+        assert expected is not None
+        self.assertIn(expected.strftime("%Y-%m-%d %H:%M"), window.token_status.text())
+        window._quitting = True
+        window.close()
+
+    def test_first_run_auto_sync_uses_visible_browser(self) -> None:
+        """没有任何缓存 Token 时，自动同步不该走静默，而是开浏览器窗口。"""
+
+        window = MainWindow(AppSettings(), AppState())
+        self.assertFalse(window._should_capture_silently(interactive=False))
+        window.state.remember_token(FAKE_OLD_TOKEN)
+        self.assertTrue(window._should_capture_silently(interactive=False))
+        self.assertFalse(window._should_capture_silently(interactive=True))
+        window._quitting = True
+        window.close()
+
+    def test_settings_dialog_has_shortcut_button_and_ccswitch_default(self) -> None:
+        settings = AppSettings()
+        dialog = SettingsDialog(settings)
+        # 默认不弹「CC Switch 正在运行」提醒
+        self.assertTrue(dialog.suppress_warning.isChecked())
+        # 目标里要有"创建桌面快捷方式"功能
+        self.assertTrue(hasattr(dialog, "shortcut_button"))
+        dialog.close()
 
 
 if __name__ == "__main__":

@@ -112,10 +112,16 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   `大写键: 值` 形式的引用（`DEEPSEEK_API_KEY` 这类；不会把 `kind`/`secret`/`id` 混进去），
   重写成 `version: 1` + `refs` 的合法结构；一个键都捞不回来就如实报错，不改文件。
 - 供应商：`<.dsh>/profiles/<profile>/cordis.patch.yml` 里 `llm-pi-ai` 的 `config.providers`。
-  先**按标记认领**已有 provider：`apiKeyEnv: MADMODEL_API_KEY` 优先，其次 `baseURL` 指向
-  `madmodel.cs.tsinghua.edu.cn`，再次本地转发 `http://127.0.0.1:xxxx/v1`（DSH 里常见的接法）——
-  认出谁就更新谁，不会在旁边再建一个重复的。找不到时，`madmodel` 键空着才新建；
-  键被别的配置占用则**报错并保持文件原样，不覆盖**。
+  先**按标记认领**已有 provider，规则（2.5.5 起从严，只认"确定是我们自己的"）：
+  1. `apiKeyEnv: MADMODEL_API_KEY`（最硬的标记）；
+  2. `baseURL` 指向 `madmodel.cs.tsinghua.edu.cn`；
+  3. 本地转发 `http://127.0.0.1:xxxx/v1` —— **必须**同时满足"provider 键名就叫 `madmodel`"
+     且"没有别人的 `apiKeyEnv`"。
+  **绝不认领别人的 provider**（`ollama` 默认就是 `127.0.0.1:11434/v1`，早先只按"本地转发"
+  判断时会把它误认成我们的，进而改掉别人的 `apiKeyEnv` 与模型列表——2.5.5 修的就是这个）。
+  写之前还有一道硬护栏：如果该 provider 的 `apiKeyEnv` 另有其人且域名不是清华站，直接报错退出、
+  一个字节都不写。找不到我们的 provider 时，`madmodel` 键空着才新建；键被别的配置占用则
+  **报错并保持文件原样，不覆盖**。
 - 只合并我们负责的字段：`apiKeyEnv` 与 `models`；`displayName` 只在空、或被填成模型 id 时纠正，
   `baseURL` / `api` / `reasoning` 只在缺失时补上，用户自己改过的值不动。
 - **思考档（2.5.3 起的规则）**：provider 级 `reasoning` **只在"用户设的值有模型不支持"时**才改成
@@ -138,6 +144,9 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 - 写库前用 SQLite 备份接口做一致性备份；`database is locked` 时提示关闭 CC Switch。
 - 先算清楚"要写什么"：卡片、`is_current`、同站点旧卡片都无需改动时**不备份也不写库**
   （CC Switch 正在运行时尤其重要）。
+- 刷新"同站点旧卡片"的令牌时只替换**值是 JWT**、或字段名**正好**是
+  `OPENAI_API_KEY` / `api_key` / `token` 之类的位置（2.5.5 起），
+  不再按"名字里含 token 就算"的宽规则乱换 —— 同一张卡片里别的模型的 key 必须原样保留。
 
 ### `backup.py`
 每次写入前把原文件复制到 `private/backups/<时间戳>-<标签>/`，并写入

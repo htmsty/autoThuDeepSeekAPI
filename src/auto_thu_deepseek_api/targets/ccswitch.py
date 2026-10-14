@@ -408,12 +408,21 @@ class CcSwitchTarget:
 
     @staticmethod
     def _is_token_value(key: str, value: str) -> bool:
+        """这个字段是不是"该被换成新 Token"的字段。
+
+        只认两类，避免误改同一张卡片里别的模型的 key：
+        · 值本身就是 JWT（站点发的那种）；
+        · 字段名**正好**是各家卡片放 Token 的名字（OPENAI_API_KEY / api_key / token 等），
+          且值够长——用来兼容偶尔出现的非 JWT 旧 Token。
+        """
+
         if not value:
             return False
         if looks_like_jwt(value):
             return True
-        lowered = key.lower()
-        return any(word in lowered for word in ("apikey", "api_key", "token")) and len(value) > 20
+        lowered = (key or "").lower()
+        exact_names = {"openai_api_key", "anthropic_api_key", "apikey", "api_key", "token", "auth_token"}
+        return lowered in exact_names and len(value) > 20
 
     # —— 路由 ——
 

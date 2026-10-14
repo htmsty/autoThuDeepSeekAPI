@@ -646,6 +646,59 @@ class TargetTestCase(unittest.TestCase):
         self.assertEqual(live["apps"]["codex"]["contract"]["key"], "deadbeef")
         self.assertEqual(live["apps"]["claude"]["mode"], "direct")
 
+    def test_ccswitch_only_refreshes_token_fields_in_old_cards(self) -> None:
+        """刷新同站点旧卡片时只换 Token 字段，卡片里别的模型的 key 一个字都不动。"""
+
+        db = self.sandbox.ccswitch_dir / "cc-switch.db"
+        payload = {
+            "auth": {
+                "OPENAI_API_KEY": FAKE_OLD_TOKEN,
+                "OTHER_MODEL_KEY": "sk-abcdefghijklmnopqrstuvwxyz012345",
+            },
+            "config": (
+                'model_provider = "custom"\n'
+                "[model_providers.custom]\n"
+                'base_url = "https://madmodel.cs.tsinghua.edu.cn/v1"\n'
+            ),
+            "meta": {"someToken": "not-a-jwt-but-long-enough-0123456789"},
+        }
+        connection = sqlite3.connect(db)
+        connection.execute(
+            "UPDATE providers SET settings_config=? WHERE id='madmodel-legacy'",
+            (json.dumps(payload, ensure_ascii=False),),
+        )
+        connection.commit()
+        connection.close()
+
+        target = CcSwitchTarget(
+            TargetPaths(
+                base_dir=self.sandbox.ccswitch_dir,
+                db_file=db,
+                settings_file=self.sandbox.ccswitch_dir / "settings.json",
+                live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        connection = sqlite3.connect(db)
+        row = connection.execute(
+            "SELECT settings_config FROM providers WHERE id='madmodel-legacy'"
+        ).fetchone()
+        connection.close()
+        data = json.loads(row[0])
+        self.assertEqual(data["auth"]["OPENAI_API_KEY"], FAKE_NEW_TOKEN, "本卡片的 Token 应当刷新")
+        self.assertEqual(
+            data["auth"]["OTHER_MODEL_KEY"],
+            "sk-abcdefghijklmnopqrstuvwxyz012345",
+            "别的模型的 key 被改掉了",
+        )
+        self.assertEqual(
+            data["meta"]["someToken"],
+            "not-a-jwt-but-long-enough-0123456789",
+            "不是 Token 的字段被改掉了",
+        )
+
     def test_ccswitch_creates_missing_card(self) -> None:
         connection = sqlite3.connect(self.sandbox.ccswitch_dir / "cc-switch.db")
         connection.execute("DELETE FROM providers WHERE id='deepseek-thu'")
@@ -691,6 +744,183 @@ class TargetTestCase(unittest.TestCase):
         self.assertFalse(second.changed)
         self.assertEqual(len(self.backup.entries()), backups_after_first)
         self.assertTrue(any("未改动 CC Switch 数据库" in note for note in second.messages), second.messages)
+
+    # —— 只动自己的 provider（别碰 ollama / GLM 这些别人的模型） ——
+
+    OTHER_PROVIDERS_PROFILE = """# 用户自己的多 provider 配置（复刻真机）
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      openaifse:
+        displayName: 大模型
+        apiKeyEnv: OPENAIFSE_API_KEY
+        api: openai-completions
+        baseURL: https://llmapi.paratera.com/v1
+        models:
+          - id: DeepSeek-V4-Pro
+            name: DeepSeek-V4-Pro
+      glm:
+        displayName: GLM
+        apiKeyEnv: GLM_API_KEY
+        api: openai-completions
+        baseURL: https://open.bigmodel.cn/api/coding/paas/v4/
+        models:
+          - id: glm-5.3-flash
+            name: glm-5.3-flash
+      ollama:
+        displayName: Ollama
+        apiKeyEnv: OLLAMA_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        models:
+          - id: deepseek-r1:1.5b
+            name: deepseek-r1:1.5b
+      madmodel:
+        displayName: DeepSeek (THU)
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: glm
+    model: glm-5.3-flash
+- id: llm-deepseek
+  name: "@deepseek-ai/dsh-llm-deepseek"
+  config:
+    baseURL: https://ai.paratera.com/v1
+"""
+
+    def _write_profile(self, text: str) -> Path:
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(text, encoding="utf-8")
+        return profile
+
+    def _dsh_target(self, *, unify: bool = False) -> DshTarget:
+        return DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            ),
+            unify_all_profiles=unify,
+        )
+
+    @staticmethod
+    def _parse_entries(path: Path) -> dict:
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="rt").load(path.read_text(encoding="utf-8"))
+        return {entry["id"]: entry for entry in data if isinstance(entry, dict)}
+
+    def test_dsh_does_not_touch_other_providers(self) -> None:
+        """同步只能写 madmodel，绝不能动 openaifse / glm / ollama 这些别人的模型。"""
+
+        profile = self._write_profile(self.OTHER_PROVIDERS_PROFILE)
+        before = self._parse_entries(profile)
+        before_providers = before["llm-pi-ai"]["config"]["providers"]
+
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        after = self._parse_entries(profile)
+        after_providers = after["llm-pi-ai"]["config"]["providers"]
+
+        for key in ("openaifse", "glm", "ollama"):
+            self.assertEqual(
+                after_providers[key],
+                before_providers[key],
+                f"{key} 是别人的 provider，同步不该动它一个字",
+            )
+        # 别的条目（默认模型是 GLM、llm-deepseek）同样不该被碰
+        self.assertEqual(after["agent-default-model"], before["agent-default-model"], "默认模型被改了")
+        self.assertEqual(after["llm-deepseek"], before["llm-deepseek"], "llm-deepseek 条目被改了")
+
+        # 我们自己的 provider 该更新的还是更新了
+        ours = after_providers["madmodel"]
+        self.assertEqual(ours["apiKeyEnv"], "MADMODEL_API_KEY")
+        self.assertIn("qwen3.8-27b", [model["id"] for model in ours["models"]])
+
+    def test_dsh_does_not_claim_other_local_provider(self) -> None:
+        """只有 ollama（127.0.0.1）而没有我们的 provider 时，绝不能认领 ollama。"""
+
+        profile = self._write_profile(
+            """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      ollama:
+        displayName: Ollama
+        apiKeyEnv: OLLAMA_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        models:
+          - id: deepseek-r1:1.5b
+            name: deepseek-r1:1.5b
+"""
+        )
+        before = self._parse_entries(profile)
+        before_ollama = before["llm-pi-ai"]["config"]["providers"]["ollama"]
+
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        after = self._parse_entries(profile)
+        providers = after["llm-pi-ai"]["config"]["providers"]
+        self.assertEqual(providers["ollama"], before_ollama, "别人的本地 provider 被改动了")
+        # 没勾"统一所有 profile"时，这种"本来没有 madmodel"的 profile 直接跳过
+        self.assertNotIn("madmodel", providers, "不勾统一时不该往别人的 profile 里塞 provider")
+
+        # 勾上"统一所有 profile"时才会新建我们自己的 provider —— 但 ollama 仍然一个字节都不动
+        profile.write_text(
+            """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      ollama:
+        displayName: Ollama
+        apiKeyEnv: OLLAMA_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        models:
+          - id: deepseek-r1:1.5b
+            name: deepseek-r1:1.5b
+""",
+            encoding="utf-8",
+        )
+        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        providers = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]
+        self.assertEqual(providers["ollama"], before_ollama, "统一模式也不许动别人的 provider")
+        self.assertIn("madmodel", providers, "统一模式应当新建我们自己的 provider")
+        self.assertEqual(providers["madmodel"]["apiKeyEnv"], "MADMODEL_API_KEY")
+        self.assertEqual(providers["madmodel"]["baseURL"], "https://madmodel.cs.tsinghua.edu.cn/v1")
+
+    def test_dsh_refuses_local_forward_with_foreign_env(self) -> None:
+        """madmodel 这个键被别人的本地转发占着时：报错、不写，原文件保持不变。"""
+
+        text = """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: Ollama
+        apiKeyEnv: OLLAMA_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        models:
+          - id: deepseek-r1:1.5b
+            name: deepseek-r1:1.5b
+"""
+        profile = self._write_profile(text)
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertFalse(result.ok, "占了 madmodel 键的别人配置不该被覆盖")
+        self.assertTrue(any("被其它配置占用" in error for error in result.errors), result.errors)
+        self.assertEqual(profile.read_text(encoding="utf-8"), text, "文件应当原样不动")
 
     # —— 备份与还原 ——
 

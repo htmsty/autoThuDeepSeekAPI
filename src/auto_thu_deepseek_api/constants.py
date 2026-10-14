@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "autoThuDeepSeekAPI"
 APP_DISPLAY_NAME = "Auto THU DeepSeek API"
 APP_AUTHOR = "htmsty"
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 REPO_URL = "https://github.com/htmsty/autoThuDeepSeekAPI"
 
 # —— 清华 MadModel ——

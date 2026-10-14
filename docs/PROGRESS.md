@@ -17,6 +17,7 @@
 | 2.5.2 | 全面检修：修"同标签备份挤一个目录"、自动同步误弹窗、维护期被插入、恢复默认绕过安全流程、prune 未走回收站、提醒仍建目录、重复启动干等 | ✅ 已完成（留档 `releases/2.5.2/`） |
 | 2.5.3 | 修干净卸载 logs 删不掉（日志 handler 泄漏的真根因）；同步不再改用户设的思考档（除非不合法） | ✅ 已完成（留档 `releases/2.5.3/`） |
 | 2.5.4 | 源码复检：坏模型缓存不再搞挂同步；同步线程收尾不再串台 | ✅ 已完成（留档 `releases/2.5.4/`） |
+| 2.5.5 | 修"同步把别的模型的 api 改了"：不再认领别人的本地转发 provider；写前二次核对；CC Switch 只刷 Token 字段 | ✅ 已完成（留档 `releases/2.5.5/`） |
 
 两个版本的**单文件程序**都要留档在 `releases/<版本>/`（不进 Git：单文件 180 MB 超过 GitHub
 单文件 100 MB 上限，改用 `releases/<版本>/SHA256.txt` 记录校验和）。
@@ -274,6 +275,33 @@
 另外把「强行终止并重试」的提示补了一句：网络校验那一步要等它返回（最多约半分钟）才停。
 
 验证：测试 109 → 112 项全绿；版本 2.5.4 打包留档。
+
+## 2.5.5 阶段（本轮）
+
+用户报"同步把别的模型的 api 改了"，并给了真实 `cordis.patch.yml`（`openaifse` / `glm` /
+`ollama` / `madmodel` 四个 provider）。
+
+### 根因
+
+provider 认领规则里"`baseURL` 是本地转发（`127.0.0.1:*/v1`）就算我们的"这条太宽：
+`ollama` 默认就是 `127.0.0.1:11434/v1`，于是在"只配了本地模型、没有 madmodel"的 profile 上，
+我们会把 ollama 认成自己的 provider，接着改掉它的 `apiKeyEnv` 与模型列表。
+
+### 修法
+
+1. 认领从严：只认 `apiKeyEnv: MADMODEL_API_KEY`、`baseURL` 指向清华站点、或"键名叫 madmodel
+   且没有别人的 apiKeyEnv 的本地转发"。
+2. 写前二次核对：`apiKeyEnv` 另有其人且域名不是清华站 → 报错退出、一个字节都不写。
+3. CC Switch 刷新同站点旧卡片时，只替换值是 JWT 或字段名正好是 Token 名的位置
+   （不再"名字里含 token 就算"）。
+
+### 验证
+
+- 用用户真实的 `D:\1\cordis.patch.yml` 跑同步（统一 / 非统一两种模式）：
+  `openaifse` / `glm` / `ollama` / `llm-deepseek` / `ui-settings-general` 逐项完全一致；
+  非统一模式默认模型仍是他自己的 glm（统一模式才会按该开关的语义切到 madmodel）。
+- 新增 4 个用例（复刻多 provider 布局、不许认领别人的本地 provider、madmodel 键被占时报错且文件原样、
+  CC Switch 只刷 Token 字段）；测试 112 → 116 项全绿；版本 2.5.5 打包留档。
 
 ## 大检查清单（按需再走）
 

@@ -292,6 +292,25 @@ class DshTarget:
             provider_key = key
             result.note(f"{name}：已找到 provider {key}")
 
+        # 硬护栏：**绝不改别的模型的配置**。
+        # 只有"这个 provider 的标记就是我们"（或域名就是清华站点）才继续写；
+        # 它的 apiKeyEnv 另有其人时宁可报错退出，也不动它一个字。
+        existing_env = provider.get("apiKeyEnv")
+        existing_base = str(provider.get("baseURL") or "")
+        if (
+            not created_here
+            and isinstance(existing_env, str)
+            and existing_env.strip()
+            and existing_env != constants.DSH_CREDENTIAL_KEY
+            and not self._is_madmodel_url(existing_base)
+        ):
+            result.fail(
+                f"{name}：provider {provider_key} 用的是 {existing_env}，不是本程序的标记，"
+                "按约定不动别的模型配置（要交给本程序维护，请把它改成 "
+                f"{constants.DSH_CREDENTIAL_KEY} 的 provider，或换一个 provider 键）"
+            )
+            return False
+
         # 只合并我们负责的字段：apiKeyEnv 与 models。其余字段只在缺失时补上，
         # 不覆盖用户在 DSH 里自己对名称/地址/思考档的调整。
         provider["apiKeyEnv"] = constants.DSH_CREDENTIAL_KEY
@@ -405,7 +424,18 @@ class DshTarget:
 
     @classmethod
     def _find_provider(cls, providers: dict) -> tuple[str, dict] | None:
-        """先按 apiKeyEnv 认领，再按 baseURL 指向清华站点（或本地转发）认领。"""
+        """只认**确定是我们自己的** provider，别的模型（ollama / lm-studio / GLM…）一律不碰。
+
+        认领规则（从严到宽）：
+        1. `apiKeyEnv: MADMODEL_API_KEY` —— 最硬的标记，一定是我们写的；
+        2. `baseURL` 的域名就是清华站点（madmodel.cs.tsinghua.edu.cn）；
+        3. 本地转发（`http://127.0.0.1:*/v1`）**同时**满足：provider 的键名就叫 `madmodel`，
+           而且它没有别的 `apiKeyEnv`（或本来就是我们的）。
+
+        第 3 条以前只看"是不是本地转发"，结果把用户自己的 `ollama`
+        （`http://127.0.0.1:11434/v1`）也当成我们的 provider 认领了，
+        于是改了别人的 `apiKeyEnv` 和模型列表——这是必须避免的。
+        """
 
         by_env: list[tuple[str, dict]] = []
         by_url: list[tuple[str, dict]] = []
@@ -413,10 +443,18 @@ class DshTarget:
             if not isinstance(entry, dict):
                 continue
             base = str(entry.get("baseURL") or "")
-            if entry.get("apiKeyEnv") == constants.DSH_CREDENTIAL_KEY:
+            env = entry.get("apiKeyEnv")
+            if env == constants.DSH_CREDENTIAL_KEY:
                 by_env.append((str(key), entry))
-            elif cls._is_madmodel_url(base) or cls._is_local_forward(base):
+                continue
+            if cls._is_madmodel_url(base):
                 by_url.append((str(key), entry))
+                continue
+            # 本地转发：必须额外带"我们的痕迹"，否则宁可新建也不认领别人的
+            if cls._is_local_forward(base) and str(key) == constants.DSH_PROVIDER_KEY:
+                if env in (None, "") or env == constants.DSH_CREDENTIAL_KEY:
+                    by_url.append((str(key), entry))
+
         for key, entry in by_env:
             if cls._is_madmodel_url(str(entry.get("baseURL") or "")):
                 return key, entry

@@ -1,5 +1,45 @@
 # 更新记录
 
+## 2.5.5 — 绝不改别人的 provider（修"同步把别的模型的 api 改了"）
+
+用户报：同步把**别的模型**的配置改掉了（附了自己真实的 `cordis.patch.yml`：
+里面有 `openaifse`、`glm`、`ollama`、`madmodel` 四个 provider）。
+
+### 根因
+
+DSH 的 provider 认领规则里有一条**太宽松**："`baseURL` 是本地转发
+（`http://127.0.0.1:*/v1`）就算我们的 provider"。
+而 `ollama` 默认就是 `http://127.0.0.1:11434/v1` —— 于是**别人的本地 provider
+被当成我们的认领了**，接着我们就把它的 `apiKeyEnv` 改成 `MADMODEL_API_KEY`、
+把模型列表换成清华站的模型（在那些"没有 madmodel、只配了本地模型"的 profile 上尤其容易中招）。
+
+### 修法（只认"确定是我们自己的"）
+
+现在只有这三种情况才会动一个 provider：
+
+1. `apiKeyEnv: MADMODEL_API_KEY` —— 最硬的标记，一定是我们写的；
+2. `baseURL` 的域名就是 `madmodel.cs.tsinghua.edu.cn`；
+3. 本地转发（`127.0.0.1:*/v1`）**且** provider 的键名就叫 `madmodel`、且它没有别的 `apiKeyEnv`。
+
+另外加了两道硬护栏：
+
+- 写之前再核一次：如果这个 provider 的 `apiKeyEnv` 另有其人（不是我们的标记、域名也不是清华站），
+  直接报错退出、**一个字节都不写**；
+- CC Switch 刷新"同站点旧卡片"时，只替换**值是 JWT** 或字段名**正好**是
+  `OPENAI_API_KEY`/`api_key`/`token` 之类的位置，不再按"名字里含 token 就算"这种宽规则乱换
+  （免得同一张卡片里别的模型的 key 被顺手改掉）。
+
+### 验证
+
+- 用你给的 `D:\1\cordis.patch.yml` **原文件**跑真实同步（统一 / 非统一两种模式）：
+  `openaifse`、`glm`、`ollama`、`llm-deepseek`、`ui-settings-general` **逐项对比完全一致**；
+  非统一模式下默认模型仍是你自己的 `glm / glm-5.3-flash`（统一模式按设置把默认模型切到 madmodel，
+  这是那个开关本身的语义）。
+- 新增 4 个用例：复刻你的多 provider 布局（别人的 provider 必须逐字段相等、默认模型与
+  其它条目不许动）、只有 ollama 时不许认领它（不勾统一就跳过、勾了才新建我们自己的 provider）、
+  `madmodel` 键被别人的本地转发占着时报错且文件原样、CC Switch 同站点旧卡片只刷 Token 字段。
+- 测试 112 → **116 项全绿**；打包 2.5.5 留档，两个版本 `--selftest` 通过。
+
 ## 2.5.4 — 源码复检：坏模型缓存不再搞挂同步、同步线程收尾不再串台
 
 按要求把全部源码又过了一遍，找到并修掉两处（都会在特定情况下把功能搞坏）。

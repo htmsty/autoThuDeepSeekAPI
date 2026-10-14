@@ -72,21 +72,6 @@ def is_expired(token: str, now: datetime | None = None, skew: timedelta = timede
     return left <= skew
 
 
-def describe_remaining(token: str) -> str:
-    """给界面用的剩余时间描述。"""
-
-    left = remaining(token)
-    if left is None:
-        return "无法解析到期时间"
-    total_minutes = int(left.total_seconds() // 60)
-    if total_minutes < 0:
-        return "已过期"
-    hours, minutes = divmod(total_minutes, 60)
-    if hours:
-        return f"剩余 {hours} 小时 {minutes} 分"
-    return f"剩余 {minutes} 分"
-
-
 def expiry_moment(token: str, obtained_at: str | None = None) -> datetime | None:
     """估算 Token 的到期时刻（本地时区）。
 

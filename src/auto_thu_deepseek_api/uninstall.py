@@ -38,13 +38,13 @@ def clean_uninstall(settings: AppSettings, *, restore_targets: bool) -> tuple[bo
     lines.extend(paths.remove_managed_data(root))
 
     pointer = paths.private_pointer_file()
-    try:
-        if pointer.exists():
-            pointer.unlink()
+    if pointer.exists():
+        # 走统一入口：删指针 + 重置数据根缓存
+        if paths.clear_private_override():
             lines.append(f"已删除位置指针 {pointer}")
-    except OSError as exc:
-        ok = False
-        lines.append(f"没删掉位置指针 {pointer}：{exc}")
+        else:
+            ok = False
+            lines.append(f"没删掉位置指针 {pointer}（详见日志）")
 
     # 以前可能退回到 %LOCALAPPDATA%\autoThuDeepSeekAPI\private，顺手也清一份
     fallback = paths.local_app_dir() / "private"

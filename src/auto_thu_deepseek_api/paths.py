@@ -153,16 +153,19 @@ def write_private_override(path: Path, migrated_from: Path | None = None) -> Non
     reset_data_root_cache()
 
 
-def clear_private_override() -> None:
-    """把位置指针删掉（恢复默认位置 / 干净卸载时用）。"""
+def clear_private_override() -> bool:
+    """把位置指针删掉（恢复默认位置 / 干净卸载时用）。返回是否删干净（本来就没有也算）。"""
 
+    deleted = True
     try:
         private_pointer_file().unlink()
     except FileNotFoundError:
         pass
     except OSError as exc:  # pragma: no cover - 删不掉不算致命
         logger.warning("删除 private 位置指针失败：%s", exc)
+        deleted = False
     reset_data_root_cache()
+    return deleted
 
 
 def desktop_dir() -> Path | None:

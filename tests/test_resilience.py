@@ -278,14 +278,12 @@ class TokenTimeTest(unittest.TestCase):
 
         self.assertFalse(jwt_utils.is_expired(future, now=now))
         self.assertTrue(jwt_utils.is_expired(past, now=now))
-        self.assertEqual(jwt_utils.describe_remaining(really_expired), "已过期")
+        self.assertTrue(jwt_utils.is_expired(really_expired), "五分钟前就过期的 Token 应当算过期")
         self.assertIsNone(jwt_utils.is_expired("not-a-jwt", now=now))
 
-        # describe_remaining 用的是本机当前时间，这里按真实时间造一个 2.5 小时后的 Token
+        # 界面用的是"有效至 …"（到期时刻），不是"剩余多少"
         soon = make_token(datetime.now(timezone.utc) + timedelta(hours=2, minutes=30))
-        described = jwt_utils.describe_remaining(soon)
-        self.assertIn("剩余", described)
-        self.assertIn("小时", described)
+        self.assertIn("有效至", jwt_utils.describe_expiry(soon, "2026-10-14T00:00:00"))
 
     def test_expiry_moment_prefers_jwt_exp(self) -> None:
         import base64

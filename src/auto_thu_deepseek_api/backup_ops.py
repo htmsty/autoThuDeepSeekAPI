@@ -79,7 +79,8 @@ def auto_backup_on_first_run(settings: AppSettings) -> int:
     """
 
     manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
-    already = {entry.source for entry in manager.entries() if entry.is_original or is_original_label(entry.label)}
+    # 复用 original_backed_up_sources()，别在这里再抄一遍判定
+    already = original_backed_up_sources(settings)
     # 同一次操作的文件共用一个快照目录，方便人工翻看"首次备份那一批"
     snapshot_label = "original-first-run"
     pending = [

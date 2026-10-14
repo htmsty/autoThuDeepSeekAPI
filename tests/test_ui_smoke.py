@@ -129,8 +129,8 @@ class UiSmokeTest(unittest.TestCase):
     def test_settings_dialog_has_shortcut_button_and_ccswitch_default(self) -> None:
         settings = AppSettings()
         dialog = SettingsDialog(settings)
-        # 默认不弹「CC Switch 正在运行」提醒
-        self.assertTrue(dialog.suppress_warning.isChecked())
+        # 默认不弹「CC Switch 正在运行」提醒 = 运行策略选「不提示，直接改」
+        self.assertTrue(dialog.policy_direct.isChecked())
         # 目标里要有"创建桌面快捷方式"功能
         self.assertTrue(hasattr(dialog, "shortcut_button"))
         dialog.close()
@@ -293,6 +293,201 @@ class UiSmokeTest(unittest.TestCase):
         worker = SyncWorker(AppSettings(), "token")
         worker.request_cancel()
         self.assertTrue(worker._cancel.is_set(), "终止请求应当是「请它停下」，不是杀线程")
+
+
+class UiInteractionTest(unittest.TestCase):
+    """正式版交互走查：新加的入口、提示与互斥逻辑都要有去处。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._old_localappdata = os.environ.get("LOCALAPPDATA")
+        os.environ["LOCALAPPDATA"] = cls._tmp.name
+        cls.application = QApplication.instance() or QApplication(sys.argv[:1])
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._old_localappdata is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = cls._old_localappdata
+        cls._tmp.cleanup()
+
+    @staticmethod
+    def _close(window) -> None:  # noqa: ANN001
+        window._quitting = True
+        window.close()
+
+    def test_qt_standard_buttons_are_chinese(self) -> None:
+        """QMessageBox 的标准按钮（是/否）必须是中文，不能英文中文混着显示。"""
+
+        from PySide6.QtWidgets import QMessageBox
+
+        from auto_thu_deepseek_api.app import _install_qt_translations
+
+        application = QApplication.instance()
+        assert application is not None
+        _install_qt_translations(application)  # 幂等：装过再装一次也没事
+        box = QMessageBox()
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        texts = [button.text() for button in box.buttons()]
+        box.deleteLater()
+        self.assertTrue(texts, "标准按钮应该存在")
+        for text in texts:
+            self.assertTrue(
+                any("\u4e00" <= char <= "\u9fff" for char in text),
+                f"标准按钮文案没被翻译：{text!r}",
+            )
+
+    def test_about_dialog_shows_version_and_repo(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        from auto_thu_deepseek_api import constants
+
+        window = MainWindow(AppSettings(), AppState())
+        boxes: list[QMessageBox] = []
+        original_exec = QMessageBox.exec
+        QMessageBox.exec = lambda self: (boxes.append(self), 0)[1]  # type: ignore[assignment]
+        try:
+            window.show_about()
+        finally:
+            QMessageBox.exec = original_exec  # type: ignore[assignment]
+            self._close(window)
+        self.assertTrue(boxes, "「关于」应当弹出对话框")
+        text = boxes[0].text() + boxes[0].informativeText()
+        self.assertIn(constants.APP_VERSION, text)
+        self.assertIn(constants.REPO_URL, text)
+        self.assertIn(str(paths.data_root()), text)
+
+    def test_restore_defaults_syncs_every_widget(self) -> None:
+        """恢复默认后，对话框里每个控件都要跟着回到默认值 —— 漏一个，
+        用户点「确定」时又会把它写回去，等于没恢复。"""
+
+        from auto_thu_deepseek_api.settings import CCSWITCH_POLICY_PROMPT, reset_to_defaults
+
+        settings = AppSettings(
+            ccswitch_refresh_sibling_cards=True,
+            ccswitch_running_policy=CCSWITCH_POLICY_PROMPT,
+        )
+        dialog = SettingsDialog(settings)
+        reset_to_defaults(dialog.settings)
+        dialog._reset_widgets_to_defaults()
+        try:
+            self.assertFalse(
+                dialog.refresh_siblings_check.isChecked(),
+                "「顺带刷新同站点旧卡片」没有跟着恢复默认（点确定时会被写回去）",
+            )
+            self.assertTrue(dialog.policy_direct.isChecked(), "运行策略要回到默认的「直接改」")
+            self.assertEqual(dialog.keep_spin.value(), AppSettings().backup_keep)
+        finally:
+            dialog.close()
+
+    def test_manual_token_is_ignored_while_busy(self) -> None:
+        """正在同步/取 Token 时，手动粘贴的 Token 不能另起一个写入线程。"""
+
+        from unittest import mock
+
+        from PySide6.QtWidgets import QDialog, QMessageBox
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        class FakeDialog:
+            DialogCode = QDialog.DialogCode
+
+            def __init__(self, settings, parent=None) -> None:  # noqa: ANN001, ANN002
+                self.manual_token = FAKE_OLD_TOKEN
+
+            def exec(self):  # noqa: ANN201
+                return QDialog.DialogCode.Accepted
+
+            def apply_to(self, settings) -> None:  # noqa: ANN001
+                pass
+
+        window = MainWindow(AppSettings(), AppState())
+        started: list[str] = []
+        window._start_sync_worker = lambda token: started.append(token)  # type: ignore[assignment]
+        window._capture = object()  # 假装正在取 Token（_busy() → True）
+        original_dialog = main_window_module.SettingsDialog
+        main_window_module.SettingsDialog = FakeDialog  # type: ignore[assignment]
+        try:
+            with mock.patch.object(QMessageBox, "warning") as warning:
+                window.open_settings()
+            self.assertEqual(started, [], "忙碌时不该启动第二个写入线程")
+            self.assertTrue(warning.called, "应当提示用户这份 Token 这次没用上")
+        finally:
+            main_window_module.SettingsDialog = original_dialog  # type: ignore[assignment]
+            window._capture = None
+            self._close(window)
+
+    def test_desktop_notice_not_repeated_in_same_run(self) -> None:
+        """启动早期弹过「程序在桌面」提醒后，主窗口启动检查不能在同一轮再弹一次。"""
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        window = MainWindow(AppSettings(), AppState(), desktop_notice_done=True)
+        calls: list[bool] = []
+        original_notice = main_window_module.data_location.desktop_notice
+        original_desktop = main_window_module.startup.is_app_on_desktop
+        main_window_module.data_location.desktop_notice = lambda *a, **k: calls.append(True) or True  # type: ignore[assignment]
+        main_window_module.startup.is_app_on_desktop = lambda: True  # type: ignore[assignment]
+        try:
+            self.assertTrue(window._check_desktop_private())
+        finally:
+            main_window_module.data_location.desktop_notice = original_notice  # type: ignore[assignment]
+            main_window_module.startup.is_app_on_desktop = original_desktop  # type: ignore[assignment]
+            self._close(window)
+        self.assertEqual(calls, [], "同一轮启动里不该再弹一次")
+
+    def test_sync_is_refused_when_no_target_is_enabled(self) -> None:
+        """两个写入目标都关着时，同步要么提示、要么跳过，不能跑到「没有任何目标被写入」。"""
+
+        from unittest import mock
+
+        from PySide6.QtWidgets import QMessageBox
+
+        settings = AppSettings(enable_dsh=False, enable_ccswitch=False)
+        window = MainWindow(settings, AppState())
+        try:
+            window.start_sync(interactive=False)
+            self.assertIsNone(window._capture, "非交互时应当直接跳过")
+            with mock.patch.object(QMessageBox, "warning") as warning:
+                window.start_sync(interactive=True)
+            self.assertTrue(warning.called, "交互式点击时要说清楚为什么没同步")
+        finally:
+            self._close(window)
+
+    def test_tray_double_click_shows_window(self) -> None:
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        window = MainWindow(AppSettings(), AppState())
+        shown: list[bool] = []
+        window.show_window = lambda: shown.append(True)  # type: ignore[assignment]
+        try:
+            window._on_tray_activated(QSystemTrayIcon.ActivationReason.DoubleClick)
+            self.assertEqual(shown, [True])
+        finally:
+            self._close(window)
+
+    def test_preflight_worker_emits_report(self) -> None:
+        """「校验写入内容」走后台线程：跑完要把报告发回主线程。"""
+
+        from auto_thu_deepseek_api.ui import workers as workers_module
+
+        class FakeReport:
+            def text(self) -> str:
+                return "预检通过（假报告）"
+
+        original = workers_module.run_preflight
+        workers_module.run_preflight = lambda settings, token: FakeReport()  # type: ignore[assignment]
+        try:
+            worker = workers_module.PreflightWorker(AppSettings(), FAKE_OLD_TOKEN)
+            reports: list[object] = []
+            worker.reportReady.connect(reports.append)
+            worker.run()  # 直接同步跑一遍，不真起线程
+        finally:
+            workers_module.run_preflight = original  # type: ignore[assignment]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].text(), "预检通过（假报告）")
 
 
 if __name__ == "__main__":

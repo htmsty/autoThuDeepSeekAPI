@@ -15,7 +15,9 @@ CCSWITCH_POLICY_DIRECT = "direct"
 # 设置文件版本。
 #   v2：默认勾选「统一所有 profile 到 madmodel」。
 #   v3：默认开启自动同步、间隔 180 分钟，并默认不弹「CC Switch 正在运行」提醒。
-SETTINGS_VERSION = 3
+#   v4：「CC Switch 正在运行时」的策略合并成一个选项（原来的"不再弹提醒"复选框
+#       等价于"不提示、直接改"，两个控件会互相矛盾，已去掉）。
+SETTINGS_VERSION = 4
 
 # 「恢复默认设置」时**不**动的字段：它们不是"设置项"，而是运行状态或系统状态。
 RESET_KEEP_FIELDS = (
@@ -64,8 +66,8 @@ class AppSettings:
     unify_all_profiles: bool = True
 
     # CC Switch 细节
-    ccswitch_running_policy: str = CCSWITCH_POLICY_PROMPT
-    suppress_ccswitch_running_warning: bool = True
+    # 默认"不提示、直接改"：这和 v3 之前的实际行为一致（那时默认勾着"不再弹提醒"）
+    ccswitch_running_policy: str = CCSWITCH_POLICY_DIRECT
     # 「顺带刷新同站点旧卡片」会改动别的卡片，默认关（要的用户自己开）
     ccswitch_refresh_sibling_cards: bool = False
 
@@ -115,12 +117,23 @@ class AppSettings:
             # v2 → v3：默认开启自动同步，并默认不弹 CC Switch 运行中提醒。
             # 间隔默认值已在 dataclass 里改成 180；用户自己填过的分钟数保留，不覆盖。
             settings.auto_sync_enabled = True
-            settings.suppress_ccswitch_running_warning = True
             migrated = True
             logging.getLogger(__name__).info(
-                "设置已升级到 v%d：默认开启自动同步，不再提示 CC Switch 正在运行（当前间隔 %d 分钟）",
-                SETTINGS_VERSION,
+                "设置已升级到 v3：默认开启自动同步（当前间隔 %d 分钟）",
                 settings.sync_interval_minutes,
+            )
+        if version < 4:
+            # v3 → v4：把"不再弹提醒"复选框合并进"运行策略"。
+            # 老配置里 suppress=True（旧默认）等价于"直接改"，False 等价于"先提示"。
+            legacy_suppress = raw.get("suppress_ccswitch_running_warning")
+            settings.ccswitch_running_policy = (
+                CCSWITCH_POLICY_PROMPT if legacy_suppress is False else CCSWITCH_POLICY_DIRECT
+            )
+            migrated = True
+            logging.getLogger(__name__).info(
+                "设置已升级到 v%d：CC Switch 运行策略合并为一个选项（当前：%s）",
+                SETTINGS_VERSION,
+                settings.ccswitch_running_policy,
             )
         if version < SETTINGS_VERSION:
             settings.settings_version = SETTINGS_VERSION

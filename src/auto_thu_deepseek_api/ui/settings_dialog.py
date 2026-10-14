@@ -111,21 +111,20 @@ class SettingsDialog(QDialog):
         # —— CC Switch 运行中 ——
         policy_box = QGroupBox("CC Switch 正在运行时")
         policy_layout = QVBoxLayout(policy_box)
-        self.policy_prompt = QRadioButton("提示我先关闭，再由我决定")
-        self.policy_direct = QRadioButton("不提示，直接改数据库")
+        self.policy_prompt = QRadioButton("先提示我，由我决定（关闭好了继续 / 直接改 / 取消）")
+        self.policy_prompt.setToolTip(
+            "每次同步前检测到 CC Switch 正在运行就先问一次，不会自己动它的数据库"
+        )
+        self.policy_direct = QRadioButton("不提示，直接改数据库（更快，可能被正在运行的 CC Switch 覆盖）")
+        self.policy_direct.setToolTip(
+            "不弹提醒直接写；CC Switch 之后可能用内存里的旧数据把这次修改覆盖回去"
+        )
         if settings.ccswitch_running_policy == CCSWITCH_POLICY_DIRECT:
             self.policy_direct.setChecked(True)
         else:
             self.policy_prompt.setChecked(True)
         policy_layout.addWidget(self.policy_prompt)
         policy_layout.addWidget(self.policy_direct)
-        self.suppress_warning = QCheckBox("检测到运行时直接改，不再弹提醒（默认勾选）")
-        self.suppress_warning.setChecked(settings.suppress_ccswitch_running_warning)
-        self.suppress_warning.setToolTip(
-            "勾选：CC Switch 正在运行也直接写数据库，不弹提醒。\n"
-            "不勾：每次同步前先提示，由你选「关闭好了，继续」「直接改」还是「取消」。"
-        )
-        policy_layout.addWidget(self.suppress_warning)
         layout.addWidget(policy_box)
 
         # —— 备份 ——
@@ -229,7 +228,7 @@ class SettingsDialog(QDialog):
 
         note = QLabel(
             f"运行数据目录：{paths.data_root()}\n"
-            "所有 Token、日志、备份与浏览器会话都保存在这里，默认不进入 Git。"
+            "Token、日志、备份与浏览器会话都只保存在本机这个目录里，不会上传到任何服务器。"
         )
         note.setWordWrap(True)
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -308,7 +307,12 @@ class SettingsDialog(QDialog):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        messages = manager.restore(entries)
+        try:
+            messages = manager.restore(entries)
+        except OSError as exc:
+            logger.error("还原失败：%s", exc)
+            QMessageBox.warning(self, "还原结果", f"还原失败：{exc}")
+            return
         QMessageBox.information(self, "还原结果", "\n".join(messages) or "没有可还原的内容。")
 
     def _paste_token(self) -> None:
@@ -364,14 +368,21 @@ class SettingsDialog(QDialog):
     def _restore_defaults(self) -> None:
         """一键恢复默认设置（开机启动项不动；private 位置会另外问）。"""
 
+        defaults = AppSettings()  # 文案里的默认值直接从默认设置取，改了默认值这里跟着变
         if QMessageBox.question(
             self,
             "恢复默认设置",
             "将把设置恢复成默认值：\n"
-            "· 自动同步：开，间隔 180 分钟，启动时立即同步：开\n"
-            "· 统一所有 profile 到 madmodel：勾选\n"
-            "· 同步前预检：开；CC Switch 运行中：不弹提醒、直接改\n"
-            "· 备份保留 10 份；静默取 Token 超时 40 秒；日志级别 INFO；关窗最小化到托盘\n\n"
+            f"· 自动同步：{'开' if defaults.auto_sync_enabled else '关'}，"
+            f"间隔 {defaults.sync_interval_minutes} 分钟，"
+            f"启动时立即同步：{'开' if defaults.sync_on_start else '关'}\n"
+            f"· 统一所有 profile 到 madmodel："
+            f"{'勾选' if defaults.unify_all_profiles else '不勾选'}\n"
+            f"· 同步前预检：{'开' if defaults.preflight_enabled else '关'}；"
+            "CC Switch 运行中：不弹提醒、直接改\n"
+            f"· 备份保留 {defaults.backup_keep} 份；静默取 Token 超时 "
+            f"{defaults.silent_capture_timeout_seconds} 秒；日志级别 {defaults.log_level}；"
+            f"关窗{'最小化到托盘' if defaults.close_to_tray else '直接退出'}\n\n"
             "开机启动项（注册表）保持现状，不会被动。\n确定恢复吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -403,11 +414,13 @@ class SettingsDialog(QDialog):
         self.unify_profiles.setChecked(settings.unify_all_profiles)
         self.ccswitch_enabled.setChecked(settings.enable_ccswitch)
         self.ccswitch_dir_edit.setText(settings.ccswitch_dir)
+        # 别忘了这个：漏掉它的话，"恢复默认设置"把配置改成 False，
+        # 对话框里却还勾着，点确定时又会写回 True，等于没恢复。
+        self.refresh_siblings_check.setChecked(settings.ccswitch_refresh_sibling_cards)
         if settings.ccswitch_running_policy == CCSWITCH_POLICY_DIRECT:
             self.policy_direct.setChecked(True)
         else:
             self.policy_prompt.setChecked(True)
-        self.suppress_warning.setChecked(settings.suppress_ccswitch_running_warning)
         self.keep_spin.setValue(settings.backup_keep)
         self.preflight_check.setChecked(settings.preflight_enabled)
         self.close_to_tray_check.setChecked(settings.close_to_tray)
@@ -537,10 +550,8 @@ class SettingsDialog(QDialog):
         settings.unify_all_profiles = self.unify_profiles.isChecked()
         settings.ccswitch_refresh_sibling_cards = self.refresh_siblings_check.isChecked()
         settings.ccswitch_running_policy = (
-            CCSWITCH_POLICY_DIRECT if (self.policy_direct.isChecked() or self.suppress_warning.isChecked())
-            else CCSWITCH_POLICY_PROMPT
+            CCSWITCH_POLICY_DIRECT if self.policy_direct.isChecked() else CCSWITCH_POLICY_PROMPT
         )
-        settings.suppress_ccswitch_running_warning = self.suppress_warning.isChecked()
         settings.backup_keep = self.keep_spin.value()
         settings.preflight_enabled = self.preflight_check.isChecked()
         settings.close_to_tray = self.close_to_tray_check.isChecked()

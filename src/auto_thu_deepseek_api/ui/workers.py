@@ -8,6 +8,7 @@ import threading
 
 from PySide6.QtCore import QThread, Signal
 
+from ..preflight import run_preflight
 from ..settings import AppSettings
 from ..sync import SyncReport, run_sync
 
@@ -40,6 +41,31 @@ class SyncWorker(QThread):
             )
         except Exception as exc:  # noqa: BLE001 - 线程里必须兜住所有异常
             logger.exception("同步失败")
+            self.failed.emit(str(exc))
+            return
+        self.reportReady.emit(report)
+
+
+class PreflightWorker(QThread):
+    """后台跑「校验写入内容」。
+
+    预检本身是只读的，但读模型清单那一步可能要联网（站点前端包最大 8 MB），
+    放在主线程里会把界面卡住几十秒 —— 所以和同步一样丢到后台线程。
+    """
+
+    reportReady = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, settings: AppSettings, token: str, parent=None) -> None:
+        super().__init__(parent)
+        self._settings = copy.deepcopy(settings)
+        self._token = token
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            report = run_preflight(self._settings, self._token)
+        except Exception as exc:  # noqa: BLE001 - 线程里必须兜住所有异常
+            logger.exception("预检失败")
             self.failed.emit(str(exc))
             return
         self.reportReady.emit(report)

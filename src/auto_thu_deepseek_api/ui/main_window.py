@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import backup_ops, constants, data_location, instance, paths, preflight, startup
+from .. import backup_ops, constants, data_location, instance, paths, startup
 from ..logging_setup import close_file_handlers, log_bus, setup_logging
 from ..settings import CCSWITCH_POLICY_DIRECT, AppSettings
 from ..state_store import AppState
@@ -39,18 +39,27 @@ from ..token.capture import TokenCaptureSession, build_profile
 from ..token.jwt_utils import describe_expiry, is_expired
 from .icon import app_icon
 from .settings_dialog import SettingsDialog
-from .workers import SyncWorker
+from .workers import PreflightWorker, SyncWorker
 
 logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: AppSettings, state: AppState) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        state: AppState,
+        *,
+        desktop_notice_done: bool = False,
+    ) -> None:
         super().__init__()
         self.settings = settings
         self.state = state
+        # 启动早期（主窗口还没建）已经弹过"程序在桌面"的提醒：这一次启动别再弹第二遍
+        self._desktop_notice_done = bool(desktop_notice_done)
         self._quitting = False
         self._sync_worker: SyncWorker | None = None
+        self._preflight_worker: PreflightWorker | None = None
         self._capture: TokenCaptureSession | None = None
         self._browser_profile = None
         self._tray_hint_shown = False
@@ -80,6 +89,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(constants.APP_DISPLAY_NAME)
         self.setWindowIcon(app_icon())
+        # 按钮那一行很长，窗口再窄就会被挤到看不清
+        self.setMinimumSize(820, 560)
         self.resize(880, 640)
 
         self._build_ui()
@@ -119,6 +130,8 @@ class MainWindow(QMainWindow):
             label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             status_grid.addWidget(label, row, 0)
             widget.setWordWrap(True)
+            # 路径这类内容要能选中复制（报障时用得上）
+            widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             status_grid.addWidget(widget, row, 1)
         status_grid.setColumnStretch(1, 1)
         layout.addWidget(status_box)
@@ -141,17 +154,21 @@ class MainWindow(QMainWindow):
         actions_layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
-        self.config_button = QPushButton("打开配置")
+        self.config_button = QPushButton("设置…")
+        self.config_button.setToolTip("写入目标、CC Switch 策略、备份与维护都在这里")
         self.shortcut_button = QPushButton("创建桌面快捷方式")
         self.shortcut_button.setToolTip("在桌面生成一个指向本程序的快捷方式，双击即可启动")
         self.log_button = QPushButton("打开日志")
         self.data_button = QPushButton("打开数据目录")
+        self.about_button = QPushButton("关于…")
+        self.about_button.setToolTip("版本、作者、项目主页与运行数据目录")
         self.exit_button = QPushButton("退出")
         for button in (
             self.config_button,
             self.shortcut_button,
             self.log_button,
             self.data_button,
+            self.about_button,
             self.exit_button,
         ):
             second_row.addWidget(button)
@@ -199,7 +216,7 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_view)
         layout.addWidget(log_box, 1)
 
-        self.statusBar().showMessage(f"数据目录：{paths.data_root()}")
+        self._restore_status_hint()
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(app_icon(), self)
@@ -214,6 +231,8 @@ class MainWindow(QMainWindow):
         log_action.triggered.connect(self.open_log)
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self.open_settings)
+        about_action = QAction("关于", self)
+        about_action.triggered.connect(self.show_about)
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.quit_app)
 
@@ -222,6 +241,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(log_action)
         menu.addAction(settings_action)
+        menu.addAction(about_action)
         menu.addSeparator()
         menu.addAction(quit_action)
         self.tray_menu = menu
@@ -237,6 +257,7 @@ class MainWindow(QMainWindow):
         self.shortcut_button.clicked.connect(self.create_shortcut)
         self.log_button.clicked.connect(self.open_log)
         self.data_button.clicked.connect(lambda: self._open_path(paths.data_root()))
+        self.about_button.clicked.connect(self.show_about)
         self.exit_button.clicked.connect(self.quit_app)
 
         self.startup_check.toggled.connect(self._toggle_startup)
@@ -324,9 +345,25 @@ class MainWindow(QMainWindow):
             logger.info("日志级别已切换为 %s", self.settings.log_level)
         logger.info("设置已保存")
         self.refresh_status()
-        if dialog.manual_token:
-            logger.info("使用手动粘贴的 Token 开始同步")
-            self._start_sync_worker(dialog.manual_token)
+        if not dialog.manual_token:
+            return
+        if self._maintenance or self._busy():
+            # 忙碌时不能再起一个写入线程：两个线程同时写同一批文件会打架
+            logger.info("正在忙，手动粘贴的 Token 这次没有使用")
+            QMessageBox.warning(
+                self,
+                "手动粘贴 Token",
+                "当前正在同步或正在取 Token，这份 Token 这次没有使用。\n"
+                "等它结束以后再粘贴一次（或用「立即获取并同步」）。",
+            )
+            return
+        try:
+            self.state.remember_token(dialog.manual_token)
+        except OSError as exc:
+            logger.error("保存手动粘贴的 Token 失败：%s", exc)
+        self.refresh_status()
+        logger.info("使用手动粘贴的 Token 开始同步")
+        self._start_sync_worker(dialog.manual_token)
 
     def open_log(self) -> None:
         log_dir = paths.logs_dir()
@@ -373,6 +410,8 @@ class MainWindow(QMainWindow):
     def _check_desktop_private(self) -> bool:
         """程序直接在桌面根目录时提醒用户；返回 False 表示已经退出程序。"""
 
+        if self._desktop_notice_done:
+            return True
         if self.state.desktop_note_ack:
             return True
         if paths.read_private_override() is not None:
@@ -567,15 +606,46 @@ class MainWindow(QMainWindow):
                 self, "校验写入内容", "需要先获取一次 Token（点「立即获取并同步」），再回来校验。"
             )
             return
+        if self._preflight_worker is not None:
+            logger.info("上一次校验还没结束，忽略这次请求")
+            return
+        self.preflight_button.setEnabled(False)
+        self._show_status_hint("正在校验将要写入的内容…（只读，不改文件）")
+        worker = PreflightWorker(self.settings, token, self)
+        self._preflight_worker = worker
+        worker.reportReady.connect(lambda report, w=worker: self._on_preflight_report(report, w))
+        worker.failed.connect(lambda message, w=worker: self._on_preflight_failed(message, w))
+        worker.finished.connect(lambda w=worker: self._on_preflight_finished(w))
         try:
-            report = preflight.run_preflight(self.settings, token)
+            worker.start()
         except Exception as exc:  # noqa: BLE001 - 预检本身出问题也要如实说
-            logger.exception("预检失败")
-            QMessageBox.warning(self, "校验写入内容", f"预检失败：{exc}")
+            logger.exception("预检线程启动失败")
+            self._preflight_worker = None
+            self.preflight_button.setEnabled(True)
+            self._restore_status_hint()
+            QMessageBox.warning(self, "校验写入内容", f"预检启动失败：{exc}")
+
+    def _on_preflight_report(self, report, worker=None) -> None:  # noqa: ANN001
+        if worker is not None and worker is not self._preflight_worker:
             return
         for line in report.text().splitlines():
             logger.info("预检 %s", line)
         QMessageBox.information(self, "校验写入内容", report.text())
+
+    def _on_preflight_failed(self, message: str, worker=None) -> None:
+        if worker is not None and worker is not self._preflight_worker:
+            return
+        logger.error("预检失败：%s", message)
+        QMessageBox.warning(self, "校验写入内容", f"预检失败：{message}")
+
+    def _on_preflight_finished(self, worker=None) -> None:
+        if worker is None:
+            worker = self.sender()
+        if worker is not None and worker is not self._preflight_worker:
+            return
+        self._preflight_worker = None
+        self.preflight_button.setEnabled(True)
+        self._restore_status_hint()
 
     def manual_backup(self) -> None:
         try:
@@ -614,6 +684,35 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "一键还原", "\n".join(messages) or "没有可还原的内容。")
         self.refresh_status()
 
+    # —— 状态栏与关于 ——
+
+    def _restore_status_hint(self) -> None:
+        """状态栏回到默认提示（运行数据目录）。"""
+
+        self.statusBar().showMessage(f"数据目录：{paths.data_root()}")
+
+    def _show_status_hint(self, message: str) -> None:
+        """状态栏显示当前正在做什么：取 Token / 写入 / 校验都是要等好几秒的动作。"""
+
+        self.statusBar().showMessage(message)
+
+    def show_about(self) -> None:
+        """关于：版本、作者、项目主页与运行数据目录（报障时要能看到版本号）。"""
+
+        box = QMessageBox(self)
+        box.setWindowTitle("关于")
+        box.setIconPixmap(app_icon().pixmap(64, 64))
+        box.setText(f"{constants.APP_DISPLAY_NAME} {constants.APP_VERSION}")
+        box.setInformativeText(
+            f"作者：{constants.APP_AUTHOR}\n"
+            f"项目主页：{constants.REPO_URL}\n"
+            f"运行数据目录：{paths.data_root()}\n\n"
+            "完整使用说明见项目主页里的 README.md 与 docs/USER-GUIDE.md。"
+        )
+        box.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.exec()
+
     @staticmethod
     def _open_path(path) -> None:  # noqa: ANN001
         try:
@@ -633,7 +732,11 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _on_tray_activated(self, reason) -> None:  # noqa: ANN001
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+        # 左键单击或双击都打开主界面（不同用户习惯不一样）
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
             self.show_window()
 
     def notify(self, message: str, title: str | None = None, warning: bool = False) -> None:
@@ -678,6 +781,23 @@ class MainWindow(QMainWindow):
                 worker.terminate()
                 worker.wait(2000)
         self._sync_worker = None
+        preflight_worker = self._preflight_worker
+        if preflight_worker is not None and preflight_worker.isRunning():
+            # 预检是只读的，但 QThread 在运行中被销毁会让 Qt 直接崩。
+            # 等一小会儿；还等不到就从窗口上摘下来、交给 QApplication 保活，
+            # 别让窗口析构把它一起删掉。
+            logger.info("退出前等校验线程结束（最多 5 秒）…")
+            if not preflight_worker.wait(5000):
+                logger.warning("校验线程还没结束（只读操作），交给进程退出处理")
+                preflight_worker.setParent(None)
+                application = QApplication.instance()
+                if application is not None:
+                    orphans = getattr(application, "_atd_orphan_threads", None)
+                    if orphans is None:
+                        orphans = []
+                        application._atd_orphan_threads = orphans  # type: ignore[attr-defined]
+                    orphans.append(preflight_worker)
+        self._preflight_worker = None
         if not self._skip_save_on_quit:
             self._persist_settings()
             self._persist_state()
@@ -726,6 +846,17 @@ class MainWindow(QMainWindow):
     def start_sync(self, interactive: bool = True) -> None:
         if self._maintenance:
             logger.info("正在搬 private 位置或卸载，本次同步先跳过")
+            return
+        if not (self.settings.enable_dsh or self.settings.enable_ccswitch):
+            # 两个目标都被关掉时同步没有意义：直接说清楚，别让它跑到"没有任何目标被写入"
+            logger.warning("DSH 与 CC Switch 写入都关着，本次同步没有意义")
+            if interactive:
+                QMessageBox.warning(
+                    self,
+                    "没有启用任何写入目标",
+                    "DSH 写入和 CC Switch 写入现在都是关着的，同步不会写任何东西。\n"
+                    "请先在「设置…」里打开至少一个写入目标。",
+                )
             return
         if self._busy():
             if not interactive:
@@ -812,8 +943,6 @@ class MainWindow(QMainWindow):
 
         if not self.settings.enable_ccswitch:
             return True
-        if self.settings.suppress_ccswitch_running_warning:
-            return True
         if self.settings.ccswitch_running_policy == CCSWITCH_POLICY_DIRECT:
             return True
         if not ccswitch_is_running():
@@ -832,16 +961,18 @@ class MainWindow(QMainWindow):
         never_again = QCheckBox("以后不再提示（以后都直接改）")
         box.setCheckBox(never_again)
         box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is cancel_button or clicked is None:
+            # 取消（或直接关掉对话框）就什么都不改：连"以后不再提示"的勾选也不生效，
+            # 免得"取消了一次同步"却把设置悄悄改掉
+            logger.info("用户取消了本次同步（勾选状态不保存）")
+            return False
 
         if never_again.isChecked():
-            self.settings.suppress_ccswitch_running_warning = True
             self.settings.ccswitch_running_policy = CCSWITCH_POLICY_DIRECT
             self._persist_settings()
 
-        clicked = box.clickedButton()
-        if clicked is cancel_button:
-            logger.info("用户取消了本次同步")
-            return False
         if clicked is direct_button:
             logger.info("用户选择直接改 CC Switch 数据库")
             return True
@@ -866,6 +997,9 @@ class MainWindow(QMainWindow):
         self._capture.cancelled.connect(self._on_capture_cancelled)
         if silent:
             logger.info("开始静默取 Token（自动同步）")
+            self._show_status_hint("正在静默获取 Token…")
+        else:
+            self._show_status_hint("正在获取 Token：请在登录窗口完成登录…")
         try:
             self._capture.start()
         except Exception as exc:  # noqa: BLE001 - 起不来的话不能把 _capture 留在那儿
@@ -882,10 +1016,12 @@ class MainWindow(QMainWindow):
             logger.error("保存 Token 到状态文件失败：%s", exc)
             self.notify(f"Token 保存失败（本次同步继续）：{exc}", warning=True)
         self.refresh_status()
+        self._show_status_hint("已获取 Token，正在写入目标…")
         self._start_sync_worker(token)
 
     def _on_capture_failed(self, message: str) -> None:
         self._capture = None
+        self._restore_status_hint()
         logger.warning(message)
         fallback = self.state.last_token
         if fallback and not is_expired(fallback):
@@ -897,6 +1033,7 @@ class MainWindow(QMainWindow):
 
     def _on_capture_cancelled(self) -> None:
         self._capture = None
+        self._restore_status_hint()
         logger.info("已取消取 Token")
 
     def _start_sync_worker(self, token: str) -> None:
@@ -907,6 +1044,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(lambda message, w=worker: self._on_sync_failed(message, w))
         worker.finished.connect(lambda w=worker: self._on_sync_thread_finished(w))
         logger.info("开始写入已启用的目标")
+        self._show_status_hint("正在写入已启用的目标…")
         try:
             worker.start()
         except Exception as exc:  # noqa: BLE001 - 线程起不来也要把界面恢复过来
@@ -928,6 +1066,7 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             logger.error("保存同步状态失败：%s", exc)
         self.refresh_status()
+        self._restore_status_hint()
         if report.cancelled:
             # 是我们自己请它停下的，别弹"同步完成"的通知吓人
             logger.info("同步已按你的要求安全停下")
@@ -942,6 +1081,7 @@ class MainWindow(QMainWindow):
             logger.info("上一次同步的错误晚到了，忽略（已经有新的同步在跑）")
             return
         logger.error("同步失败：%s", message)
+        self._restore_status_hint()
         self.notify(f"同步失败：{message}", warning=True)
 
     def _on_sync_thread_finished(self, worker=None) -> None:
@@ -953,6 +1093,7 @@ class MainWindow(QMainWindow):
             return
         self.sync_button.setEnabled(True)
         self._sync_worker = None
+        self._restore_status_hint()
         if self._retry_after_stop:
             self._retry_after_stop = False
             logger.info("上一次同步已安全停下，按你的要求重新开始")

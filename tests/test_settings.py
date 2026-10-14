@@ -11,7 +11,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_thu_deepseek_api import paths  # noqa: E402
-from auto_thu_deepseek_api.settings import SETTINGS_VERSION, AppSettings  # noqa: E402
+from auto_thu_deepseek_api.settings import (  # noqa: E402
+    CCSWITCH_POLICY_DIRECT,
+    CCSWITCH_POLICY_PROMPT,
+    SETTINGS_VERSION,
+    AppSettings,
+)
 
 
 class SettingsTest(unittest.TestCase):
@@ -41,7 +46,11 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(migrated.settings_version, SETTINGS_VERSION)
         self.assertEqual(migrated.sync_interval_minutes, 15, "用户自己填过的间隔不能被改掉")
         self.assertTrue(migrated.auto_sync_enabled, "迁移后默认开启自动同步")
-        self.assertTrue(migrated.suppress_ccswitch_running_warning, "默认不再弹 CC Switch 运行提醒")
+        self.assertEqual(
+            migrated.ccswitch_running_policy,
+            CCSWITCH_POLICY_DIRECT,
+            "默认不弹 CC Switch 运行提醒（等价于「直接改」）",
+        )
 
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["settings_version"], SETTINGS_VERSION)
@@ -53,10 +62,36 @@ class SettingsTest(unittest.TestCase):
         settings = AppSettings()
         self.assertTrue(settings.auto_sync_enabled)
         self.assertEqual(settings.sync_interval_minutes, 180)
-        self.assertTrue(settings.suppress_ccswitch_running_warning)
+        self.assertEqual(settings.ccswitch_running_policy, CCSWITCH_POLICY_DIRECT)
         self.assertFalse(
             settings.ccswitch_refresh_sibling_cards,
             "默认不该去刷新别人的卡片（要的用户自己开）",
+        )
+
+    def test_v3_policy_merges_suppress_switch(self) -> None:
+        """v3 → v4：老的「不再弹提醒」复选框合并进「运行策略」这一个选项。"""
+
+        path = self.root / "settings.json"
+        path.write_text(
+            json.dumps({"settings_version": 3, "suppress_ccswitch_running_warning": False}),
+            encoding="utf-8",
+        )
+        settings = AppSettings.load()
+        self.assertEqual(
+            settings.ccswitch_running_policy,
+            CCSWITCH_POLICY_PROMPT,
+            "明确要求提醒的用户要保持在「先提示」",
+        )
+        self.assertEqual(settings.settings_version, SETTINGS_VERSION)
+
+        path.write_text(
+            json.dumps({"settings_version": 3, "suppress_ccswitch_running_warning": True}),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            AppSettings.load().ccswitch_running_policy,
+            CCSWITCH_POLICY_DIRECT,
+            "老默认「不再弹提醒」等于「直接改」",
         )
 
     def test_v2_settings_keep_user_interval(self) -> None:

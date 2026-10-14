@@ -29,6 +29,28 @@ def _lock_wait_seconds(argv: list[str]) -> float:
     return 6.0 if "--restarted" in argv else 0.6
 
 
+def _install_qt_translations(application: QApplication) -> None:
+    """把 Qt 自带控件的标准文案（是/否、确定/取消）换成中文。
+
+    不加载的话，QMessageBox / QDialogButtonBox 的按钮会是英文 Yes/No/OK/Cancel，
+    和全中文的界面不一致。翻译文件随 PySide6 一起打包（translations/qtbase_zh_CN.qm），
+    加载失败只记日志，不影响程序运行。
+    """
+
+    from PySide6.QtCore import QLibraryInfo, QTranslator
+
+    translator = QTranslator(application)
+    translations_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    if translator.load("qtbase_zh_CN", translations_path) and application.installTranslator(
+        translator
+    ):
+        # 必须挂在 application 上保住引用：只放局部变量的话会被回收、翻译随即失效
+        application._atd_translator = translator  # type: ignore[attr-defined]
+        logger.info("已加载 Qt 中文翻译（标准按钮显示为中文）")
+    else:
+        logger.warning("Qt 中文翻译没加载上，标准按钮会显示英文：%s", translations_path)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     start_minimized = "--minimized" in argv
@@ -43,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     QApplication.setOrganizationName(constants.APP_AUTHOR)
 
     application = QApplication(argv)
+    _install_qt_translations(application)
     application.setWindowIcon(app_icon())
     application.setQuitOnLastWindowClosed(False)
 
@@ -53,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     # 那个调用一旦会建目录，就又变成"还没问用户，桌面上已经多出 private 了"。
     early_state: AppState | None = None
     on_desktop = False
+    desktop_notice_done = False
     paths.defer_creation(True)
     try:
         try:
@@ -67,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
             on_desktop = False
         if on_desktop and early_state is not None:
             logger.info("程序在桌面根目录，先提醒用户再决定 private 放哪")
+            # 记下"这次启动已经问过"：主窗口的启动检查别再弹第二遍
+            # （用户按 ESC 不记"已处理"时，跨启动仍会提醒，但同一次启动只提醒一次）
+            desktop_notice_done = True
             if not data_location.desktop_notice(None, early_state):
                 logger.info("用户选择退出程序去换本程序位置，本次不启动")
                 return 0
@@ -110,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     if not QSystemTrayIcon.isSystemTrayAvailable():
         logger.warning("系统托盘不可用：关闭窗口会直接退出程序")
 
-    window = MainWindow(settings, state)
+    window = MainWindow(settings, state, desktop_notice_done=desktop_notice_done)
 
     # 首次运行自动留一份原始配置，且这份备份不会被清理逻辑删掉，
     # 用户随时能在设置里"一键还原"到程序第一次动它之前的状态。

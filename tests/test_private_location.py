@@ -12,7 +12,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_thu_deepseek_api import paths, procinfo, sync, uninstall  # noqa: E402
-from auto_thu_deepseek_api.settings import AppSettings, reset_to_defaults  # noqa: E402
+from auto_thu_deepseek_api.settings import (  # noqa: E402
+    CCSWITCH_POLICY_DIRECT,
+    CCSWITCH_POLICY_PROMPT,
+    AppSettings,
+    reset_to_defaults,
+)
 from auto_thu_deepseek_api.sync import both_targets_missing, run_sync  # noqa: E402
 
 from .sandbox import FAKE_NEW_TOKEN, Sandbox  # noqa: E402
@@ -253,7 +258,7 @@ class ResetDefaultsTest(unittest.TestCase):
             sync_interval_minutes=45,
             auto_sync_enabled=False,
             unify_all_profiles=False,
-            suppress_ccswitch_running_warning=False,
+            ccswitch_running_policy=CCSWITCH_POLICY_PROMPT,
             launch_at_startup=True,
             last_sync_at="2026-01-01T00:00:00",
             last_sync_summary="上次同步的摘要",
@@ -262,7 +267,11 @@ class ResetDefaultsTest(unittest.TestCase):
         self.assertEqual(settings.sync_interval_minutes, 180)
         self.assertTrue(settings.auto_sync_enabled)
         self.assertTrue(settings.unify_all_profiles)
-        self.assertTrue(settings.suppress_ccswitch_running_warning)
+        self.assertEqual(
+            settings.ccswitch_running_policy,
+            CCSWITCH_POLICY_DIRECT,
+            "CC Switch 运行策略要回到默认值（不提示、直接改）",
+        )
         self.assertTrue(settings.launch_at_startup, "开机启动项不该被恢复默认动到")
         self.assertEqual(settings.last_sync_summary, "上次同步的摘要")
 

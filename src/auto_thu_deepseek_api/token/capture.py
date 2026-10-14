@@ -233,10 +233,6 @@ class TokenCaptureSession(QObject):
             self._window.deleteLater()
             self._window = None
 
-    def close_window(self) -> None:
-        if self._window is not None:
-            self._window.close()
-
     # —— 捕获 ——
 
     def _on_cookie_added(self, cookie) -> None:  # noqa: ANN001 - Qt 类型

@@ -54,6 +54,10 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(settings.auto_sync_enabled)
         self.assertEqual(settings.sync_interval_minutes, 180)
         self.assertTrue(settings.suppress_ccswitch_running_warning)
+        self.assertFalse(
+            settings.ccswitch_refresh_sibling_cards,
+            "默认不该去刷新别人的卡片（要的用户自己开）",
+        )
 
     def test_v2_settings_keep_user_interval(self) -> None:
         settings_path = self.root / "settings.json"

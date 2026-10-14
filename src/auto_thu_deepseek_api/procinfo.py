@@ -54,10 +54,3 @@ def any_running(*keywords: str) -> str | None:
         if any(word in name for word in lowered):
             return name
     return None
-
-
-def reset_cache() -> None:
-    """仅供测试。"""
-
-    global _CACHE
-    _CACHE = None

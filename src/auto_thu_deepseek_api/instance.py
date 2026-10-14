@@ -63,7 +63,3 @@ def release() -> None:
     except Exception as exc:  # pragma: no cover - 让不出也要继续
         logger.warning("让出单实例锁失败：%s", exc)
     _LOCK = None
-
-
-def is_held() -> bool:
-    return _LOCK is not None

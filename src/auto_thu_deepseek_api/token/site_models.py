@@ -273,28 +273,6 @@ def _save_cache(models: list[dict]) -> None:
         logger.info("写模型缓存失败：%s", exc)
 
 
-def models_equal(left: list[dict] | None, right: list[dict] | None) -> bool:
-    """只比较我们负责的字段，避免每次都重写 provider。"""
-
-    def normalize(models: list[dict] | None) -> str:
-        rows = []
-        for model in models or []:
-            if not isinstance(model, dict):
-                continue
-            rows.append(
-                {
-                    "id": model.get("id") or "",
-                    "name": model.get("name") or "",
-                    "contextWindow": model.get("contextWindow") or 0,
-                    "input": model.get("input") or [],
-                    "reasoningEfforts": model.get("reasoningEfforts") or {},
-                }
-            )
-        return json.dumps(rows, ensure_ascii=False, sort_keys=True)
-
-    return normalize(left) == normalize(right)
-
-
 def resolve_models(token: str | None = None, *, use_cache: bool = True) -> list[dict]:
     """站点前端包 → （读不到时）`/v1/models` → 内置名单。"""
 

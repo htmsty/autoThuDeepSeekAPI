@@ -1,5 +1,49 @@
 # 更新记录
 
+## 2.5.7 — 写入面加固（只动我们自己的东西）+ 死逻辑清理
+
+按要求又全面排查一遍：**任何交互都不许改动用户的其它配置**，顺带清掉死代码。
+（`ARCHITECTURE.md` 新增了「写入面清单」，逐文件写明我们只会写哪一部分、怎么保证。）
+
+### 1. 以前"整份重写"会顺手改掉别人配置的**排版**
+
+DSH profile 是整份 YAML 重写的，而 ruamel 重写时会把**别人 provider** 里的
+流式列表空格（`{ id: x }` → `{id: x}`）、注释对齐一起重排 —— 值没变，但确实动了人家的文件。
+现在改成：
+
+- **块级替换**：只把"我们的 provider 块"和"真要改时的 `agent-default-model` 条目"
+  贴回原文件，其余部分**原文照抄**（注释、单引号、流式写法、空白都保留）；
+- 只在**值真的变了**时才写（纯格式差异不再触发写盘）；
+- 定位不到块时退回整份重写，并且写完仍然做回读校验 + 失败回滚。
+
+凭据文件（`.credentials.yaml`，别的工具的 key 也在里面）同样改成**行级替换**：
+只改 `MADMODEL_API_KEY:` 那一行（保留引号与行尾注释），只有"文件坏掉要重建"时才整份写。
+
+CC Switch 的两个 JSON（`settings.json` / `live-state.json`）也改成**行级替换**：
+只换 `currentProviderCodex` / `apps.codex.proxy_route` 那一行，替换完用 `json.loads`
+确认结果就是我们要的数据；值没变就不写，同名键不唯一时退回整份重排（值仍不动别的键）。
+
+### 2. 「顺带刷新同站点旧卡片」改成默认关闭
+
+那会改动**别人的卡片**。现在默认**只维护我们自己那张 `DeepSeek (THU)`**；
+想让它顺手刷新旧卡片，要在设置里显式勾选「顺带刷新同站点旧卡片的令牌」
+（打开后也只替换 Token 字段）。
+
+### 3. 死逻辑清理（全仓库机械扫描）
+
+删掉 7 处"只有定义、全仓库没人调用"的代码：
+`backup.latest_entries`、`instance.is_held`、`paths.creation_deferred`、`paths.managed_paths`、
+`procinfo.reset_cache`、`capture.close_window`、`site_models.models_equal`（连它那个只测自己的用例），
+以及 `selftest.py` 里没用到的 `socket` import。HTTP handler 的 `do_GET` / `log_message`
+是框架回调，保留。
+
+### 验证
+
+- 测试 117 → **120 项全绿**，新增：别人的 provider **原文**（注释/单引号/流式列表）
+  逐字不变（普通与统一两种模式）、凭据文件只改我们那一行、CC Switch JSON 沿用用户缩进风格
+  且只改一行、默认不刷别人的卡片。
+- 打包 2.5.7 留档，两个版本 `--selftest` 通过。
+
 ## 2.5.6 — 修"已经留了我们标记的别人的 provider 还会被继续改"（isearcher / infini-ai 那例）
 
 用户报：DSH 里 `isearcher` 的 `infini-ai` 配置和默认模型被改，运行报

@@ -52,13 +52,6 @@ class SiteModelsTest(unittest.TestCase):
         self.assertEqual(plain["input"], ["text"])
         self.assertNotIn("reasoningEfforts", plain)
 
-    def test_models_equal_ignores_other_fields(self) -> None:
-        a = [{"id": "m", "name": "M (THU)", "contextWindow": 1000000, "input": ["text"], "extra": 1}]
-        b = [{"id": "m", "name": "M (THU)", "contextWindow": 1000000, "input": ["text"]}]
-        self.assertTrue(site_models.models_equal(a, b))
-        c = [{"id": "m", "name": "其他名字", "contextWindow": 1000000, "input": ["text"]}]
-        self.assertFalse(site_models.models_equal(a, c))
-
     def test_corrupt_cache_is_ignored_not_fatal(self) -> None:
         """缓存文件被写坏（at 不是数字 / 条目不是字典）时，不能把整次同步搞挂。"""
 

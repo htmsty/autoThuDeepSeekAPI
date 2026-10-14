@@ -19,6 +19,7 @@
 | 2.5.4 | 源码复检：坏模型缓存不再搞挂同步；同步线程收尾不再串台 | ✅ 已完成（留档 `releases/2.5.4/`） |
 | 2.5.5 | 修"同步把别的模型的 api 改了"：不再认领别人的本地转发 provider；写前二次核对；CC Switch 只刷 Token 字段 | ✅ 已完成（留档 `releases/2.5.5/`） |
 | 2.5.6 | 修"已经带了我们标记的别人的 provider 仍被继续改"（isearcher/infini-ai）：去掉 apiKeyEnv 认领、收紧 profile 归属、加误改提醒 | ✅ 已完成（留档 `releases/2.5.6/`） |
+| 2.5.7 | 写入面加固：块级/行级替换（别人配置的排版也不许动）、旧卡片刷新改默认关、清理 7 处死逻辑 | ✅ 已完成（留档 `releases/2.5.7/`） |
 
 两个版本的**单文件程序**都要留档在 `releases/<版本>/`（不进 Git：单文件 180 MB 超过 GitHub
 单文件 100 MB 上限，改用 `releases/<版本>/SHA256.txt` 记录校验和）。
@@ -328,6 +329,30 @@ provider 认领规则里"`baseURL` 是本地转发（`127.0.0.1:*/v1`）就算�
 
 验证：改写/新增用例（isearcher 场景在统一模式下也一字不动且给出提醒、thu-local 不勾统一时整个
 profile 跳过、madmodel 键被外人占用仍报错且文件原样）；测试 116 → 117 项全绿；版本 2.5.6 打包留档。
+
+## 2.5.7 阶段（本轮）
+
+按要求"再全面排查一次 + 一切交互不能改动用户其它配置 + 检查死逻辑"。
+
+### 写入面加固（详见 ARCHITECTURE.md 的「写入面清单」）
+
+1. **DSH profile 改块级替换**：原来整份 YAML 重写会把别人 provider 的流式列表空格、
+   注释对齐一起重排；现在只把"我们的 provider 块"和"真要改时的 agent-default-model 条目"
+   贴回原文件，其余原文照抄；只在值真的变了时才写。
+2. **凭据文件改行级替换**：只改 `MADMODEL_API_KEY:` 那一行（保留引号/行尾注释），
+   坏文件重建时才整份写。
+3. **CC Switch 两个 JSON 改行级替换**：只换 `currentProviderCodex` / `apps.codex.proxy_route`
+   那一行，替换后 `json.loads` 校验；值没变不写；同名键不唯一则退回整份重排（仍只改值）。
+4. **「顺带刷新同站点旧卡片」默认关闭**（会改别人的卡片），要的用户在设置里显式打开。
+
+### 死逻辑清理
+
+机械扫描全仓库"只有定义没人调用"的函数，删掉 6 个函数 + 1 个没用的 import
+（`backup.latest_entries`、`instance.is_held`、`paths.creation_deferred`、`paths.managed_paths`、
+`procinfo.reset_cache`、`capture.close_window`、`site_models.models_equal` 及其用例、`selftest.socket`）。
+HTTP handler 的 `do_GET` / `log_message` 是框架回调，保留。
+
+验证：测试 117 → 120 项全绿；版本 2.5.7 打包留档。
 
 ## 大检查清单（按需再走）
 

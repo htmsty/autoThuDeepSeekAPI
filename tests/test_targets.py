@@ -59,6 +59,42 @@ class TargetTestCase(unittest.TestCase):
         self.assertEqual(parsed["refs"]["MADMODEL_API_KEY"], FAKE_NEW_TOKEN)
         self.assertEqual(parsed["refs"]["TSINGHUA_API_KEY"], FAKE_OLD_TOKEN)
 
+    def test_dsh_credentials_only_rewrites_our_line(self) -> None:
+        """凭据文件里还有别的工具的 key：只改 MADMODEL_API_KEY 那一行，其余原文一字不动。"""
+
+        credentials = self.sandbox.dsh_dir / ".credentials.yaml"
+        original = """# 这份文件别的工具也在用：注释、单引号、流式写法都别动
+version: 1
+records:
+  client-connection/browser-session: {kind: grant, secret: "sXi1FWkuO"}   # 别人的记录
+refs:
+  DEEPSEEK_API_KEY: 'deepseek-old-key'        # 别的工具
+  MADMODEL_API_KEY: old-token-value           # 我们的
+  TSINGHUA_API_KEY: "tsinghua-old-key"
+"""
+        credentials.write_text(original, encoding="utf-8")
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=credentials,
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        after = credentials.read_text(encoding="utf-8")
+        self.assertIn(FAKE_NEW_TOKEN, after)
+        # 别的行（含注释、引号风格、流式写法）必须逐字保持
+        for keep in (
+            "# 这份文件别的工具也在用：注释、单引号、流式写法都别动",
+            'client-connection/browser-session: {kind: grant, secret: "sXi1FWkuO"}   # 别人的记录',
+            "DEEPSEEK_API_KEY: 'deepseek-old-key'        # 别的工具",
+            'TSINGHUA_API_KEY: "tsinghua-old-key"',
+            "# 我们的",
+        ):
+            self.assertIn(keep, after, f"这一行被改动了：{keep}")
+
     def test_dsh_only_touches_profiles_with_madmodel(self) -> None:
         target = DshTarget(
             TargetPaths(
@@ -663,7 +699,8 @@ class TargetTestCase(unittest.TestCase):
                 db_file=self.sandbox.ccswitch_dir / "cc-switch.db",
                 settings_file=self.sandbox.ccswitch_dir / "settings.json",
                 live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
-            )
+            ),
+            refresh_sibling_cards=True,  # 这个开关默认是关的；这里专门测"打开后会刷新旧卡片"
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
@@ -702,6 +739,76 @@ class TargetTestCase(unittest.TestCase):
         self.assertEqual(live["apps"]["codex"]["contract"]["key"], "deadbeef")
         self.assertEqual(live["apps"]["claude"]["mode"], "direct")
 
+    def test_ccswitch_json_keeps_user_style_and_other_keys(self) -> None:
+        """改 settings.json / live-state.json 时沿用用户自己的缩进风格，其它键原样保留。"""
+
+        settings_path = self.sandbox.ccswitch_dir / "settings.json"
+        settings_path.write_text(
+            "{\n"
+            '    "showInTray": true,\n'
+            '    "currentProviderCodex": "codex-official",\n'
+            '    "enableLocalProxy": true,\n'
+            '    "用户自己的键": {"嵌套": [1, 2, 3]}\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        original = settings_path.read_text(encoding="utf-8")
+
+        target = CcSwitchTarget(
+            TargetPaths(
+                base_dir=self.sandbox.ccswitch_dir,
+                db_file=self.sandbox.ccswitch_dir / "cc-switch.db",
+                settings_file=settings_path,
+                live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        after = settings_path.read_text(encoding="utf-8")
+        self.assertIn('    "currentProviderCodex": "deepseek-thu"', after, "值该改还是要改")
+        self.assertIn('    "用户自己的键": {"嵌套": [1, 2, 3]}', after, "别的键（含紧凑写法）被改动了")
+        self.assertIn('    "showInTray": true', after, "缩进风格被换掉了（原来是 4 空格）")
+        # 只有那一行的值变了，其它行逐字保持
+        self.assertEqual(
+            [line for line in after.splitlines() if "currentProvider" not in line],
+            [line for line in original.splitlines() if "currentProvider" not in line],
+            "除了当前供应商那一行，别的行不该被改写",
+        )
+
+    def test_ccswitch_does_not_touch_sibling_cards_by_default(self) -> None:
+        """默认不去动「同站点旧卡片」——那属于别人的配置；只有显式打开开关才刷新。"""
+
+        db = self.sandbox.ccswitch_dir / "cc-switch.db"
+        target = CcSwitchTarget(
+            TargetPaths(
+                base_dir=self.sandbox.ccswitch_dir,
+                db_file=db,
+                settings_file=self.sandbox.ccswitch_dir / "settings.json",
+                live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        connection = sqlite3.connect(db)
+        row = connection.execute(
+            "SELECT settings_config FROM providers WHERE id='madmodel-legacy'"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(
+            json.loads(row[0])["auth"]["OPENAI_API_KEY"],
+            FAKE_OLD_TOKEN,
+            "默认不该动同站点旧卡片的令牌（那是别人的卡片）",
+        )
+        # 我们自己那张卡片照常更新
+        connection = sqlite3.connect(db)
+        mine = connection.execute(
+            "SELECT settings_config FROM providers WHERE id='deepseek-thu' AND app_type='codex'"
+        ).fetchone()
+        connection.close()
+        self.assertEqual(json.loads(mine[0])["auth"]["OPENAI_API_KEY"], FAKE_NEW_TOKEN)
+
     def test_ccswitch_only_refreshes_token_fields_in_old_cards(self) -> None:
         """刷新同站点旧卡片时只换 Token 字段，卡片里别的模型的 key 一个字都不动。"""
 
@@ -732,7 +839,8 @@ class TargetTestCase(unittest.TestCase):
                 db_file=db,
                 settings_file=self.sandbox.ccswitch_dir / "settings.json",
                 live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
-            )
+            ),
+            refresh_sibling_cards=True,
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
@@ -900,6 +1008,58 @@ class TargetTestCase(unittest.TestCase):
         ours = after_providers["madmodel"]
         self.assertEqual(ours["apiKeyEnv"], "MADMODEL_API_KEY")
         self.assertIn("qwen3.8-27b", [model["id"] for model in ours["models"]])
+
+    def test_foreign_provider_raw_text_is_untouched(self) -> None:
+        """别人的 provider 不只是字段值不变：注释、单引号、流式列表这些**原文**也要一字不动。"""
+
+        profile = self._write_profile(
+            """# 顶部注释
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      glm:                      # 别人的：混着注释与单引号
+        displayName: 'GLM'      # 单引号风格
+        apiKeyEnv: GLM_API_KEY
+        api: openai-completions
+        baseURL: "https://open.bigmodel.cn/api/coding/paas/v4/"
+        models: [{ id: glm-5.3-flash, name: glm-5.3-flash }]   # 流式列表
+      madmodel:
+        displayName: DeepSeek (THU)
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+"""
+        )
+        before = profile.read_text(encoding="utf-8")
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        after = profile.read_text(encoding="utf-8")
+
+        def foreign_block(text: str) -> str:
+            return text[text.index("      glm:") : text.index("      madmodel:")]
+
+        self.assertEqual(
+            foreign_block(after),
+            foreign_block(before),
+            "别人的 provider 原文（注释/引号/流式写法）被改写了",
+        )
+        # 我们自己的那段该更新就更新
+        self.assertIn("qwen3.8-27b", after)
+
+        # 再跑一次统一模式：会新建/改写 agent-default-model，但别人那段原文仍然不许动
+        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        after_unify = profile.read_text(encoding="utf-8")
+        self.assertEqual(
+            foreign_block(after_unify),
+            foreign_block(before),
+            "统一模式下别人的 provider 原文被改写了",
+        )
+        self.assertIn("agent-default-model", after_unify)
 
     def test_dsh_does_not_claim_other_local_provider(self) -> None:
         """只有 ollama（127.0.0.1）而没有我们的 provider 时，绝不能认领 ollama。"""

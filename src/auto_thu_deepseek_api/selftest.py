@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import http.server
 import logging
-import socket
 import sys
 import threading
 from pathlib import Path

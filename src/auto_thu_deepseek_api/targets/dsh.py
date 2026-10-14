@@ -139,6 +139,14 @@ class DshTarget:
         yaml.dump(data, stream)
         new_text = stream.getvalue()
 
+        # 能只改一行就只改一行：凭据文件里还有别的工具（DeepSeek / 清华）的 key，
+        # 整份重写会把它们的排版一起重排 —— 那也算动了用户的配置。
+        # 注意：文件是"坏掉重建"时必须整份写新结构，不能往坏文本里贴一行。
+        if not rebuilt:
+            spliced = self._replace_ref_line(text, constants.DSH_CREDENTIAL_KEY, token)
+            if spliced is not None:
+                new_text = spliced
+
         # 回读校验：确认写进去的就是这个 Token（避免折行标量之类的坑）
         from ruamel.yaml import YAML as CheckYAML
 
@@ -314,6 +322,7 @@ class DshTarget:
 
         # 只合并我们负责的字段：apiKeyEnv 与 models。其余字段只在缺失时补上，
         # 不覆盖用户在 DSH 里自己对名称/地址/思考档的调整。
+        provider_before = copy.deepcopy(provider)
         provider["apiKeyEnv"] = constants.DSH_CREDENTIAL_KEY
         if not provider.get("api"):
             provider["api"] = "openai-completions"
@@ -354,25 +363,39 @@ class DshTarget:
         if not display_name or display_name in model_ids:
             provider["displayName"] = constants.PROVIDER_DISPLAY_NAME
 
+        provider_changed = provider != provider_before
+
         if self.unify_all_profiles:
-            self._point_default_model(data, merged, provider_key, result)
+            entry_changed = self._point_default_model(data, merged, provider_key, result)
         else:
-            self._repair_default_model(data, merged, provider_key)
+            entry_changed = self._repair_default_model(data, merged, provider_key)
 
         import io
 
         stream = io.StringIO()
         yaml.dump(data, stream)
         new_text = stream.getvalue()
-        if new_text == original:
+        # 只按"值"判断有没有变化：ruamel 整份重写会把别人 provider 的排版（流式列表空格、
+        # 注释对齐）也改掉，那种"纯格式变化"不该算改动，更不该落盘。
+        if not provider_changed and not entry_changed:
             result.note(f"{path.parent.name}：供应商配置已是最新")
             return False
+
+        # 只把**我们要改的那两块**（我们的 provider / 默认模型条目）换成新文本，
+        # 其余部分原样照抄 —— 这样别人 provider 的注释、引号、流式写法一个字节都不会变。
+        final_text = self._keep_other_blocks_verbatim(
+            original,
+            new_text,
+            provider_key=provider_key,
+            provider_changed=provider_changed,
+            entry_changed=bool(entry_changed),
+        )
 
         # 落盘前先确认 dump 出来的是合法的顶层数组，且我们的 provider 真在里面。
         # 这里用往返模式解析：profile 允许 !!js 标签，safe 模式会拒收。
         from ruamel.yaml import YAML as CheckYAML
 
-        check = CheckYAML(typ="rt").load(new_text)
+        check = CheckYAML(typ="rt").load(final_text)
         if not isinstance(check, list):
             raise ValueError("回读校验失败：写出的补丁不是顶层数组")
         check_entry = self._find_entry(check, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME)
@@ -381,12 +404,12 @@ class DshTarget:
         if not isinstance(check_provider, dict) or check_provider.get("apiKeyEnv") != constants.DSH_CREDENTIAL_KEY:
             raise ValueError(f"回读校验失败：写出的补丁里找不到 provider {provider_key}")
 
-        emit(self, path, new_text, "dsh-profile", "yaml")
+        emit(self, path, final_text, "dsh-profile", "yaml")
         if self.dry_run:
             result.note(f"（预检）将更新供应商配置 {path}")
             return True
 
-        ok, message = write_with_rollback(path, new_text, backup, "dsh-profile")
+        ok, message = write_with_rollback(path, final_text, backup, "dsh-profile")
         if not ok:
             result.fail(message)
             return False
@@ -490,6 +513,139 @@ class DshTarget:
                 return str(key), entry
         return None
 
+    # —— 只换我们自己的那两块文本，其余原文照抄 ——
+
+    @staticmethod
+    def _replace_ref_line(text: str, key: str, value: str) -> str | None:
+        """把 `KEY: 旧值` 这一行换成新值，文件其余部分（含别的 refs 与排版）原样保留。
+
+        找不到这一行、或者原值是多行标量（`|` / `>`）时返回 None，调用方退回整份重写。
+        """
+
+        pattern = re.compile(
+            rf"^(?P<indent>\s*){re.escape(key)}\s*:\s*"
+            r"(?P<quote>[\"']?)(?P<old>[^\s#]*)(?P=quote)(?P<tail>\s*(?:#.*)?)$"
+        )
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            body = line.rstrip("\r\n")
+            match = pattern.match(body)
+            if not match:
+                continue
+            old = match.group("old") or ""
+            if old.startswith("|") or old.startswith(">"):
+                return None  # 多行标量：别乱动，交给整份重写 + 回读校验
+            quote = match.group("quote") or ""
+            newline = line[len(body) :]
+            lines[index] = (
+                f"{match.group('indent')}{key}: {quote}{value}{quote}{match.group('tail')}{newline}"
+            )
+            return "".join(lines)
+        return None
+
+    @staticmethod
+    def _provider_span(lines: list[str], provider_key: str) -> tuple[int, int] | None:
+        """找出 `providers:` 里某个 provider 的行范围 [start, end)。"""
+
+        providers_indent: int | None = None
+        key_indent: int | None = None
+        start: int | None = None
+        key_pattern = re.compile(rf"^\s*{re.escape(provider_key)}\s*:\s*(#.*)?$")
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if providers_indent is None:
+                if re.match(r"^\s*providers\s*:\s*(#.*)?$", line):
+                    providers_indent = indent
+                continue
+            if start is None:
+                if indent > providers_indent and key_pattern.match(line):
+                    start = index
+                    key_indent = indent
+                continue
+            if indent <= (key_indent or 0):
+                return start, index
+        return (start, len(lines)) if start is not None else None
+
+    @staticmethod
+    def _entry_span(lines: list[str], entry_id: str) -> tuple[int, int] | None:
+        """找出顶层数组里某个 `- id: xxx` 条目的行范围 [start, end)。"""
+
+        pattern = re.compile(rf"^\s*-\s*id\s*:\s*{re.escape(entry_id)}\s*$")
+        for index, line in enumerate(lines):
+            if not pattern.match(line):
+                continue
+            item_indent = len(line) - len(line.lstrip(" "))
+            for follow in range(index + 1, len(lines)):
+                stripped = lines[follow].strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if (len(lines[follow]) - len(lines[follow].lstrip(" "))) <= item_indent:
+                    return index, follow
+            return index, len(lines)
+        return None
+
+    @classmethod
+    def _keep_other_blocks_verbatim(
+        cls,
+        original: str,
+        new_text: str,
+        *,
+        provider_key: str,
+        provider_changed: bool,
+        entry_changed: bool,
+    ) -> str:
+        """把新文本里"我们改的那两块"贴回原文件，别的地方一个字节都不动。
+
+        整份 dump 虽然是合法的，但 ruamel 会把别人 provider 里的流式列表空格、注释对齐
+        这类排版重排一遍 —— 那也算改了用户的配置。这里改成只替换：
+        · 我们的 provider 块（字段真的有变化时）；
+        · `agent-default-model` 条目（真的被我们改了时）。
+        定位不到就退回整份新文本（宁可排版动一点，也不能写错内容）。
+        """
+
+        orig_lines = original.splitlines(keepends=True)
+        new_lines = new_text.splitlines(keepends=True)
+        replaces: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        appends: list[str] = []
+
+        if provider_changed:
+            orig_span = cls._provider_span(orig_lines, provider_key)
+            new_span = cls._provider_span(new_lines, provider_key)
+            if orig_span is None or new_span is None:
+                logger.info("定位不到 provider %s 的文本块，这次退回整份重写", provider_key)
+                return new_text
+            replaces.append((orig_span, new_span))
+
+        if entry_changed:
+            orig_span = cls._entry_span(orig_lines, constants.DSH_DEFAULT_MODEL_ENTRY_ID)
+            new_span = cls._entry_span(new_lines, constants.DSH_DEFAULT_MODEL_ENTRY_ID)
+            if new_span is None:
+                return new_text
+            if orig_span is None:
+                # 原来没有这个条目（我们新建的）：整块追加到文件末尾
+                appends.extend(new_lines[new_span[0] : new_span[1]])
+            else:
+                replaces.append((orig_span, new_span))
+
+        if not replaces and not appends:
+            return new_text
+
+        result = list(orig_lines)
+        for (o_start, o_end), (n_start, n_end) in sorted(
+            replaces, key=lambda item: item[0][0], reverse=True
+        ):
+            result[o_start:o_end] = new_lines[n_start:n_end]
+        if appends:
+            if result and not result[-1].endswith("\n"):
+                result[-1] += "\n"
+            if result and result[-1].strip():
+                result.append("\n")
+            result.extend(appends)
+        return "".join(result)
+
     @staticmethod
     def _merge_models(existing: object, fetched: list[dict]) -> list[dict]:
         """校正模型列表。
@@ -546,7 +702,7 @@ class DshTarget:
             )
         return merged or base
 
-    def _repair_default_model(self, data: list, models: list[dict], provider_key: str) -> None:
+    def _repair_default_model(self, data: list, models: list[dict], provider_key: str) -> bool:
         """默认模型指向 madmodel 时，保证它的 model 是真实存在的模型 id。
 
         用户在 DSH 界面里换过 provider 又没换 model 时，会留下
@@ -560,14 +716,16 @@ class DshTarget:
             constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
         )
         if entry is None:
-            return
+            return False
         config = entry.get("config")
         if not isinstance(config, dict) or config.get("provider") != provider_key:
-            return
+            return False
         model_ids = [str(item["id"]) for item in models if item.get("id")]
+        before = copy.deepcopy(config)
         if model_ids and config.get("model") not in model_ids:
             config["model"] = self._preferred_model_id(model_ids)
         self._ensure_default_effort(config, models)
+        return config != before
 
     # —— 思考档（reasoning effort）——
 
@@ -643,7 +801,7 @@ class DshTarget:
 
     def _point_default_model(
         self, data: list, models: list[dict], provider_key: str, result  # noqa: ANN001 - ApplyResult
-    ) -> None:
+    ) -> bool:
         entry = self._find_entry(
             data,
             constants.DSH_DEFAULT_MODEL_ENTRY_ID,
@@ -660,6 +818,7 @@ class DshTarget:
         if not isinstance(config, dict):
             config = {}
             entry["config"] = config
+        before = copy.deepcopy(config)
         previous = config.get("provider")
         config["provider"] = provider_key
         if previous and previous != provider_key:
@@ -673,4 +832,5 @@ class DshTarget:
             # 换 provider 时必须一起换 model，否则会留下"指着 madmodel 却填别的模型 id"的组合
             config["model"] = self._preferred_model_id(model_ids)
         self._ensure_default_effort(config, models)
+        return config != before
 

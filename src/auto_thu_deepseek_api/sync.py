@@ -82,7 +82,12 @@ def build_targets(settings: AppSettings) -> list[object]:
             )
         )
     if settings.enable_ccswitch:
-        targets.append(CcSwitchTarget(paths.resolve_ccswitch_paths(settings.ccswitch_dir)))
+        targets.append(
+            CcSwitchTarget(
+                paths.resolve_ccswitch_paths(settings.ccswitch_dir),
+                refresh_sibling_cards=settings.ccswitch_refresh_sibling_cards,
+            )
+        )
     return targets
 
 

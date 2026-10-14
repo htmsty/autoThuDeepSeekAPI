@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -47,15 +48,46 @@ class CcSwitchTarget:
     key = "ccswitch"
     label = "CC Switch"
 
-    def __init__(self, paths: TargetPaths) -> None:
+    def __init__(self, paths: TargetPaths, *, refresh_sibling_cards: bool = False) -> None:
         self.paths = paths
+        # 刷新"同站点旧卡片"会改动别的卡片，默认关（要的用户在设置里显式打开）
+        self.refresh_sibling_cards = bool(refresh_sibling_cards)
         # 干跑：只渲染将要写入的内容，不备份、不写库（预检用）
         self.dry_run = False
         self.rendered: list[RenderedFile] = []
 
-    def _write_json(self, path: Path, data: dict, backup: BackupManager, label: str) -> bool:
+    def _write_json(
+        self,
+        path: Path,
+        data: dict,
+        backup: BackupManager,
+        label: str,
+        *,
+        patch: tuple[str, object, object] | None = None,
+    ) -> bool:
+        """写一个 JSON 文件。
+
+        `patch=(key, 旧值, 新值)` 时，优先只替换那**一行**，其它行（含用户自己的键、
+        缩进风格、紧凑写法）逐字不动；替换结果必须能解析且等于 data，否则退回整份重排。
+        """
+
         original = path.read_text(encoding="utf-8") if path.exists() else ""
-        new_text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        if original:
+            try:
+                if json.loads(original) == data:
+                    # 值没变：连排版都不动（原来会因为缩进风格不同而整份重写）
+                    return False
+            except ValueError:
+                pass
+        new_text = self._json_dump(data, original)
+        if patch is not None and original:
+            spliced = self._splice_json_line(original, new_text, *patch)
+            if spliced is not None:
+                try:
+                    if json.loads(spliced) == data:
+                        new_text = spliced
+                except ValueError:  # pragma: no cover - 拼坏了就退回整份
+                    pass
         if original == new_text:
             return False
         emit(self, path, new_text, label, "json")
@@ -65,6 +97,51 @@ class CcSwitchTarget:
         if not ok:
             raise OSError(message)
         return True
+
+    @staticmethod
+    def _splice_json_line(
+        original_text: str, new_text: str, key: str, old_value: object, new_value: object
+    ) -> str | None:
+        """把 `"key": 旧值` 那一行换成新版本，其余行原样保留；不唯一就返回 None。
+
+        只在"这个键在原文和新文里都只出现一次、且旧值正好等于 old_value"时才动手，
+        免得误替换同名键（例如 live-state.json 里 claude / codex 各有一份 proxy_route）。
+        """
+
+        key_pattern = re.compile(rf'^\s*"{re.escape(key)}"\s*:')
+        old_literal = json.dumps(old_value, ensure_ascii=False)
+        target_pattern = re.compile(
+            rf'^(\s*"{re.escape(key)}"\s*:\s*)' + re.escape(old_literal) + r'(\s*,?\s*)$'
+        )
+        original_lines = original_text.splitlines(keepends=True)
+        new_lines = new_text.splitlines(keepends=True)
+
+        old_hits = [i for i, line in enumerate(original_lines) if key_pattern.match(line)]
+        new_hits = [i for i, line in enumerate(new_lines) if key_pattern.match(line)]
+        if len(old_hits) != 1 or len(new_hits) != 1:
+            return None
+        if not target_pattern.match(original_lines[old_hits[0]].rstrip("\r\n")):
+            return None
+        result = list(original_lines)
+        result[old_hits[0]] = new_lines[new_hits[0]]
+        return "".join(result)
+
+    @staticmethod
+    def _json_dump(data: dict, original_text: str) -> str:
+        """按原文件的风格输出 JSON：单行还是单行，缩进宽度也照抄原文件。"""
+
+        stripped = original_text.strip()
+        if stripped and "\n" not in stripped:
+            return json.dumps(data, ensure_ascii=False) + "\n"
+        indent = 2
+        for line in original_text.splitlines():
+            body = line.lstrip(" ")
+            if body and body != line:
+                width = len(line) - len(body)
+                if 0 < width <= 8:
+                    indent = width
+                break
+        return json.dumps(data, ensure_ascii=False, indent=indent) + "\n"
 
     # —— 探测 ——
 
@@ -144,7 +221,7 @@ class CcSwitchTarget:
                 card_needs_write = changed
 
             current_fix = bool(has_current and self._other_current_cards(connection))
-            refresh_targets = self._collect_refresh_targets(connection, token)
+            refresh_targets = self._refresh_targets(connection, token)
 
             if self.dry_run:
                 # 预检：只把"将要写进卡片的内容"渲染出来，别碰数据库
@@ -163,7 +240,7 @@ class CcSwitchTarget:
                 return
 
             if not card_needs_write and not current_fix and not refresh_targets:
-                result.note("卡片与同站点旧卡片都已是最新，未改动 CC Switch 数据库")
+                result.note("卡片已是最新，未改动 CC Switch 数据库")
                 return
 
             backup.backup_sqlite(db, "ccswitch-db")
@@ -192,7 +269,7 @@ class CcSwitchTarget:
                         or (has_current and is_current != 1)
                     )
                 current_fix = bool(has_current and self._other_current_cards(connection))
-                refresh_targets = self._collect_refresh_targets(connection, token)
+                refresh_targets = self._refresh_targets(connection, token)
                 if not card_needs_write and not current_fix and not refresh_targets:
                     connection.rollback()
                     result.note("加锁后发现已经是最新，未改动 CC Switch 数据库")
@@ -382,6 +459,18 @@ class CcSwitchTarget:
             logger.info("准备刷新同站点卡片令牌：%s / %s", app_type, provider_id)
         return targets
 
+    def _refresh_targets(
+        self, connection: sqlite3.Connection, token: str
+    ) -> list[tuple[str, str, str]]:
+        """要不要顺带刷新别人卡片的令牌。
+
+        **默认不刷**：那属于"改用户的其它配置"，只有用户在设置里明确打开才做。
+        """
+
+        if not self.refresh_sibling_cards:
+            return []
+        return self._collect_refresh_targets(connection, token)
+
     @classmethod
     def _replace_tokens(cls, node: object, token: str) -> bool:
         """把 JSON 里看起来是令牌的字符串换成新令牌。"""
@@ -431,9 +520,16 @@ class CcSwitchTarget:
         if settings_path and settings_path.exists():
             data = _load_json(settings_path)
             key = f"currentProvider{constants.CCSWITCH_APP_TYPE.capitalize()}"
-            if data.get(key) != constants.CCSWITCH_PROVIDER_ID:
+            previous = data.get(key)
+            if previous != constants.CCSWITCH_PROVIDER_ID:
                 data[key] = constants.CCSWITCH_PROVIDER_ID
-                if self._write_json(settings_path, data, backup, "ccswitch-settings"):
+                if self._write_json(
+                    settings_path,
+                    data,
+                    backup,
+                    "ccswitch-settings",
+                    patch=(key, previous, constants.CCSWITCH_PROVIDER_ID),
+                ):
                     result.changed = True
                     result.note(f"已把 settings.json 的 {key} 指向 DeepSeek (THU)")
             else:
@@ -453,8 +549,15 @@ class CcSwitchTarget:
                 app_state = {}
                 apps[constants.CCSWITCH_APP_TYPE] = app_state
             if app_state.get("proxy_route") != constants.CCSWITCH_PROVIDER_ID:
+                previous_route = app_state.get("proxy_route")
                 app_state["proxy_route"] = constants.CCSWITCH_PROVIDER_ID
-                if self._write_json(live_path, data, backup, "ccswitch-live-state"):
+                if self._write_json(
+                    live_path,
+                    data,
+                    backup,
+                    "ccswitch-live-state",
+                    patch=("proxy_route", previous_route, constants.CCSWITCH_PROVIDER_ID),
+                ):
                     result.changed = True
                     result.note("已把 live-state.json 的代理路由指向 DeepSeek (THU)")
                 if "contract" in app_state:

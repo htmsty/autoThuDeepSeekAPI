@@ -361,12 +361,6 @@ class BackupManager:
             result.setdefault(entry.source, entry)
         return result
 
-    def latest_entries(self) -> dict[str, BackupEntry]:
-        result: dict[str, BackupEntry] = {}
-        for entry in sorted(self.entries(), key=lambda item: Path(item.backup).parent.name):
-            result[entry.source] = entry
-        return result
-
     def restore(self, entries: dict[str, BackupEntry] | None = None, label: str = "pre-restore") -> list[str]:
         """把备份复制回原位。还原前先把当前状态也备份一份。"""
 

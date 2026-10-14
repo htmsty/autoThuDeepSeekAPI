@@ -98,6 +98,14 @@ class SettingsDialog(QDialog):
         self.ccswitch_dir_edit.setPlaceholderText(str(paths.default_ccswitch_dir()))
         targets_form.addRow("CC Switch 目录", self._path_row(self.ccswitch_dir_edit, self._browse_ccswitch))
 
+        self.refresh_siblings_check = QCheckBox("顺带刷新同站点旧卡片的令牌（会改动别的卡片，默认关）")
+        self.refresh_siblings_check.setChecked(settings.ccswitch_refresh_sibling_cards)
+        self.refresh_siblings_check.setToolTip(
+            "打开后：非本程序名下、但配置里出现清华站点的卡片，其令牌字段也会被换成新 Token。\n"
+            "默认关闭——程序只维护自己那张卡片（DeepSeek (THU)），不动别人的配置。"
+        )
+        targets_form.addRow(self.refresh_siblings_check)
+
         layout.addWidget(targets_box)
 
         # —— CC Switch 运行中 ——
@@ -521,6 +529,7 @@ class SettingsDialog(QDialog):
         settings.dsh_dir = self.dsh_dir_edit.text().strip()
         settings.ccswitch_dir = self.ccswitch_dir_edit.text().strip()
         settings.unify_all_profiles = self.unify_profiles.isChecked()
+        settings.ccswitch_refresh_sibling_cards = self.refresh_siblings_check.isChecked()
         settings.ccswitch_running_policy = (
             CCSWITCH_POLICY_DIRECT if (self.policy_direct.isChecked() or self.suppress_warning.isChecked())
             else CCSWITCH_POLICY_PROMPT

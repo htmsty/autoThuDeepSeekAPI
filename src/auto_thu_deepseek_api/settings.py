@@ -67,6 +67,8 @@ class AppSettings:
     # CC Switch 细节
     ccswitch_running_policy: str = CCSWITCH_POLICY_PROMPT
     suppress_ccswitch_running_warning: bool = True
+    # 「顺带刷新同站点旧卡片」会改动别的卡片，默认关（要的用户自己开）
+    ccswitch_refresh_sibling_cards: bool = False
 
     # 备份
     backup_keep: int = 10

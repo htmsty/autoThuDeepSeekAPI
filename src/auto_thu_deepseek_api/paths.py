@@ -73,10 +73,6 @@ def defer_creation(enabled: bool) -> None:
     _DEFER_CREATION = bool(enabled)
 
 
-def creation_deferred() -> bool:
-    return _DEFER_CREATION
-
-
 def app_dir() -> Path:
     """程序所在目录（打包后是 exe 所在目录，源码运行时是项目根目录）。"""
 
@@ -277,13 +273,6 @@ def reset_data_root_cache() -> None:
 
     global _DATA_ROOT_CACHE
     _DATA_ROOT_CACHE = None
-
-
-def managed_paths(root: Path | None = None) -> list[Path]:
-    """private 目录里由程序管理的条目（别的文件不属于我们，永远不碰）。"""
-
-    base = Path(root) if root is not None else data_root()
-    return [base / name for name in MANAGED_ENTRIES]
 
 
 def recycle_path(path: Path) -> tuple[bool, str]:

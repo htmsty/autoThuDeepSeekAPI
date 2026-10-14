@@ -6,10 +6,10 @@ import logging
 import subprocess
 import sys
 
-from PySide6.QtCore import QLockFile, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from . import constants, paths, startup
+from . import constants, data_location, instance, paths, startup
 from .logging_setup import setup_logging
 from .settings import AppSettings
 from .state_store import AppState
@@ -17,15 +17,6 @@ from .ui.icon import app_icon
 from .ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
-
-
-def _single_instance_guard() -> QLockFile | None:
-    lock_path = paths.data_root() / "app.lock"
-    lock = QLockFile(str(lock_path))
-    lock.setStaleLockTime(0)
-    if not lock.tryLock(100):
-        return None
-    return lock
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,6 +36,24 @@ def main(argv: list[str] | None = None) -> int:
     application.setWindowIcon(app_icon())
     application.setQuitOnLastWindowClosed(False)
 
+    # —— 启动早期：先处理"程序在桌面"这条提醒，**别先在桌面把 private 建出来** ——
+    # 这一步之前不能调用任何会创建 private 的东西（日志、锁文件都算）。
+    paths.defer_creation(True)
+    try:
+        early_state = AppState.load()  # 只读：目录不存在时就是默认值
+        on_desktop = (
+            startup.is_app_on_desktop()
+            and paths.read_private_override() is None
+            and not early_state.desktop_note_ack
+        )
+    finally:
+        paths.defer_creation(False)
+    if on_desktop:
+        logger.info("程序在桌面根目录，先提醒用户再决定 private 放哪")
+        if not data_location.desktop_notice(None, early_state):
+            logger.info("用户选择退出程序去换本程序位置，本次不启动")
+            return 0
+
     paths.ensure_runtime_dirs()
     # 上次换过 private 位置的话，把旧位置里的残留补删一下（删不掉不影响使用）
     try:
@@ -53,8 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("补清理旧 private 位置失败：%s", exc)
     setup_logging()
 
-    lock = _single_instance_guard()
-    if lock is None:
+    if not instance.acquire_with_retry(6.0):
         logger.info("程序已经在运行，退出本次启动")
         # 开机启动（--minimized）是后台拉起，别弹窗打扰用户
         if not start_minimized and QSystemTrayIcon.isSystemTrayAvailable():

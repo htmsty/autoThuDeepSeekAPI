@@ -70,3 +70,23 @@ def setup_logging(level: int = logging.INFO) -> Path:
     logging.getLogger("auto_thu_deepseek_api").info("日志已启动：%s", log_file)
     return log_file
 
+
+def close_file_handlers() -> int:
+    """关掉所有文件日志句柄，返回关掉几个。
+
+    换 private 位置 / 干净卸载之前必须先关：Windows 上日志文件被占着就删不掉、也搬不走。
+    关掉之后日志只会走界面与 stderr，做完再调用一次 `setup_logging()` 就会在新位置重开。
+    """
+
+    root = logging.getLogger()
+    closed = 0
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.FileHandler):
+            try:
+                handler.close()
+            except Exception:  # pragma: no cover - 关不掉也要把它摘掉
+                pass
+            root.removeHandler(handler)
+            closed += 1
+    return closed
+

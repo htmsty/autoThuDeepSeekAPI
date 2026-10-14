@@ -56,6 +56,21 @@ private 的位置**可以改**（2.5 起）：
   用户自己的文件不动、目录不整个删；`finish_pending_migration()` 在下次启动时补删残留。
 - `MANAGED_ENTRIES` 是"程序自己的东西"的唯一定义：设置、状态、模型缓存、锁、日志、备份、
   浏览器会话。换位置与卸载都按它来。
+- **删除一律先走回收站**：`recycle_path()`（Windows Shell `SHFileOperation` + `FOF_ALLOWUNDO`）
+  优先，回收站不可用时才永久删除（`delete_path()` 会说明用的是哪种）。
+  旧目录清空到只剩程序自己时，连目录一起删；还剩用户文件就保留。
+- `defer_creation()`：启动早期只判断不落盘，避免"桌面提醒还没弹，private 已经在桌面上"。
+  `finish_pending_migration()` 只有在旧位置真的清空了才清掉 `migrated_from`，
+  否则留着重试标记，下次启动继续清。
+
+### `instance.py`
+单实例锁。`acquire_with_retry()` 给"旧进程正在退出"留时间（默认 6 秒），
+`release()` 供"重启程序 / 干净卸载"前主动让出——不然新进程会被判成"程序已经在运行"而退出。
+
+### `data_location.py`
+private 位置与桌面提醒的共用流程（启动早期主窗口还不存在时也要用）：
+`ask_private_dir()` / `confirm_move()` / `move_private_dir()` / `choose_private_dir()` /
+`desktop_notice()`。三个按钮是「选择 private 位置…」「仍然继续」「退出程序去换本程序位置」。
 
 ### `settings.py`
 用户设置（JSON）：同步间隔、自动同步、开机启动、启动即同步、同步后最小化、
@@ -180,6 +195,9 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
   时提醒一次，三个选择），再 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
   都通过才跑"启动时立即同步"。两条提醒的"已处理"状态写在 private 的 `state.json` 里。
   「强行终止并重试」也在这里：`_ask_force_retry()` + `_retry_after_stop`。
+  2.5.1 起，桌面提醒其实由 `app.py` 在**创建任何目录之前**调 `data_location.desktop_notice()`
+  完成（`MainWindow` 里那条只是兜底）；搬家/卸载前会先 `_prepare_for_data_move()` /
+  `prepare_for_uninstall()` 放开浏览器档案、日志句柄与单实例锁，否则那些文件删不掉。
 - `settings_dialog.py`：**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
   千万不要再造第二个 `QVBoxLayout(self)`：后建的会把先挂的布局顶掉，对话框会变成空窗口
   （2.4 踩过一次，`test_settings_dialog_is_actually_openable` 是这条的回归用例）。

@@ -134,6 +134,42 @@ class PrivateLocationTest(unittest.TestCase):
         ok, message = paths.switch_private_root(self.private / "inside")
         self.assertFalse(ok, message)
 
+    def test_pending_migration_keeps_marker_when_something_is_left(self) -> None:
+        """旧位置还有删不掉的东西（被占用）时，重试标记要留着，下次启动继续清。"""
+
+        (self.private / "settings.json").write_text("{}", encoding="utf-8")
+        (self.private / "browser-profile").mkdir()
+        (self.private / "browser-profile" / "Cookies").write_text("x", encoding="utf-8")
+        target = self.root / "new-place"
+
+        original_delete = paths.delete_path
+
+        def fake_delete(path):  # noqa: ANN001
+            if Path(path).name == "browser-profile":
+                return False, "模拟被浏览器占着"
+            return original_delete(path)
+
+        paths.delete_path = fake_delete  # type: ignore[assignment]
+        try:
+            ok, message = paths.switch_private_root(target)
+            self.assertTrue(ok, message)
+            self.assertTrue((self.private / "browser-profile").exists(), "模拟的残留应当还在")
+
+            paths.data_root = lambda: target  # type: ignore[assignment]
+            paths.finish_pending_migration()
+            location = paths.read_private_override()
+            assert location is not None
+            self.assertEqual(location.migrated_from, self.private, "还有残留就不能丢掉重试标记")
+        finally:
+            paths.delete_path = original_delete  # type: ignore[assignment]
+
+        # 残留清掉之后再跑一次：这次要清干净并把标记去掉
+        paths.finish_pending_migration()
+        location = paths.read_private_override()
+        assert location is not None
+        self.assertIsNone(location.migrated_from)
+        self.assertFalse(self.private.exists(), "没残留时旧目录应当被删掉")
+
     # —— 卸载 ——
 
     def test_clean_uninstall_removes_only_program_files(self) -> None:
@@ -256,6 +292,181 @@ class SyncCancelTest(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertIn("已被用户终止", report.summary())
             self.assertEqual(credentials.read_text(encoding="utf-8"), before)
+
+
+class DeferredCreationTest(unittest.TestCase):
+    """启动早期不能创建 private：不然桌面提醒还没弹，文件夹已经在桌面上了。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.local = self.root / "localappdata"
+        self.local.mkdir()
+        self._old_local = os.environ.get("LOCALAPPDATA")
+        os.environ["LOCALAPPDATA"] = str(self.local)
+        self._old_desktop = paths.desktop_dir
+        self._old_app_dir = paths.app_dir
+        self.desktop = self.root / "Desktop"
+        self.desktop.mkdir()
+        paths.desktop_dir = lambda: self.desktop  # type: ignore[assignment]
+        paths.app_dir = lambda: self.desktop  # type: ignore[assignment]
+        from auto_thu_deepseek_api import startup as startup_module
+
+        self._old_startup_desktop = startup_module.desktop_dir
+        startup_module.desktop_dir = lambda: self.desktop  # type: ignore[assignment]
+        paths.reset_data_root_cache()
+
+    def tearDown(self) -> None:
+        paths.defer_creation(False)
+        paths.desktop_dir = self._old_desktop  # type: ignore[assignment]
+        paths.app_dir = self._old_app_dir  # type: ignore[assignment]
+        from auto_thu_deepseek_api import startup as startup_module
+
+        startup_module.desktop_dir = self._old_startup_desktop  # type: ignore[assignment]
+        if self._old_local is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = self._old_local
+        paths.reset_data_root_cache()
+        self._tmp.cleanup()
+
+    def test_planned_root_is_not_created_while_deferred(self) -> None:
+        from auto_thu_deepseek_api import startup
+
+        self.assertTrue(startup.is_app_on_desktop(), "假的桌面上应当被判成在桌面")
+        paths.defer_creation(True)
+        try:
+            planned = paths.data_root()
+            paths.state_file()  # 只读地取路径，也不该创建
+            self.assertFalse(planned.exists(), "延迟期间不该真的建目录")
+            self.assertFalse((self.desktop / "private").exists(), "桌面上不该先冒出 private")
+        finally:
+            paths.defer_creation(False)
+        paths.reset_data_root_cache()
+        created = paths.data_root()
+        self.assertEqual(created, planned)
+        self.assertTrue(created.is_dir(), "恢复正常后才创建")
+
+
+class RecycleDeleteTest(unittest.TestCase):
+    def test_delete_path_uses_recycle_bin_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "x.txt"
+            target.write_text("hi", encoding="utf-8")
+            ok, message = paths.delete_path(target)
+            self.assertTrue(ok, message)
+            self.assertFalse(target.exists())
+            if sys.platform == "win32":
+                self.assertIn("回收站", message, "Windows 上应当先走回收站")
+
+    def test_remove_managed_data_removes_dir_when_only_ours(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private"
+            root.mkdir()
+            (root / "settings.json").write_text("{}", encoding="utf-8")
+            (root / "logs").mkdir()
+            (root / "logs" / "a.log").write_text("x", encoding="utf-8")
+            messages = paths.remove_managed_data(root)
+            self.assertFalse(root.exists(), "只剩程序自己的东西时，目录也该删掉")
+            self.assertTrue(messages, "要有说明")
+
+    def test_remove_managed_data_keeps_dir_with_user_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private"
+            root.mkdir()
+            (root / "settings.json").write_text("{}", encoding="utf-8")
+            (root / "mine.txt").write_text("用户自己的东西", encoding="utf-8")
+            paths.remove_managed_data(root)
+            self.assertTrue(root.is_dir(), "还有用户文件时不能删目录")
+            self.assertTrue((root / "mine.txt").exists())
+
+
+class InstanceLockTest(unittest.TestCase):
+    def test_release_lets_the_next_process_in(self) -> None:
+        from PySide6.QtCore import QLockFile
+
+        from auto_thu_deepseek_api import instance
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = paths.data_root
+            paths.data_root = lambda: Path(tmp)  # type: ignore[assignment]
+            instance.release()
+            try:
+                self.assertTrue(instance.acquire(), "第一次取锁应当成功")
+                other = QLockFile(str(Path(tmp) / "app.lock"))
+                other.setStaleLockTime(0)
+                self.assertFalse(other.tryLock(50), "别的实例应当拿不到")
+                # 重启/卸载前主动让出：新进程马上就能起来（修"第一次自动退出"）
+                instance.release()
+                self.assertTrue(other.tryLock(200), "让出锁之后别人应当能拿到")
+                other.unlock()
+            finally:
+                instance.release()
+                paths.data_root = original  # type: ignore[assignment]
+
+
+class DesktopNoticeTest(unittest.TestCase):
+    def test_notice_text_and_ack(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        import auto_thu_deepseek_api.data_location as data_location
+
+        application = QApplication.instance() or QApplication(sys.argv[:1])
+        self.assertIsNotNone(application)
+
+        labels: list[str] = []
+        original_add = QMessageBox.addButton
+        original_exec = QMessageBox.exec
+        original_clicked = QMessageBox.clickedButton
+        QMessageBox.addButton = lambda self, text, *a: (labels.append(text), original_add(self, text, *a))[1]  # type: ignore[assignment]
+        QMessageBox.exec = lambda self: 0  # type: ignore[assignment]
+        QMessageBox.clickedButton = lambda self: None  # type: ignore[assignment]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_root = paths.data_root
+            paths.data_root = lambda: Path(tmp) / "private"  # type: ignore[assignment]
+            try:
+                from auto_thu_deepseek_api.state_store import AppState
+
+                state = AppState()
+                self.assertTrue(data_location.desktop_notice(None, state))
+            finally:
+                paths.data_root = original_root  # type: ignore[assignment]
+                QMessageBox.addButton = original_add  # type: ignore[assignment]
+                QMessageBox.exec = original_exec  # type: ignore[assignment]
+                QMessageBox.clickedButton = original_clicked  # type: ignore[assignment]
+
+        self.assertIn("退出程序去换本程序位置", labels)
+        self.assertIn("选择 private 位置…", labels)
+        self.assertIn("仍然继续", labels)
+
+
+class LogHandleTest(unittest.TestCase):
+    def test_closing_file_handlers_unlocks_log_for_deletion(self) -> None:
+        """用户遇到的 WinError 32：日志文件被占着删不掉。关掉句柄后必须能删/能搬。"""
+
+        import logging
+
+        from auto_thu_deepseek_api import logging_setup
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = paths.data_root
+            paths.data_root = lambda: Path(tmp) / "private"  # type: ignore[assignment]
+            try:
+                log_file = logging_setup.setup_logging()
+                logging.getLogger("atd-test").info("写一行，确保文件真的被打开")
+                if sys.platform == "win32":
+                    blocked, _ = paths.delete_path(log_file)
+                    self.assertFalse(blocked, "日志开着时就该删不掉（这正是 WinError 32）")
+                closed = logging_setup.close_file_handlers()
+                self.assertGreaterEqual(closed, 1)
+                ok, message = paths.delete_path(log_file)
+                self.assertTrue(ok, message)
+            finally:
+                logging_setup.close_file_handlers()
+                paths.data_root = original  # type: ignore[assignment]
+                logging_setup.setup_logging()  # 把日志恢复到正常位置，别影响后面的用例
 
 
 if __name__ == "__main__":

@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 # 同名探针文件可能互相踩到，导致误判"不可写"、数据被分流到 LOCALAPPDATA。这里缓存一次。
 _DATA_ROOT_CACHE: Path | None = None
 
+# 启动早期（桌面提醒还没弹之前）先别创建任何目录：否则"提醒"和"实际"就对不上了。
+_DEFER_CREATION = False
+
 # private 目录里由程序管理的条目（换位置要搬、卸载要删的都是这些）
 MANAGED_ENTRIES: tuple[str, ...] = (
     "settings.json",
@@ -62,6 +65,17 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def defer_creation(enabled: bool) -> None:
+    """启动早期用：置 True 后 data_root() 只做判断，不创建目录。"""
+
+    global _DEFER_CREATION
+    _DEFER_CREATION = bool(enabled)
+
+
+def creation_deferred() -> bool:
+    return _DEFER_CREATION
+
+
 def app_dir() -> Path:
     """程序所在目录（打包后是 exe 所在目录，源码运行时是项目根目录）。"""
 
@@ -71,8 +85,20 @@ def app_dir() -> Path:
 
 
 def _is_writable(path: Path) -> bool:
+    if _DEFER_CREATION:
+        # 只判断，不落任何文件：目录在就试写一个探针，目录不在就问它父目录
+        if path.is_dir():
+            return _probe_writable(path)
+        return path.parent.is_dir() and os.access(str(path.parent), os.W_OK)
     try:
         path.mkdir(parents=True, exist_ok=True)
+        return _probe_writable(path)
+    except OSError:
+        return False
+
+
+def _probe_writable(path: Path) -> bool:
+    try:
         probe = path / f".write-probe-{os.getpid()}"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
@@ -259,11 +285,73 @@ def managed_paths(root: Path | None = None) -> list[Path]:
     return [base / name for name in MANAGED_ENTRIES]
 
 
+def recycle_path(path: Path) -> tuple[bool, str]:
+    """把文件/目录移到回收站（Windows Shell，可撤销）。
+
+    返回 (是否成功, 说明)。回收站不可用（网络盘、路径过长等）时返回 False，
+    由 `delete_path()` 决定要不要退化成永久删除。
+    """
+
+    target = Path(path)
+    if sys.platform != "win32":
+        return False, "非 Windows 环境"
+    if not target.exists():
+        return True, "本来就不存在"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ShFileOpStructW(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("wFunc", wintypes.UINT),
+                ("pFrom", wintypes.LPCWSTR),
+                ("pTo", wintypes.LPCWSTR),
+                ("fFlags", ctypes.c_uint16),
+                ("fAnyOperationsAborted", wintypes.BOOL),
+                ("hNameMappings", ctypes.c_void_p),
+                ("lpszProgressTitle", wintypes.LPCWSTR),
+            ]
+
+        operation = ShFileOpStructW()
+        operation.wFunc = 3  # FO_DELETE
+        operation.pFrom = str(target.resolve()) + "\0\0"
+        # FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR
+        operation.fFlags = 0x0004 | 0x0010 | 0x0040 | 0x0400 | 0x0200
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+    except (OSError, AttributeError) as exc:  # pragma: no cover - 依赖系统
+        return False, f"调用回收站接口失败：{exc}"
+    if result != 0:
+        return False, f"回收站接口返回 {result}"
+    if operation.fAnyOperationsAborted:
+        return False, "操作被中止"
+    return True, "已移到回收站"
+
+
+def delete_path(path: Path) -> tuple[bool, str]:
+    """删除文件/目录：**优先移到回收站**，回收站不可用时才永久删除（并如实说明）。"""
+
+    target = Path(path)
+    if not target.exists():
+        return True, "本来就不存在"
+    ok, message = recycle_path(target)
+    if ok:
+        return True, message
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    except OSError as exc:
+        return False, f"没删掉 {target}：{exc}"
+    return True, f"已永久删除（回收站不可用：{message}）"
+
+
 def remove_managed_data(root: Path, *, keep: tuple[str, ...] = ()) -> list[str]:
     """删掉 private 里由程序管理的条目，返回说明行。
 
     只删顶层这些条目，用户自己放进来的文件一律不动；删完目录还剩下东西就留着，
-    不整个删目录（「干净卸载」也是这个口径）。
+    不整个删目录（「干净卸载」也是这个口径）。删除一律先走回收站。
     """
 
     messages: list[str] = []
@@ -275,28 +363,28 @@ def remove_managed_data(root: Path, *, keep: tuple[str, ...] = ()) -> list[str]:
         if not target.exists():
             continue
         try:
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-            messages.append(f"已删除 {target}")
-        except OSError as exc:
-            messages.append(f"没删掉 {target}：{exc}")
+            ok, detail = delete_path(target)
+        except OSError as exc:  # pragma: no cover - delete_path 内部已经兜住
+            ok, detail = False, f"没删掉 {target}：{exc}"
+        messages.append(f"{'OK' if ok else '跳过'} {target}：{detail}")
     # 目录空了就顺手删掉；还留着用户的东西就保持原样
     try:
         if base.is_dir() and not any(base.iterdir()):
-            base.rmdir()
-            messages.append(f"已删除空目录 {base}")
+            ok, detail = delete_path(base)
+            messages.append(f"{'OK' if ok else '跳过'} {base}：{detail}")
     except OSError:  # pragma: no cover - 删不掉就留着
         pass
     return messages
 
 
-def switch_private_root(new_root: Path | str) -> tuple[bool, str]:
+def switch_private_root(
+    new_root: Path | str, *, skip: tuple[str, ...] = ("app.lock",)
+) -> tuple[bool, str]:
     """把运行数据换到新位置：拷过去 → 写指针 → 尽力清理旧位置。
 
     重启后生效；旧位置里正在被占用的文件（日志、锁）删不掉也没关系，
     指针里记着 `migrated_from`，下次启动会再补一次清理。
+    `skip` 里的条目不搬运（默认跳过单实例锁：它在旧位置，重启后自然失效）。
     """
 
     ok, message = validate_private_dir(new_root)
@@ -318,6 +406,8 @@ def switch_private_root(new_root: Path | str) -> tuple[bool, str]:
     copied: list[str] = []
     failed: list[str] = []
     for name in MANAGED_ENTRIES:
+        if name in skip:
+            continue
         source = old / name
         if not source.exists():
             continue
@@ -360,6 +450,11 @@ def finish_pending_migration() -> None:
     # 到了这里程序已经在用新位置，旧位置的日志/锁也不会再被占用，可以全删
     messages = remove_managed_data(old)
     logger.info("补清理旧 private 位置 %s：%d 项", old, len(messages))
+    still_there = [name for name in MANAGED_ENTRIES if (old / name).exists()]
+    if still_there:
+        # 还有被占着的（例如浏览器档案），留着重试标记，下次启动继续清
+        logger.info("旧位置还有这些没清掉，下次启动再试：%s", "、".join(still_there))
+        return
     write_private_override(override.path, migrated_from=None)
 
 

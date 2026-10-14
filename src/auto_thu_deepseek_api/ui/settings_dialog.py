@@ -475,6 +475,9 @@ class SettingsDialog(QDialog):
         ) != QMessageBox.StandardButton.Yes:
             return
 
+        # 先放开浏览器档案、日志句柄与单实例锁，不然 browser-profile / logs / app.lock 删不掉
+        if parent is not None and hasattr(parent, "prepare_for_uninstall"):
+            parent.prepare_for_uninstall()
         ok, lines = uninstall.clean_uninstall(
             self.settings, restore_targets=(restore == QMessageBox.StandardButton.Yes)
         )

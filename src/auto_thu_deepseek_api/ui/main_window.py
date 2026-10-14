@@ -5,15 +5,15 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import backup_ops, constants, paths, preflight, startup
-from ..logging_setup import log_bus
+from .. import backup_ops, constants, data_location, instance, paths, preflight, startup
+from ..logging_setup import close_file_handlers, log_bus, setup_logging
 from ..settings import CCSWITCH_POLICY_DIRECT, AppSettings
 from ..state_store import AppState
 from ..sync import SyncReport, both_targets_missing, detect_targets
@@ -59,6 +59,7 @@ class MainWindow(QMainWindow):
         # private 位置改了要重启才生效；干净卸载后不要再把设置写回磁盘
         self._restart_requested = False
         self._skip_save_on_quit = False
+        self._moving_from: Path | None = None
 
         # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
         try:
@@ -352,33 +353,10 @@ class MainWindow(QMainWindow):
         if not startup.is_app_on_desktop():
             return True
 
-        logger.info("程序放在桌面根目录，提醒用户 private 数据文件夹会建在桌面上")
-        box = QMessageBox(self)
-        box.setWindowTitle("程序放在桌面上运行")
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setText("程序现在直接放在桌面上，继续运行会在桌面生成并使用 private 数据文件夹。")
-        box.setInformativeText(
-            f"private 里放着 Token、设置、备份和浏览器会话（默认位置：{paths.data_root()}）。\n"
-            "请不要删除它，删了这些数据就没了。\n"
-            "建议把它放到别的地方，例如 D 盘一个固定的文件夹。"
-        )
-        choose_button = box.addButton("选择 private 位置…", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("仍然继续", QMessageBox.ButtonRole.DestructiveRole)
-        leave_button = box.addButton("退出程序去换位置", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-
-        if clicked is leave_button:
-            logger.info("用户选择退出程序去换位置（不记「已处理」，下次仍会提醒）")
-            self.quit_app()
-            return False
-        if clicked is choose_button and not self.choose_private_dir():
-            return True  # 没选成，下次启动再提醒
-
-        self.state.desktop_note_ack = True
-        self.state.save()
-        logger.info("已记住「程序在桌面」这件事，以后不再提醒")
-        return True
+        if data_location.desktop_notice(self, self.state):
+            return True
+        self.quit_app()
+        return False
 
     def _check_targets_missing(self) -> bool:
         """DSH 与 CC Switch 都没检出时提醒一次并跳过这次同步；返回是否继续同步。"""
@@ -411,36 +389,63 @@ class MainWindow(QMainWindow):
                 self, "更改 private 位置", "正在同步或正在取 Token，等它结束再改 private 位置。"
             )
             return False
-        current = paths.data_root()
-        chosen = QFileDialog.getExistingDirectory(self, "选择 private 数据文件夹", str(current))
-        if not chosen:
-            return False
-        target = Path(chosen)
-        ok, message = paths.validate_private_dir(target)
-        if not ok:
-            QMessageBox.warning(self, "更改 private 位置", message)
-            return False
-        if QMessageBox.question(
-            self,
-            "更改 private 位置",
-            "会把现在的运行数据（Token、设置、状态、日志、备份、浏览器会话）复制到：\n"
-            f"{target}\n\n"
-            "复制后需要重启程序才生效；旧位置里属于程序的文件会顺手清掉，"
-            "你自己放在那里的文件不会动。\n\n现在开始搬吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return False
-
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            ok, message = paths.switch_private_root(target)
+            return data_location.choose_private_dir(
+                self,
+                prepare=self._prepare_for_data_move,
+                after=self._after_data_move,
+                offer_restart=self._offer_restart,
+            )
         finally:
             QApplication.restoreOverrideCursor()
-        if not ok:
-            QMessageBox.warning(self, "更改 private 位置", message)
-            return False
 
-        logger.info(message)
+    # —— 搬迁/卸载前的准备与收尾 ——
+
+    def _release_browser_profile(self) -> None:
+        """放掉内置浏览器档案：不然 browser-profile 里的 Cookies 被占着，搬不动也删不掉。"""
+
+        if self._capture is not None:
+            self._capture.cancel()
+            self._capture = None
+        profile = self._browser_profile
+        self._browser_profile = None
+        if profile is None:
+            return
+        try:
+            profile.deleteLater()
+        except (RuntimeError, AttributeError):  # pragma: no cover - 已经没了就算了
+            pass
+        # 让 Qt 真正处理 deleteLater（普通 processEvents 不会处理 DeferredDelete），
+        # 再给 Chromium 一点时间把手里的文件关掉。剩下的（极少数仍被占的）会在
+        # 下次启动时由 paths.finish_pending_migration() 补删干净。
+        for _ in range(12):
+            # 普通 processEvents 不处理 DeferredDelete，这里显式投递一次
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            QApplication.processEvents()
+            time.sleep(0.05)
+        logger.info("已释放内置浏览器档案（browser-profile 解锁）")
+
+    def _prepare_for_data_move(self) -> None:
+        """搬 private 之前：停取 Token、放掉浏览器、关掉日志文件句柄。"""
+
+        self._moving_from = paths.data_root()
+        self._release_browser_profile()
+        closed = close_file_handlers()
+        logger.info("搬 private 前已关闭 %d 个日志文件句柄", closed)
+
+    def _after_data_move(self) -> None:
+        """搬完之后：在新位置重开日志，再补一次旧位置清理。"""
+
+        setup_logging(logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO)
+        old = self._moving_from
+        self._moving_from = None
+        if old is None or old == paths.data_root() or not old.is_dir():
+            return
+        leftovers = paths.remove_managed_data(old)
+        logger.info("旧 private 位置补清理：%s", "；".join(leftovers) or "没有残留")
+
+    def _offer_restart(self, message: str) -> None:
         if QMessageBox.question(
             self,
             "更改 private 位置",
@@ -448,7 +453,14 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes:
             self.restart_app()
-        return True
+
+    def prepare_for_uninstall(self) -> None:
+        """干净卸载之前：停取 Token、放掉浏览器、关日志、让出单实例锁。"""
+
+        self._release_browser_profile()
+        close_file_handlers()
+        instance.release()
+        logger.info("已准备好干净卸载（浏览器、日志、单实例锁都已放开）")
 
     # —— 维护动作 ——
 
@@ -473,6 +485,13 @@ class MainWindow(QMainWindow):
         """重启自己（private 位置改了需要重启才生效）。"""
 
         self._restart_requested = True
+        # 先让出单实例锁，并把旧 private 位置的最后一点残留清掉
+        # （不然新进程起来会被判成"程序已经在运行"，第一次就自动退出）
+        instance.release()
+        try:
+            paths.finish_pending_migration()
+        except Exception as exc:  # noqa: BLE001 - 清不掉不影响重启
+            logger.warning("重启前清理旧 private 位置失败：%s", exc)
         logger.info("按要求重启程序")
         self.quit_app()
 
@@ -484,6 +503,7 @@ class MainWindow(QMainWindow):
         """干净卸载后退出：不要再写设置/状态，否则刚删掉的文件会被重新创建。"""
 
         self._skip_save_on_quit = True
+        instance.release()
         logger.info("干净卸载完成，退出程序（不再写回设置文件）")
         self.quit_app()
 

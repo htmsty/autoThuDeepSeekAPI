@@ -544,6 +544,34 @@ class NewVsOldInteractionTest(unittest.TestCase):
             window._quitting = True
             window.close()
 
+    def test_busy_while_a_worker_object_still_exists(self) -> None:
+        """线程跑完但 finished 还没派发时也算忙，别让两轮同步并排跑。"""
+
+        window = self._window()
+        try:
+            self.assertFalse(window._busy())
+            window._sync_worker = object()  # type: ignore[assignment]  # 只占位，模拟"还没收尾"
+            self.assertTrue(window._busy(), "线程对象还在就该算忙")
+        finally:
+            window._sync_worker = None
+            window._quitting = True
+            window.close()
+
+    def test_stale_worker_finished_does_not_clobber_new_one(self) -> None:
+        """老线程的 finished 晚到时，不能把新线程的状态清掉。"""
+
+        window = self._window()
+        old_worker = object()
+        new_worker = object()
+        try:
+            window._sync_worker = new_worker  # type: ignore[assignment]
+            window._on_sync_thread_finished(old_worker)
+            self.assertIs(window._sync_worker, new_worker, "新线程的引用被老线程清掉了")
+        finally:
+            window._sync_worker = None
+            window._quitting = True
+            window.close()
+
     def test_moving_private_pauses_auto_sync(self) -> None:
         window = self._window()
         try:

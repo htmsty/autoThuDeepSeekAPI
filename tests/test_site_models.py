@@ -59,6 +59,37 @@ class SiteModelsTest(unittest.TestCase):
         c = [{"id": "m", "name": "其他名字", "contextWindow": 1000000, "input": ["text"]}]
         self.assertFalse(site_models.models_equal(a, c))
 
+    def test_corrupt_cache_is_ignored_not_fatal(self) -> None:
+        """缓存文件被写坏（at 不是数字 / 条目不是字典）时，不能把整次同步搞挂。"""
+
+        import json
+        import tempfile
+
+        from auto_thu_deepseek_api import paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_root = paths.data_root
+            original_fetch = site_models.fetch_site_models
+            paths.data_root = lambda: Path(tmp)  # type: ignore[assignment]
+            site_models.fetch_site_models = lambda: None  # type: ignore[assignment]
+            try:
+                cache = Path(tmp) / "model-cache.json"
+                for payload in (
+                    {"at": "不是数字", "models": [{"id": "m"}]},
+                    {"at": None, "models": [{"id": "m"}]},
+                    {"at": 1e18, "models": ["脏数据", {"id": "只留字典"}]},
+                ):
+                    cache.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                    models = site_models.resolve_models(None)
+                    self.assertTrue(models, "坏缓存应当被忽略并回退到内置名单")
+                    self.assertTrue(
+                        all(isinstance(item, dict) and item.get("id") for item in models),
+                        f"回退结果里不该有脏数据：{models}",
+                    )
+            finally:
+                site_models.fetch_site_models = original_fetch  # type: ignore[assignment]
+                paths.data_root = original_root  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

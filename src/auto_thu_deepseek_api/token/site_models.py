@@ -244,19 +244,30 @@ def _load_cache() -> list[dict] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(payload, dict) or time.time() - float(payload.get("at", 0)) > constants.MODEL_CACHE_TTL_SECONDS:
+    if not isinstance(payload, dict):
         return None
-    models = payload.get("models")
-    if isinstance(models, list) and models:
-        return models
-    return None
+    try:
+        # at 被写坏（不是数字）时也要当"没有缓存"，不能让整次同步挂掉
+        age = time.time() - float(payload.get("at", 0))
+    except (TypeError, ValueError):
+        logger.info("模型缓存的时间戳坏了，忽略这份缓存：%s", path)
+        return None
+    # 时间戳跑到未来太多（时钟被改过）也当过期，免得这份缓存"永远新鲜"
+    if age > constants.MODEL_CACHE_TTL_SECONDS or age < -3600:
+        return None
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        return None
+    # 只认字典条目：缓存被手改/写坏时，脏数据不该流进写入流程
+    models = [item for item in raw_models if isinstance(item, dict) and item.get("id")]
+    return models or None
 
 
 def _save_cache(models: list[dict]) -> None:
     try:
-        _cache_file().write_text(
+        paths.write_text_atomic(
+            _cache_file(),
             json.dumps({"at": time.time(), "models": models}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
     except OSError as exc:  # pragma: no cover - 缓存写不进去不影响功能
         logger.info("写模型缓存失败：%s", exc)

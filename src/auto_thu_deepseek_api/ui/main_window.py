@@ -742,7 +742,8 @@ class MainWindow(QMainWindow):
             box.setText("上一次同步还在处理，目标文件可能正写到一半。")
         box.setInformativeText(
             "「强行终止并重试」会在安全的位置停下当前动作，然后重新开始同步。\n"
-            "正在写入的那一份文件会先写完（失败会自动回滚），不会写坏配置。"
+            "正在写入的那一份文件会先写完（失败会自动回滚），不会写坏配置。\n"
+            "如果正卡在网络校验上，会等这一步返回（最多约半分钟）再停下。"
         )
         force_button = box.addButton("强行终止并重试", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -774,7 +775,9 @@ class MainWindow(QMainWindow):
     def _busy(self) -> bool:
         """正在同步，或正在取 Token。"""
 
-        if self._sync_worker is not None and self._sync_worker.isRunning():
+        # 线程对象还在就算忙：哪怕它刚好跑完、finished 信号还没派发到主线程，
+        # 这时候放新的同步进来会让两轮并排跑（旧线程收尾时还会误清新线程的状态）。
+        if self._sync_worker is not None:
             return True
         return self._capture is not None
 
@@ -867,14 +870,24 @@ class MainWindow(QMainWindow):
 
     def _start_sync_worker(self, token: str) -> None:
         self.sync_button.setEnabled(False)
-        self._sync_worker = SyncWorker(self.settings, token, self)
-        self._sync_worker.reportReady.connect(self._on_sync_report)
-        self._sync_worker.failed.connect(self._on_sync_failed)
-        self._sync_worker.finished.connect(self._on_sync_thread_finished)
+        worker = SyncWorker(self.settings, token, self)
+        self._sync_worker = worker
+        worker.reportReady.connect(lambda report, w=worker: self._on_sync_report(report, w))
+        worker.failed.connect(lambda message, w=worker: self._on_sync_failed(message, w))
+        worker.finished.connect(lambda w=worker: self._on_sync_thread_finished(w))
         logger.info("开始写入已启用的目标")
-        self._sync_worker.start()
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001 - 线程起不来也要把界面恢复过来
+            logger.exception("同步线程启动失败")
+            self._sync_worker = None
+            self.sync_button.setEnabled(True)
+            self.notify(f"同步启动失败：{exc}", warning=True)
 
-    def _on_sync_report(self, report: SyncReport) -> None:
+    def _on_sync_report(self, report: SyncReport, worker=None) -> None:
+        if worker is not None and worker is not self._sync_worker:
+            logger.info("上一次同步的结果晚到了，忽略（已经有新的同步在跑）")
+            return
         summary = report.summary()
         self.settings.last_sync_at = datetime.now().isoformat(timespec="seconds")
         self.settings.last_sync_summary = f"{self.settings.last_sync_at} · {summary}"
@@ -890,11 +903,20 @@ class MainWindow(QMainWindow):
         if self.settings.minimize_after_sync:
             self.hide()
 
-    def _on_sync_failed(self, message: str) -> None:
+    def _on_sync_failed(self, message: str, worker=None) -> None:
+        if worker is not None and worker is not self._sync_worker:
+            logger.info("上一次同步的错误晚到了，忽略（已经有新的同步在跑）")
+            return
         logger.error("同步失败：%s", message)
         self.notify(f"同步失败：{message}", warning=True)
 
-    def _on_sync_thread_finished(self) -> None:
+    def _on_sync_thread_finished(self, worker=None) -> None:
+        if worker is None:
+            worker = self.sender()
+        if worker is not None and worker is not self._sync_worker:
+            # 老线程的收尾信号：别动新线程的状态
+            logger.info("上一次同步的线程收尾，忽略（已经有新的同步在跑）")
+            return
         self.sync_button.setEnabled(True)
         self._sync_worker = None
         if self._retry_after_stop:

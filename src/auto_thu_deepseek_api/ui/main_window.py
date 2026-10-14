@@ -60,6 +60,8 @@ class MainWindow(QMainWindow):
         self._restart_requested = False
         self._skip_save_on_quit = False
         self._moving_from: Path | None = None
+        # 正在搬 private / 卸载：这期间不让自动同步插进来
+        self._maintenance = False
 
         # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
         try:
@@ -353,7 +355,12 @@ class MainWindow(QMainWindow):
         if not startup.is_app_on_desktop():
             return True
 
-        if data_location.desktop_notice(self, self.state):
+        if data_location.desktop_notice(
+            self,
+            self.state,
+            prepare=self._prepare_for_data_move,
+            after=self._after_data_move,
+        ):
             return True
         self.quit_app()
         return False
@@ -429,6 +436,8 @@ class MainWindow(QMainWindow):
     def _prepare_for_data_move(self) -> None:
         """搬 private 之前：停取 Token、放掉浏览器、关掉日志文件句柄。"""
 
+        self._maintenance = True
+        self._auto_timer.stop()
         self._moving_from = paths.data_root()
         self._release_browser_profile()
         closed = close_file_handlers()
@@ -441,9 +450,13 @@ class MainWindow(QMainWindow):
         old = self._moving_from
         self._moving_from = None
         if old is None or old == paths.data_root() or not old.is_dir():
-            return
-        leftovers = paths.remove_managed_data(old)
-        logger.info("旧 private 位置补清理：%s", "；".join(leftovers) or "没有残留")
+            pass
+        else:
+            leftovers = paths.remove_managed_data(old)
+            logger.info("旧 private 位置补清理：%s", "；".join(leftovers) or "没有残留")
+        # 维护结束，自动同步计时器按当前设置重新起来
+        self._maintenance = False
+        self._apply_auto_timer()
 
     def _offer_restart(self, message: str) -> None:
         if QMessageBox.question(
@@ -457,6 +470,8 @@ class MainWindow(QMainWindow):
     def prepare_for_uninstall(self) -> None:
         """干净卸载之前：停取 Token、放掉浏览器、关日志、让出单实例锁。"""
 
+        self._maintenance = True
+        self._auto_timer.stop()
         self._release_browser_profile()
         close_file_handlers()
         instance.release()
@@ -683,7 +698,14 @@ class MainWindow(QMainWindow):
     # —— 同步流程 ——
 
     def start_sync(self, interactive: bool = True) -> None:
+        if self._maintenance:
+            logger.info("正在搬 private 位置或卸载，本次同步先跳过")
+            return
         if self._busy():
+            if not interactive:
+                # 自动同步撞上"还在忙"就直接跳过：别在用户正登录/正写入时弹窗打扰
+                logger.info("上一次同步还没结束，自动同步这次先跳过")
+                return
             logger.info("上一次同步还没结束，询问是否强行终止并重试")
             if not self._ask_force_retry():
                 return

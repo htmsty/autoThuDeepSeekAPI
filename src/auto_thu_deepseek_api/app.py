@@ -19,6 +19,16 @@ from .ui.main_window import MainWindow
 logger = logging.getLogger(__name__)
 
 
+def _lock_wait_seconds(argv: list[str]) -> float:
+    """等单实例锁的秒数。
+
+    自己拉起来的"重启"要多等一会儿（旧进程可能还在退）；用户正常双击启动就少等，
+    免得"程序已经在运行"要愣 6 秒才提示。
+    """
+
+    return 6.0 if "--restarted" in argv else 0.6
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     start_minimized = "--minimized" in argv
@@ -38,21 +48,30 @@ def main(argv: list[str] | None = None) -> int:
 
     # —— 启动早期：先处理"程序在桌面"这条提醒，**别先在桌面把 private 建出来** ——
     # 这一步之前不能调用任何会创建 private 的东西（日志、锁文件都算）。
+    # 这段发生在日志与单实例锁之前，任何异常都不能让程序起不来。
+    # 注意：提醒本身也要在"延迟创建"状态下弹——提醒文案里会取 data_root()，
+    # 那个调用一旦会建目录，就又变成"还没问用户，桌面上已经多出 private 了"。
+    early_state: AppState | None = None
+    on_desktop = False
     paths.defer_creation(True)
     try:
-        early_state = AppState.load()  # 只读：目录不存在时就是默认值
-        on_desktop = (
-            startup.is_app_on_desktop()
-            and paths.read_private_override() is None
-            and not early_state.desktop_note_ack
-        )
+        try:
+            early_state = AppState.load()  # 只读：目录不存在时就是默认值
+            on_desktop = (
+                startup.is_app_on_desktop()
+                and paths.read_private_override() is None
+                and not early_state.desktop_note_ack
+            )
+        except Exception as exc:  # noqa: BLE001 - 启动早期不冒险
+            logger.warning("启动早期检查失败（按「不在桌面」处理）：%s", exc)
+            on_desktop = False
+        if on_desktop and early_state is not None:
+            logger.info("程序在桌面根目录，先提醒用户再决定 private 放哪")
+            if not data_location.desktop_notice(None, early_state):
+                logger.info("用户选择退出程序去换本程序位置，本次不启动")
+                return 0
     finally:
         paths.defer_creation(False)
-    if on_desktop:
-        logger.info("程序在桌面根目录，先提醒用户再决定 private 放哪")
-        if not data_location.desktop_notice(None, early_state):
-            logger.info("用户选择退出程序去换本程序位置，本次不启动")
-            return 0
 
     paths.ensure_runtime_dirs()
     # 上次换过 private 位置的话，把旧位置里的残留补删一下（删不掉不影响使用）
@@ -62,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("补清理旧 private 位置失败：%s", exc)
     setup_logging()
 
-    if not instance.acquire_with_retry(6.0):
+    if not instance.acquire_with_retry(_lock_wait_seconds(argv)):
         logger.info("程序已经在运行，退出本次启动")
         # 开机启动（--minimized）是后台拉起，别弹窗打扰用户
         if not start_minimized and QSystemTrayIcon.isSystemTrayAvailable():
@@ -104,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if window.restart_requested:
         try:
-            command = startup.launch_command()
+            command = startup.launch_command(extra=("--restarted",))
             subprocess.Popen(command, cwd=str(paths.app_dir()))  # noqa: S603 - 拉起自己
             logger.info("已按你的要求重新启动程序")
         except OSError as exc:

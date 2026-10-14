@@ -469,5 +469,255 @@ class LogHandleTest(unittest.TestCase):
                 logging_setup.setup_logging()  # 把日志恢复到正常位置，别影响后面的用例
 
 
+class NewVsOldInteractionTest(unittest.TestCase):
+    """新功能别把旧逻辑搞坏：自动同步、维护动作、恢复默认之间的交互。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        cls.application = QApplication.instance() or QApplication(sys.argv[:1])
+
+    def _window(self):  # noqa: ANN202
+        from auto_thu_deepseek_api.state_store import AppState
+        from auto_thu_deepseek_api.ui.main_window import MainWindow
+
+        return MainWindow(AppSettings(), AppState())
+
+    def test_auto_sync_never_pops_the_force_dialog(self) -> None:
+        """自动同步撞上"还在忙"应当安静跳过，不能弹「强行终止并重试」打扰用户。"""
+
+        window = self._window()
+        window._busy = lambda: True  # type: ignore[assignment]
+
+        def boom() -> bool:  # pragma: no cover - 走到这里就是 bug
+            raise AssertionError("自动同步不该弹强行终止对话框")
+
+        window._ask_force_retry = boom  # type: ignore[assignment]
+        try:
+            window.start_sync(interactive=False)  # 不抛异常就对了
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_sync_is_skipped_while_maintenance_runs(self) -> None:
+        window = self._window()
+        window._maintenance = True
+        window._busy = lambda: (_ for _ in ()).throw(AssertionError("维护期间不该继续走同步流程"))  # type: ignore[assignment]
+        try:
+            window.start_sync(interactive=True)  # 直接返回
+        finally:
+            window._maintenance = False
+            window._quitting = True
+            window.close()
+
+    def test_moving_private_pauses_auto_sync(self) -> None:
+        window = self._window()
+        try:
+            window._prepare_for_data_move()
+            self.assertTrue(window._maintenance)
+            self.assertFalse(window._auto_timer.isActive())
+            window._after_data_move()
+            self.assertFalse(window._maintenance)
+            self.assertTrue(window._auto_timer.isActive(), "搬完要恢复自动同步计时器")
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_restore_defaults_reset_position_uses_safe_hooks(self) -> None:
+        """恢复默认设置的"还原 private 位置"必须和更改位置走同一条安全流程。"""
+
+        from PySide6.QtWidgets import QMessageBox
+
+        import auto_thu_deepseek_api.data_location as data_location
+        import auto_thu_deepseek_api.ui.settings_dialog as settings_dialog
+
+        window = self._window()
+        dialog = settings_dialog.SettingsDialog(window.settings, window)
+        captured: dict[str, object] = {}
+        original_move = data_location.move_private_dir
+        original_read = paths.read_private_override
+        original_question = QMessageBox.question
+        paths.read_private_override = lambda: paths.PrivateLocation(path=paths.data_root())  # type: ignore[assignment]
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)  # type: ignore[assignment]
+
+        def fake_move(parent, target, *, prepare=None, after=None):  # noqa: ANN001
+            captured["prepare"] = prepare
+            captured["after"] = after
+            captured["target"] = target
+            return True, "（测试）已经搬好"
+
+        data_location.move_private_dir = fake_move  # type: ignore[assignment]
+        try:
+            dialog._offer_reset_private_dir()
+        finally:
+            data_location.move_private_dir = original_move  # type: ignore[assignment]
+            paths.read_private_override = original_read  # type: ignore[assignment]
+            QMessageBox.question = original_question  # type: ignore[assignment]
+            dialog.close()
+            window._quitting = True
+            window.close()
+
+        self.assertEqual(captured.get("target"), paths.default_private_dir())
+        self.assertIsNotNone(captured.get("prepare"), "必须带上「放开占用」的准备动作")
+        self.assertIsNotNone(captured.get("after"), "必须带上搬完之后的收尾动作")
+
+    def test_prune_uses_recycle_bin(self) -> None:
+        """清理旧备份也应当走回收站，而不是永久删除。"""
+
+        from auto_thu_deepseek_api.backup import BackupManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "backups"
+            root.mkdir()
+            source = Path(tmp) / "file.txt"
+            source.write_text("x", encoding="utf-8")
+            manager = BackupManager(root, keep=2)
+            original_prune = manager.prune
+            manager.prune = lambda: None  # type: ignore[assignment]  # 先攒够旧备份，最后手动清
+            for _ in range(4):
+                manager.backup_file(source, "auto-sync")
+            manager.prune = original_prune  # type: ignore[assignment]
+
+            calls: list[Path] = []
+            original = paths.delete_path
+
+            def fake_delete(path):  # noqa: ANN001
+                calls.append(Path(path))
+                return original(path)
+
+            paths.delete_path = fake_delete  # type: ignore[assignment]
+            try:
+                manager.prune()
+            finally:
+                paths.delete_path = original  # type: ignore[assignment]
+            self.assertTrue(calls, "prune 应当通过 paths.delete_path（回收站）删除")
+
+    def test_repeated_backups_get_their_own_snapshot_dir(self) -> None:
+        """同一个标签连续备份也要各占一个快照目录。
+
+        否则旧备份全堆在一个目录里，prune 既清不掉、文件也会越积越多（2.5 的回归）。
+        """
+
+        from auto_thu_deepseek_api.backup import BackupManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "backups"
+            root.mkdir()
+            source = Path(tmp) / "file.txt"
+            source.write_text("x", encoding="utf-8")
+            manager = BackupManager(root, keep=5)
+            for _ in range(3):
+                manager.backup_file(source, "dsh-credentials")
+
+            entries = manager.entries()
+            dirs = {Path(entry.backup).parent for entry in entries}
+            self.assertEqual(len(dirs), 3, f"三次备份应当是三个快照目录：{dirs}")
+
+            manager.keep = 2
+            manager.prune()
+            left = {path for path in root.iterdir() if path.is_dir()}
+            self.assertLessEqual(len(left), 2, f"清完最多剩 2 个目录：{left}")
+
+    def test_explicit_snapshot_still_groups_files(self) -> None:
+        """显式开的会话（首次运行那一批）仍然要把多份文件放进同一个目录。"""
+
+        from auto_thu_deepseek_api.backup import BackupManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "backups"
+            root.mkdir()
+            first = Path(tmp) / "a.yaml"
+            second = Path(tmp) / "b.yaml"
+            first.write_text("a", encoding="utf-8")
+            second.write_text("b", encoding="utf-8")
+            manager = BackupManager(root, keep=5)
+            manager.begin_snapshot("original-first-run")
+            manager.backup_file(first, "original-first-run")
+            manager.backup_file(second, "original-first-run")
+            dirs = {Path(entry.backup).parent for entry in manager.entries()}
+            self.assertEqual(len(dirs), 1, f"同一批应当共用一个目录：{dirs}")
+
+
+class LockWaitTest(unittest.TestCase):
+    def test_restart_waits_longer_than_normal_launch(self) -> None:
+        from auto_thu_deepseek_api.app import _lock_wait_seconds
+
+        self.assertGreater(_lock_wait_seconds(["--restarted"]), 5.0)
+        self.assertLessEqual(_lock_wait_seconds([]), 1.0, "正常双击启动不该让用户干等")
+
+
+class DesktopNoticeNoCreateTest(unittest.TestCase):
+    """提醒弹出时不能已经在桌面把 private 建出来（连取 data_root() 都不行）。"""
+
+    def test_notice_does_not_create_private_before_choice(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        import auto_thu_deepseek_api.data_location as data_location
+
+        application = QApplication.instance() or QApplication(sys.argv[:1])
+        self.assertIsNotNone(application)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            desktop = root / "Desktop"
+            desktop.mkdir()
+            private = desktop / "private"
+            local = root / "localappdata"
+            local.mkdir()
+            original_local = os.environ.get("LOCALAPPDATA")
+            os.environ["LOCALAPPDATA"] = str(local)
+            original_desktop = paths.desktop_dir
+            original_app_dir = paths.app_dir
+            original_local_app_dir = paths.local_app_dir
+            original_add = QMessageBox.addButton
+            original_exec = QMessageBox.exec
+            original_clicked = QMessageBox.clickedButton
+            buttons: list[object] = []
+            paths.reset_data_root_cache()
+            paths.desktop_dir = lambda: desktop  # type: ignore[assignment]
+            paths.app_dir = lambda: desktop  # type: ignore[assignment]
+            paths.local_app_dir = lambda: local / "autoThuDeepSeekAPI"  # type: ignore[assignment]
+            QMessageBox.addButton = lambda self, text, *a: (buttons.append(text), original_add(self, text, *a))[1]  # type: ignore[assignment]
+            QMessageBox.exec = lambda self: 0  # type: ignore[assignment]
+            # 模拟用户点「退出程序去换本程序位置」：按文字找那个按钮
+            def fake_clicked(self):  # noqa: ANN001, ANN202
+                for button in self.buttons():
+                    if "退出程序" in button.text():
+                        return button
+                return None
+
+            QMessageBox.clickedButton = fake_clicked  # type: ignore[assignment]
+            continued = True
+            # 和 app.py 一样：提醒期间保持"只判断、不落盘"
+            try:
+                from auto_thu_deepseek_api.state_store import AppState
+
+                state = AppState()
+                paths.defer_creation(True)
+                try:
+                    continued = data_location.desktop_notice(None, state)
+                finally:
+                    paths.defer_creation(False)
+            finally:
+                paths.desktop_dir = original_desktop  # type: ignore[assignment]
+                paths.app_dir = original_app_dir  # type: ignore[assignment]
+                paths.local_app_dir = original_local_app_dir  # type: ignore[assignment]
+                QMessageBox.addButton = original_add  # type: ignore[assignment]
+                QMessageBox.exec = original_exec  # type: ignore[assignment]
+                QMessageBox.clickedButton = original_clicked  # type: ignore[assignment]
+                if original_local is None:
+                    os.environ.pop("LOCALAPPDATA", None)
+                else:
+                    os.environ["LOCALAPPDATA"] = original_local
+                paths.reset_data_root_cache()
+
+            self.assertFalse(continued, "选退出就不该继续启动")
+            self.assertIn("退出程序去换本程序位置", buttons)
+            self.assertFalse(private.exists(), "提醒阶段不该在桌面创建 private")
+
+
 if __name__ == "__main__":
     unittest.main()

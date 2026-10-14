@@ -94,7 +94,13 @@ def choose_private_dir(
     return True
 
 
-def desktop_notice(parent: QWidget | None, state) -> bool:  # noqa: ANN001 - AppState
+def desktop_notice(
+    parent: QWidget | None,
+    state,  # noqa: ANN001 - AppState
+    *,
+    prepare: Callable[[], None] | None = None,
+    after: Callable[[], None] | None = None,
+) -> bool:
     """程序直接放在桌面根目录时的提醒。
 
     返回 False 表示"用户选择退出程序去换本程序位置"（调用方应该退出启动流程）。
@@ -118,7 +124,7 @@ def desktop_notice(parent: QWidget | None, state) -> bool:  # noqa: ANN001 - App
     if clicked is leave_button:
         logger.info("用户选择退出程序去换本程序位置（不记「已处理」，下次仍会提醒）")
         return False
-    if clicked is choose_button and not choose_private_dir(parent):
+    if clicked is choose_button and not choose_private_dir(parent, prepare=prepare, after=after):
         return True  # 没选成：不记状态，下次启动再说
 
     state.desktop_note_ack = True

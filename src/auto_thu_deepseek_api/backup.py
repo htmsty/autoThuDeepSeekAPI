@@ -58,6 +58,8 @@ class BackupManager:
         self.index_path = self.root / INDEX_NAME
         self._session_snapshot: Path | None = None
         self._session_label = ""
+        # 只有 begin_snapshot() 显式开的会话才会被复用；普通的一次备份各占一个目录
+        self._session_explicit = False
 
     # —— 索引 ——
 
@@ -161,7 +163,12 @@ class BackupManager:
 
     def _new_snapshot_dir(self, label: str, *, reuse: bool = True) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        if reuse and self._session_snapshot is not None and self._session_label == label:
+        if (
+            reuse
+            and self._session_explicit
+            and self._session_snapshot is not None
+            and self._session_label == label
+        ):
             # 会话目录可能已经被清理掉（例如连续同名备份触发 prune），确认还在才复用
             if self._session_snapshot.is_dir():
                 return self._session_snapshot
@@ -179,12 +186,18 @@ class BackupManager:
         path.mkdir(parents=True, exist_ok=False)
         self._session_snapshot = path
         self._session_label = label
+        self._session_explicit = False
         return path
 
     def begin_snapshot(self, label: str) -> None:
-        """让接下来同一标签的多次备份共用同一个快照目录（同一次操作的多份文件）。"""
+        """显式开一个快照目录：接下来同一标签的多次备份都放进它（同一批文件）。
+
+        只有显式开过的会话才会复用目录；普通的一次备份（例如每次同步前备份凭据）
+        各占一个目录，否则旧备份会堆在同一个目录里永远清不掉。
+        """
 
         self._new_snapshot_dir(label, reuse=False)
+        self._session_explicit = True
 
     def backup_file(self, source: Path, label: str) -> Path | None:
         """普通文件备份；文件不存在返回 None。"""
@@ -323,14 +336,20 @@ class BackupManager:
 
         for directory in removed_dirs:
             path = Path(directory)
-            # 正在用的会话快照不能删：同一次操作可能还要往它里面写下一份文件
-            if self._session_snapshot is not None and path == self._session_snapshot:
+            # 正在用的显式会话快照不能删：同一次操作可能还要往它里面写下一份文件
+            if self._session_explicit and self._session_snapshot is not None and path == self._session_snapshot:
+                continue
+            if not (path.is_dir() and path.parent == self.root):
                 continue
             try:
-                if path.is_dir() and path.parent == self.root:
-                    shutil.rmtree(path)
+                # 清理旧备份也走回收站（和"程序里的删除都进回收站"保持一致）
+                ok, detail = paths.delete_path(path)
             except OSError as exc:  # pragma: no cover
-                logger.warning("清理旧备份失败：%s (%s)", path, exc)
+                ok, detail = False, str(exc)
+            if ok:
+                logger.info("已清理旧备份 %s（%s）", path, detail)
+            else:
+                logger.warning("清理旧备份失败：%s（%s）", path, detail)
 
     # —— 还原 ——
 

@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import paths, startup, uninstall
+from .. import data_location, paths, startup, uninstall
 from ..backup import BackupManager
 from ..constants import DEFAULT_MODELS
 from ..settings import (
@@ -409,6 +409,14 @@ class SettingsDialog(QDialog):
 
         if paths.read_private_override() is None:
             return
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_busy") and parent._busy():
+            QMessageBox.information(
+                self,
+                "恢复默认设置",
+                "设置已经恢复默认值了；正在同步或正在取 Token，private 位置等它结束再改。",
+            )
+            return
         current = paths.data_root()
         if QMessageBox.question(
             self,
@@ -420,15 +428,22 @@ class SettingsDialog(QDialog):
         ) != QMessageBox.StandardButton.Yes:
             return
 
+        # 走和「更改位置…」同一条流程：先放开浏览器档案、日志句柄、单实例锁，再搬
+        # （不然 browser-profile / logs 会被占着，跟用户之前遇到的问题一样）
+        prepare = getattr(parent, "_prepare_for_data_move", None)
+        after = getattr(parent, "_after_data_move", None)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            ok, message = paths.switch_private_root(paths.default_private_dir())
+            ok, message = data_location.move_private_dir(
+                self,
+                paths.default_private_dir(),
+                prepare=prepare,
+                after=after,
+            )
         finally:
             QApplication.restoreOverrideCursor()
         if not ok:
-            QMessageBox.warning(self, "恢复默认设置", message)
-            return
-        logger.info(message)
+            return  # move_private_dir 里已经提示过原因
         self.private_path_label.setText(str(paths.data_root()))
         if QMessageBox.question(
             self,

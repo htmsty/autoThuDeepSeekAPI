@@ -78,7 +78,3 @@ class ApplyResult:
         self.errors.append(message)
         self.ok = False
 
-
-class SkipTarget(Exception):
-    """目标未安装 / 未启用，跳过的理由。"""
-

@@ -35,7 +35,9 @@ def clean_uninstall(settings: AppSettings, *, restore_targets: bool) -> tuple[bo
             lines.extend(messages or ["没有找到可还原的首次备份，跳过还原"])
 
     root = paths.data_root()
-    lines.extend(paths.remove_managed_data(root))
+    # remove_empty_dir=False：只删程序管理的条目，连空目录也不动
+    # （用户口径：只删上面那些，不整个删目录）
+    lines.extend(paths.remove_managed_data(root, remove_empty_dir=False))
 
     pointer = paths.private_pointer_file()
     if pointer.exists():
@@ -49,16 +51,10 @@ def clean_uninstall(settings: AppSettings, *, restore_targets: bool) -> tuple[bo
     # 以前可能退回到 %LOCALAPPDATA%\autoThuDeepSeekAPI\private，顺手也清一份
     fallback = paths.local_app_dir() / "private"
     if fallback != root and fallback.is_dir():
-        lines.extend(paths.remove_managed_data(fallback))
+        lines.extend(paths.remove_managed_data(fallback, remove_empty_dir=False))
 
-    # 位置指针所在的目录空了再删（有别的东西就留着）
-    try:
-        app_local = paths.local_app_dir()
-        if app_local.is_dir() and not any(app_local.iterdir()):
-            app_local.rmdir()
-            lines.append(f"已删除空目录 {app_local}")
-    except OSError:  # pragma: no cover - 删不掉就留着
-        pass
+    # 位置指针所在的目录本身不删（就是"只删上面那些、不整个删目录"的口径）：
+    # 指针文件已经删掉，目录里剩下的是用户自己的东西就留着，空目录也无害。
 
     paths.reset_data_root_cache()
     logger.info("干净卸载完成：%d 条操作", len(lines))

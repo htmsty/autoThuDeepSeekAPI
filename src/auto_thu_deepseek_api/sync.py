@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import paths, procinfo
 from .backup import BackupManager
-from .preflight import PreflightReport, run_preflight
+from .preflight import GLOBAL_CHECK_KEYS, PreflightReport, run_preflight
 from .settings import AppSettings
 from .targets import ApplyResult, CcSwitchTarget, DshTarget
 from .targets.base import TargetStatus
@@ -239,8 +239,12 @@ def run_sync(
             report.skipped.append(f"{status.label}（未安装）")
             continue
         if target.key in blocked:
+            # 全局检查（Token 不是 JWT / 模型清单不合法）失败时也会走到这里，
+            # 所以除了"这个目标自己的失败项"，还要带上全局失败项的说明
             reasons = "；".join(
-                item.detail for item in (report.preflight.failed() if report.preflight else []) if item.target_key == target.key
+                item.detail
+                for item in (report.preflight.failed() if report.preflight else [])
+                if item.target_key in (target.key, *GLOBAL_CHECK_KEYS)
             )
             result = ApplyResult(target.key, target.label, ok=False)
             result.fail(f"预检未通过，已跳过写入：{reasons}")

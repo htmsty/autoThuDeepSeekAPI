@@ -77,6 +77,16 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(migrated.auto_sync_enabled)
         self.assertFalse(migrated.unify_all_profiles, "v2 已经迁过的选项不该被二次覆盖")
 
+    def test_non_object_json_falls_back_to_defaults(self) -> None:
+        """settings.json 是合法 JSON 但不是对象（手改成数组/字符串）时，
+        按默认值启动即可，绝不能抛异常把程序带崩。"""
+
+        path = self.root / "settings.json"
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertEqual(AppSettings.load().sync_interval_minutes, 180)
+        path.write_text('"nope"', encoding="utf-8")
+        self.assertEqual(AppSettings.load().backup_keep, 10)
+
     def test_manual_uncheck_survives_reload(self) -> None:
         settings_path = self.root / "settings.json"
         settings = AppSettings()

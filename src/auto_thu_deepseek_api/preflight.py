@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,63}$")
 
+# 这两个检查是"全局"的：Token 不是 JWT、模型清单不合法时，任何目标都不该写。
+# 以前它们的 target_key 是 token / models，落到 blocked_targets() 里会被当成
+# "不属于任何目标"，于是预检明明失败了，写入照跑 —— 现在它们会阻塞全部目标。
+GLOBAL_CHECK_KEYS = ("token", "models")
+
 
 @dataclass
 class CheckItem:
@@ -49,7 +54,11 @@ class PreflightReport:
         return [item for item in self.items if not item.ok]
 
     def blocked_targets(self) -> set[str]:
-        return {item.target_key for item in self.failed() if item.target_key in ("dsh", "ccswitch")}
+        failed_keys = {item.target_key for item in self.failed()}
+        if failed_keys & set(GLOBAL_CHECK_KEYS):
+            # 全局检查没过：所有目标这次都不写
+            return {"dsh", "ccswitch"}
+        return failed_keys & {"dsh", "ccswitch"}
 
     def text(self) -> str:
         lines = []

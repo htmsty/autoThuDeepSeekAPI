@@ -172,6 +172,48 @@ class PrivateLocationTest(unittest.TestCase):
 
     # —— 卸载 ——
 
+    def test_move_aborts_and_keeps_old_data_when_a_file_fails(self) -> None:
+        """搬运部分失败时必须中止：指针不切、旧数据一个字节不动、新位置的半成品收回。"""
+
+        import shutil as shutil_mod
+        from unittest import mock
+
+        (self.private / "settings.json").write_text('{"interval": 42}', encoding="utf-8")
+        (self.private / "state.json").write_text('{"last_token": "x"}', encoding="utf-8")
+        target = self.root / "newplace"
+        real_copy2 = shutil_mod.copy2
+
+        def flaky_copy2(src, dst, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if Path(src).name == "settings.json":
+                raise OSError("模拟磁盘错误")
+            return real_copy2(src, dst, *args, **kwargs)
+
+        with mock.patch.object(paths.shutil, "copy2", side_effect=flaky_copy2):
+            ok, message = paths.switch_private_root(target)
+
+        self.assertFalse(ok, message)
+        self.assertIn("搬运失败", message)
+        self.assertEqual(
+            (self.private / "settings.json").read_text(encoding="utf-8"),
+            '{"interval": 42}',
+            "没搬成功的文件必须留在原位置",
+        )
+        self.assertEqual(
+            (self.private / "state.json").read_text(encoding="utf-8"),
+            '{"last_token": "x"}',
+            "旧位置的数据不该被清理",
+        )
+        self.assertIsNone(paths.read_private_override(), "失败时绝不能切位置指针")
+
+    def test_clean_uninstall_keeps_empty_private_dir(self) -> None:
+        """干净卸载只删程序管理的条目，不整个删目录（用户口径）。"""
+
+        (self.private / "settings.json").write_text("{}", encoding="utf-8")
+        ok, lines = uninstall.clean_uninstall(AppSettings(), restore_targets=False)
+        self.assertTrue(ok, lines)
+        self.assertFalse((self.private / "settings.json").exists())
+        self.assertTrue(self.private.is_dir(), "只删条目、不删目录本身")
+
     def test_clean_uninstall_removes_only_program_files(self) -> None:
         (self.private / "settings.json").write_text("{}", encoding="utf-8")
         (self.private / "state.json").write_text("{}", encoding="utf-8")
@@ -440,6 +482,36 @@ class DesktopNoticeTest(unittest.TestCase):
         self.assertIn("退出程序去换本程序位置", labels)
         self.assertIn("选择 private 位置…", labels)
         self.assertIn("仍然继续", labels)
+
+    def test_esc_close_does_not_mark_handled(self) -> None:
+        """按 ESC / 点 × 关掉提醒：不能偷偷记成「已处理」，下次启动还要提醒。"""
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        import auto_thu_deepseek_api.data_location as data_location
+        from auto_thu_deepseek_api.state_store import AppState
+
+        application = QApplication.instance() or QApplication(sys.argv[:1])
+        self.assertIsNotNone(application)
+
+        original_exec = QMessageBox.exec
+        original_clicked = QMessageBox.clickedButton
+        QMessageBox.exec = lambda self: 0  # type: ignore[assignment]
+        QMessageBox.clickedButton = lambda self: None  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                original_root = paths.data_root
+                paths.data_root = lambda: Path(tmp) / "private"  # type: ignore[assignment]
+                try:
+                    state = AppState()
+                    self.assertTrue(data_location.desktop_notice(None, state))
+                    self.assertFalse(state.desktop_note_ack, "没点任何按钮就不该记「已处理」")
+                finally:
+                    paths.data_root = original_root  # type: ignore[assignment]
+        finally:
+            QMessageBox.exec = original_exec  # type: ignore[assignment]
+            QMessageBox.clickedButton = original_clicked  # type: ignore[assignment]
 
 
 class LogHandleTest(unittest.TestCase):

@@ -378,7 +378,13 @@ class SettingsDialog(QDialog):
             return
 
         settings = reset_to_defaults(self.settings)
-        settings.save()
+        try:
+            settings.save()
+        except OSError as exc:
+            logger.error("保存默认设置失败：%s", exc)
+            QMessageBox.warning(
+                self, "恢复默认设置", f"已在界面上恢复默认值，但写入磁盘失败：{exc}"
+            )
         logger.info("设置已恢复为默认值")
 
         self._reset_widgets_to_defaults()

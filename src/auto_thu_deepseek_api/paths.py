@@ -341,13 +341,21 @@ def delete_path(path: Path) -> tuple[bool, str]:
 
 
 def remove_managed_data(
-    root: Path, *, keep: tuple[str, ...] = (), attempts: int = 3, pause: float = 0.3
+    root: Path,
+    *,
+    keep: tuple[str, ...] = (),
+    attempts: int = 3,
+    pause: float = 0.3,
+    remove_empty_dir: bool = True,
 ) -> list[str]:
     """删掉 private 里由程序管理的条目，返回说明行。
 
     只删顶层这些条目，用户自己放进来的文件一律不动；删完目录还剩下东西就留着，
     不整个删目录（「干净卸载」也是这个口径）。删除一律先走回收站；
     删不掉的会等一小会儿再试（Windows 释放文件句柄有几毫秒到几百毫秒的延迟）。
+
+    `remove_empty_dir=False` 时连"空目录"也不删（干净卸载用：用户要求只删条目、
+    不整个删目录）；换位置清理旧目录时保持默认 True（把桌面上的空 private 收掉）。
     """
 
     base = Path(root)
@@ -373,12 +381,13 @@ def remove_managed_data(
         logger.info("有 %d 项没删掉，%s 秒后再试一次", len(failed), pause)
         time.sleep(pause)
     # 目录空了就顺手删掉；还留着用户的东西就保持原样
-    try:
-        if base.is_dir() and not any(base.iterdir()):
-            ok, detail = delete_path(base)
-            messages.append(f"{'OK' if ok else '跳过'} {base}：{detail}")
-    except OSError:  # pragma: no cover - 删不掉就留着
-        pass
+    if remove_empty_dir:
+        try:
+            if base.is_dir() and not any(base.iterdir()):
+                ok, detail = delete_path(base)
+                messages.append(f"{'OK' if ok else '跳过'} {base}：{detail}")
+        except OSError:  # pragma: no cover - 删不掉就留着
+            pass
     return messages
 
 
@@ -408,7 +417,8 @@ def switch_private_root(
         return False, "新旧位置不能互相包含，请选一个独立的文件夹"
 
     target.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
+    created: list[str] = []  # 目标里原本没有、这次新建的
+    overwritten: list[str] = []  # 目标里原本就有同名项、这次被覆盖的
     failed: list[str] = []
     for name in MANAGED_ENTRIES:
         if name in skip:
@@ -417,17 +427,31 @@ def switch_private_root(
         if not source.exists():
             continue
         destination = target / name
+        existed = destination.exists()
         try:
             if source.is_dir():
                 shutil.copytree(source, destination, dirs_exist_ok=True)
             else:
                 shutil.copy2(source, destination)
-            copied.append(name)
         except OSError as exc:
             failed.append(f"{name}（{exc}）")
+            continue
+        (overwritten if existed else created).append(name)
 
-    if failed and not copied:
-        return False, "搬运失败：" + "、".join(failed)
+    if failed:
+        # 有东西没搬成功就绝不切换位置：把刚复制到新位置的条目收回（进回收站），
+        # 指针保持不动，旧位置一个字节也不动 —— 用户修好问题后重试即可。
+        # 绝不出现"指针指向新位置、但某项还留在旧位置"的半搬状态。
+        for name in created:
+            try:
+                delete_path(target / name)
+            except OSError as exc:  # pragma: no cover - delete_path 内部已兜住
+                logger.warning("回滚新位置的 %s 失败：%s", name, exc)
+        detail = "、".join(failed)
+        if overwritten:
+            # 目标位置原有同名项已被本次复制覆盖，无法自动还原，如实说明
+            detail += f"；另外这几项原本就在目标位置、已被覆盖：{'、'.join(overwritten)}"
+        return False, f"搬运失败，已中止（原位置保持不变）：{detail}"
 
     write_private_override(target, migrated_from=old)
     cleanup_messages = remove_managed_data(old, keep=("app.lock", "logs"))
@@ -449,7 +473,11 @@ def finish_pending_migration() -> None:
         return
     old = override.migrated_from
     current = data_root()
-    if old == current or not old.is_dir():
+    try:
+        same_as_current = old.resolve() == current.resolve()
+    except OSError:  # pragma: no cover - 路径解析失败时退回字面比较
+        same_as_current = old == current
+    if same_as_current or not old.is_dir():
         write_private_override(override.path, migrated_from=None)
         return
     # 到了这里程序已经在用新位置，旧位置的日志/锁也不会再被占用，可以全删

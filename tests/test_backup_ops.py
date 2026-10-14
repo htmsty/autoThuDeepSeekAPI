@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_thu_deepseek_api import backup_ops  # noqa: E402
 from auto_thu_deepseek_api.settings import AppSettings  # noqa: E402
 
-from .sandbox import FAKE_NEW_TOKEN, Sandbox  # noqa: E402
+from .sandbox import Sandbox  # noqa: E402
 
 
 class BackupOpsTest(unittest.TestCase):

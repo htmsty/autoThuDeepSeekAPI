@@ -250,12 +250,33 @@ class MainWindow(QMainWindow):
 
     # —— 设置项 ——
 
+    def _persist_settings(self) -> bool:
+        """保存设置。写不进去（目录只读、U 盘拔了等）只记日志 + 托盘提醒，不抛异常。"""
+
+        try:
+            self.settings.save()
+            return True
+        except OSError as exc:
+            logger.error("保存设置失败：%s", exc)
+            self.notify(f"保存设置失败：{exc}", warning=True)
+            return False
+
+    def _persist_state(self) -> bool:
+        """保存运行状态。同样不允许把异常抛回 Qt 事件循环。"""
+
+        try:
+            self.state.save()
+            return True
+        except OSError as exc:
+            logger.error("保存运行状态失败：%s", exc)
+            return False
+
     def _save_from_ui(self) -> None:
         self.settings.sync_on_start = self.sync_on_start_check.isChecked()
         self.settings.auto_sync_enabled = self.auto_sync_check.isChecked()
         self.settings.sync_interval_minutes = self.interval_spin.value()
         self.settings.minimize_after_sync = self.minimize_after_check.isChecked()
-        self.settings.save()
+        self._persist_settings()
 
     def _toggle_startup(self, checked: bool) -> None:
         ok, message = startup.set_enabled(checked)
@@ -267,7 +288,7 @@ class MainWindow(QMainWindow):
             self.startup_check.blockSignals(False)
             return
         self.settings.launch_at_startup = checked
-        self.settings.save()
+        self._persist_settings()
 
     def _on_auto_toggled(self, checked: bool) -> None:
         self._save_from_ui()
@@ -294,8 +315,13 @@ class MainWindow(QMainWindow):
         if self._skip_save_on_quit or self._quitting:
             # 设置对话框里刚做过"干净卸载"或正在退出：别再写设置文件，否则刚删的会被建回来
             return
+        previous_level = self.settings.log_level
         dialog.apply_to(self.settings)
-        self.settings.save()
+        self._persist_settings()
+        if self.settings.log_level != previous_level:
+            # 改日志级别立刻生效，不用等下次启动
+            setup_logging(logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO)
+            logger.info("日志级别已切换为 %s", self.settings.log_level)
         logger.info("设置已保存")
         self.refresh_status()
         if dialog.manual_token:
@@ -384,7 +410,7 @@ class MainWindow(QMainWindow):
             box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
             box.exec()
             self.state.targets_note_ack = True
-            self.state.save()
+            self._persist_state()
             logger.info("已提醒过「都没检出」，以后不再弹这个提醒")
         return False
 
@@ -653,8 +679,8 @@ class MainWindow(QMainWindow):
                 worker.wait(2000)
         self._sync_worker = None
         if not self._skip_save_on_quit:
-            self.settings.save()
-            self.state.save()
+            self._persist_settings()
+            self._persist_state()
         self.tray.hide()
         self.close()
         from PySide6.QtWidgets import QApplication
@@ -810,7 +836,7 @@ class MainWindow(QMainWindow):
         if never_again.isChecked():
             self.settings.suppress_ccswitch_running_warning = True
             self.settings.ccswitch_running_policy = CCSWITCH_POLICY_DIRECT
-            self.settings.save()
+            self._persist_settings()
 
         clicked = box.clickedButton()
         if clicked is cancel_button:
@@ -849,7 +875,12 @@ class MainWindow(QMainWindow):
 
     def _on_token_captured(self, token: str) -> None:
         self._capture = None
-        self.state.remember_token(token)
+        try:
+            self.state.remember_token(token)
+        except OSError as exc:
+            # 状态文件写不进去不该拦住同步：Token 已经在内存里，这次先用着
+            logger.error("保存 Token 到状态文件失败：%s", exc)
+            self.notify(f"Token 保存失败（本次同步继续）：{exc}", warning=True)
         self.refresh_status()
         self._start_sync_worker(token)
 
@@ -891,8 +922,11 @@ class MainWindow(QMainWindow):
         summary = report.summary()
         self.settings.last_sync_at = datetime.now().isoformat(timespec="seconds")
         self.settings.last_sync_summary = f"{self.settings.last_sync_at} · {summary}"
-        self.settings.save()
-        self.state.remember_status(summary)
+        self._persist_settings()
+        try:
+            self.state.remember_status(summary)
+        except OSError as exc:
+            logger.error("保存同步状态失败：%s", exc)
         self.refresh_status()
         if report.cancelled:
             # 是我们自己请它停下的，别弹"同步完成"的通知吓人

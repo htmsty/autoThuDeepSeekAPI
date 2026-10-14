@@ -256,15 +256,15 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 ## 写入面清单（"绝不动用户其它配置"的落地方式）
 
 用户明确要求：任何交互都不能改动**别人的**配置。下面是我们会写的每一个文件、写的范围，
-以及保证方式（2.5.7 起；每一条都有对应用例）。
+以及保证方式（2.5.7 / 2.5.9 起；每一条都有对应用例）。
 
 | 文件 | 只写什么 | 保证方式 |
 | --- | --- | --- |
 | `.dsh/.credentials.yaml` | `refs.MADMODEL_API_KEY` 这一行 | **行级替换**：别的地方（其它工具的 key、`records`、注释、单引号风格）一个字节都不动；只有文件坏掉需要重建时才整份重写（先留底、日志说明） |
-| `.dsh/profiles/*/cordis.patch.yml` | ① 我们自己的 provider 块（`apiKeyEnv` / `models` / 缺失字段）；② 真要改时的 `agent-default-model` 条目 | **块级替换**：把新文本里这两块贴回原文件，其余部分（别人的 provider、其它条目、注释、引号、流式列表写法）原文照抄；认领只认"域名是清华站点"或"键名就叫 madmodel"，不再靠 `apiKeyEnv` 这种可能被旧版本污染的标记；写前还有"不是我们的就报错退出"的硬护栏 |
+| `.dsh/profiles/*/cordis.patch.yml` | ① 我们自己的 provider 块（`apiKeyEnv` / `models` / 缺失字段）；② 真要改时的 `agent-default-model` 条目 | **块级替换**：把新文本里这两块贴回原文件，其余部分（别人的 provider、其它条目、注释、引号、流式列表写法）原文照抄；**新增 provider 时只往我们这个条目（`llm-pi-ai`）的 `providers:` 块末尾插入**（同一文件别的条目也可能有 providers，插入范围限定在本条目内）；同一文件里还有别的 provider 时**禁止整份重写**，块/条目定位不到就报错、这次不写；条目定位按"整块文本匹配 id/name"（引号、字段顺序都能认），数据层说条目已存在而文本层定位不到时绝不追加；认领只认"域名是清华站点"或"键名就叫 madmodel"，不再靠 `apiKeyEnv` 这种可能被旧版本污染的标记；写前还有"不是我们的就报错退出"的硬护栏 |
 | `.cc-switch/cc-switch.db` | `(deepseek-thu, codex)` 这张卡片的 token / meta / name / is_current | 其它卡片的内容不动；`is_current` 的置位只作用于 codex 应用（"当前供应商"这个语义本身）；**默认不再刷新别人的卡片**（想刷要在设置里显式打开 `顺带刷新同站点旧卡片的令牌`，且只替换 Token 字段） |
-| `.cc-switch/settings.json` | `currentProviderCodex` 这一行 | **行级替换** + 替换后 `json.loads` 校验等于目标数据；值没变就连排版都不写；同名键不唯一时退回整份重排（仍只改值） |
-| `.cc-switch/live-state.json` | `apps.codex.proxy_route` 这一行 | 同上（`contract` 等其它字段保持原样） |
+| `.cc-switch/settings.json` | `currentProviderCodex` 这一行 | **行级替换** + 替换后 `json.loads` 校验等于目标数据；值没变就连排版都不写；键还不存在时**只往对象末尾最小插入一行**（别处字节不动），同名键不唯一 / 结构不认识才退回整份重排（仍只改值） |
+| `.cc-switch/live-state.json` | `apps.codex.proxy_route` 这一行 | 同上；缺 `apps.codex` 这类中间层时整块补出缺的部分，别的应用（例如 claude）的紧凑写法一字不动（`contract` 等其它字段保持原样） |
 | `private/**` | 我们自己的设置 / 状态 / 日志 / 备份 / 浏览器会话 / 模型缓存 | 都是本程序的数据，换位置与卸载只按 `paths.MANAGED_ENTRIES` 处理 |
 | 桌面快捷方式、开机启动注册表项 | 只在用户点按钮 / 勾选时写 | 不做后台自动写入 |
 

@@ -16,6 +16,8 @@ from . import paths
 logger = logging.getLogger(__name__)
 
 _LOCK: QLockFile | None = None
+# 最近一次取锁失败的原因（LockFailedError = 已有实例；PermissionError 等是环境问题）
+_LAST_ERROR = ""
 
 
 def _lock_file() -> QLockFile:
@@ -27,13 +29,17 @@ def _lock_file() -> QLockFile:
 def acquire(timeout_ms: int = 100) -> bool:
     """取锁。成功返回 True；已经被别的实例占着返回 False。"""
 
-    global _LOCK
+    global _LOCK, _LAST_ERROR
     if _LOCK is not None:
         return True
     lock = _lock_file()
     if not lock.tryLock(timeout_ms):
+        error = lock.error()
+        _LAST_ERROR = str(getattr(error, "name", "") or error or "")
+        logger.info("取单实例锁失败：%s（%s）", _LAST_ERROR or "未知原因", paths.data_root() / "app.lock")
         return False
     _LOCK = lock
+    _LAST_ERROR = ""
     return True
 
 
@@ -63,3 +69,9 @@ def release() -> None:
     except Exception as exc:  # pragma: no cover - 让不出也要继续
         logger.warning("让出单实例锁失败：%s", exc)
     _LOCK = None
+
+
+def last_error() -> str:
+    """最近一次取锁失败的原因（枚举名，例如 LockFailedError / PermissionError）。"""
+
+    return _LAST_ERROR

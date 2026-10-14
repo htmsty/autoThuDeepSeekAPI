@@ -7,6 +7,7 @@ import logging
 import re
 import sqlite3
 import subprocess
+import textwrap
 from pathlib import Path
 
 from .. import constants
@@ -63,12 +64,17 @@ class CcSwitchTarget:
         backup: BackupManager,
         label: str,
         *,
-        patch: tuple[str, object, object] | None = None,
+        patch: tuple[str, object] | None = None,
+        insert: tuple[tuple[str, ...], str, object] | None = None,
     ) -> bool:
         """写一个 JSON 文件。
 
-        `patch=(key, 旧值, 新值)` 时，优先只替换那**一行**，其它行（含用户自己的键、
+        `patch=(key, 旧值)` 时，优先只替换那**一行**，其它行（含用户自己的键、
         缩进风格、紧凑写法）逐字不动；替换结果必须能解析且等于 data，否则退回整份重排。
+
+        `insert=(对象路径, key, value)` 是"键还不存在"时的兜底：只往那个对象末尾补一行
+        （缺的中间层整块补出来），同样要求解析结果等于 data，失败才退回整份重排。
+        这样别的应用（例如 CC Switch 里的 claude 配置）的排版不会被顺手重写。
         """
 
         original = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -80,8 +86,10 @@ class CcSwitchTarget:
             except ValueError:
                 pass
         new_text = self._json_dump(data, original)
-        if patch is not None and original:
-            spliced = self._splice_json_line(original, new_text, *patch)
+        if original:
+            spliced = self._splice_json_line(original, new_text, *patch) if patch is not None else None
+            if spliced is None and insert is not None:
+                spliced = self._insert_json_key(original, *insert)
             if spliced is not None:
                 try:
                     if json.loads(spliced) == data:
@@ -100,7 +108,7 @@ class CcSwitchTarget:
 
     @staticmethod
     def _splice_json_line(
-        original_text: str, new_text: str, key: str, old_value: object, new_value: object
+        original_text: str, new_text: str, key: str, old_value: object
     ) -> str | None:
         """把 `"key": 旧值` 那一行换成新版本，其余行原样保留；不唯一就返回 None。
 
@@ -125,6 +133,182 @@ class CcSwitchTarget:
         result = list(original_lines)
         result[old_hits[0]] = new_lines[new_hits[0]]
         return "".join(result)
+
+    # —— 最小插入：键还不存在时只往对象末尾补一行 ——
+
+    @classmethod
+    def _insert_json_key(
+        cls, original_text: str, path: tuple[str, ...], key: str, value: object
+    ) -> str | None:
+        """在 `path` 指向的对象末尾插入 `key: value`，其余文本一字不动。
+
+        路径里缺的中间对象会整块补出来（例如 live-state.json 还没有 apps.codex）。
+        单行 JSON、找不到顶层对象、键已经存在等情况返回 None，调用方退回整份重排。
+        """
+
+        if "\n" not in original_text:
+            # 单行 JSON 本身就是紧凑写法，整份重写不会重排别人的东西
+            return None
+        top = original_text.find("{")
+        if top < 0:
+            return None
+        top_end = cls._match_brace(original_text, top)
+        if top_end is None:
+            return None
+
+        current_start, current_end = top, top_end
+        for depth, segment in enumerate(path):
+            value_start = cls._find_json_key(original_text, current_start, current_end, segment)
+            if value_start is None:
+                # 缺了这一层：把它以及剩下的路径整块补在当前对象末尾
+                nested = cls._nested_payload(path[depth + 1 :], key, value)
+                return cls._append_json_member(
+                    original_text, current_start, current_end, segment, nested
+                )
+            if original_text[value_start] != "{":
+                return None
+            current_start = value_start
+            matched = cls._match_brace(original_text, current_start)
+            if matched is None:
+                return None
+            current_end = matched
+
+        if cls._find_json_key(original_text, current_start, current_end, key) is not None:
+            # 已经存在了：绝不能插成重复键
+            return None
+        return cls._append_json_member(original_text, current_start, current_end, key, value)
+
+    @staticmethod
+    def _nested_payload(rest: tuple[str, ...], key: str, value: object) -> object:
+        """把剩余路径包成一个嵌套对象：rest=("a","b") → {"a": {"b": {key: value}}}。"""
+
+        payload: object = {key: value}
+        for segment in reversed(rest):
+            payload = {segment: payload}
+        return payload
+
+    @staticmethod
+    def _match_brace(text: str, start: int) -> int | None:
+        """text[start] == '{' 时返回配对的 '}' 下标（跳过字符串与转义）。"""
+
+        depth = 0
+        quote = ""
+        index = start
+        while index < len(text):
+            char = text[index]
+            if quote:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = ""
+                index += 1
+                continue
+            if char == '"':
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+            index += 1
+        return None
+
+    @classmethod
+    def _find_json_key(cls, text: str, obj_start: int, obj_end: int, key: str) -> int | None:
+        """在**这一层**对象里找 `"key":`，返回值起始下标；找不到返回 None。
+
+        嵌套对象里的同名键不算（用括号深度过滤，例如 live-state.json 里
+        claude / codex 各有一份 proxy_route 时不会互相串）。
+        """
+
+        pattern = re.compile(rf'"{re.escape(key)}"\s*:\s*')
+        for match in pattern.finditer(text, obj_start + 1, obj_end):
+            if cls._depth_at(text, obj_start, match.start()) != 0:
+                continue
+            value_start = match.end()
+            while value_start < obj_end and text[value_start] in " \t\r\n":
+                value_start += 1
+            return value_start if value_start < obj_end else None
+        return None
+
+    @staticmethod
+    def _depth_at(text: str, obj_start: int, index: int) -> int:
+        """obj_start 之后、index 之前，括号的净深度（跳过字符串里的括号）。"""
+
+        depth = 0
+        quote = ""
+        position = obj_start + 1
+        while position < index:
+            char = text[position]
+            if quote:
+                if char == "\\":
+                    position += 2
+                    continue
+                if char == quote:
+                    quote = ""
+            elif char == '"':
+                quote = char
+            elif char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+            position += 1
+        return depth
+
+    @classmethod
+    def _append_json_member(
+        cls, text: str, obj_start: int, obj_end: int, key: str, value: object
+    ) -> str | None:
+        """把 `"key": value` 追加到对象末尾，返回新文本；结构不认识时返回 None。"""
+
+        last = obj_end - 1
+        while last > obj_start and text[last] in " \t\r\n":
+            last -= 1
+        empty_object = text[last] == "{"
+        child_indent = cls._child_indent(text, obj_start, obj_end)
+        parent_indent = cls._line_indent(text, obj_start)
+
+        body = json.dumps({key: value}, ensure_ascii=False, indent=2)
+        inner_lines = body.splitlines()[1:-1]
+        if not inner_lines:
+            return None
+        # json.dumps 自带 2 格基础缩进，先去掉，再整体平移成原文子键的缩进
+        inner = textwrap.dedent("\n".join(inner_lines))
+        member = "\n".join(
+            child_indent + line if line.strip() else "" for line in inner.splitlines()
+        )
+
+        if empty_object:
+            new_object = "{" + "\n" + member + "\n" + parent_indent + "}"
+            return text[:obj_start] + new_object + text[obj_end + 1 :]
+        head = text[: last + 1]
+        tail = text[last + 1 : obj_end + 1]  # 原对象尾部的空白 + '}'
+        return head + ",\n" + member + tail + text[obj_end + 1 :]
+
+    @staticmethod
+    def _line_indent(text: str, index: int) -> str:
+        line_start = text.rfind("\n", 0, index) + 1
+        prefix = text[line_start:index]
+        return prefix[: len(prefix) - len(prefix.lstrip(" \t"))]
+
+    @classmethod
+    def _child_indent(cls, text: str, obj_start: int, obj_end: int) -> str:
+        """对象里子键用的缩进；看不出来就用"父行缩进 + 两格"。"""
+
+        fallback = cls._line_indent(text, obj_start) + "  "
+        newline = text.find("\n", obj_start, obj_end)
+        if newline < 0:
+            return fallback
+        line_start = newline + 1
+        line_end = text.find("\n", line_start, obj_end + 1)
+        row = text[line_start : line_end if line_end >= 0 else obj_end]
+        stripped = row.lstrip(" \t")
+        if not stripped or stripped[0] in "}],":
+            return fallback
+        indent = row[: len(row) - len(stripped)]
+        return indent or fallback
 
     @staticmethod
     def _json_dump(data: dict, original_text: str) -> str:
@@ -174,7 +358,7 @@ class CcSwitchTarget:
             return result
 
         try:
-            self._write_routing(token, backup, result)
+            self._write_routing(backup, result)
         except Exception as exc:  # noqa: BLE001
             result.fail(f"当前路由写入失败：{exc}")
         return result
@@ -515,7 +699,7 @@ class CcSwitchTarget:
 
     # —— 路由 ——
 
-    def _write_routing(self, token: str, backup: BackupManager, result: ApplyResult) -> None:
+    def _write_routing(self, backup: BackupManager, result: ApplyResult) -> None:
         settings_path = self.paths.settings_file
         if settings_path and settings_path.exists():
             data = _load_json(settings_path)
@@ -528,7 +712,8 @@ class CcSwitchTarget:
                     data,
                     backup,
                     "ccswitch-settings",
-                    patch=(key, previous, constants.CCSWITCH_PROVIDER_ID),
+                    patch=(key, previous),
+                    insert=((), key, constants.CCSWITCH_PROVIDER_ID),
                 ):
                     result.changed = True
                     result.note(f"已把 settings.json 的 {key} 指向 DeepSeek (THU)")
@@ -556,7 +741,12 @@ class CcSwitchTarget:
                     data,
                     backup,
                     "ccswitch-live-state",
-                    patch=("proxy_route", previous_route, constants.CCSWITCH_PROVIDER_ID),
+                    patch=("proxy_route", previous_route),
+                    insert=(
+                        ("apps", constants.CCSWITCH_APP_TYPE),
+                        "proxy_route",
+                        constants.CCSWITCH_PROVIDER_ID,
+                    ),
                 ):
                     result.changed = True
                     result.note("已把 live-state.json 的代理路由指向 DeepSeek (THU)")

@@ -103,7 +103,9 @@ def _target_command() -> tuple[str, str, str]:
     if paths.is_frozen():
         exe = str(Path(sys.executable).resolve())
         return exe, "", str(Path(exe).parent)
-    interpreter = Path(sys.executable).resolve()
+    # 源码模式也优先 pythonw：用 python.exe 建出来的快捷方式每次双击都会闪一下控制台
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    interpreter = pythonw.resolve() if pythonw.exists() else Path(sys.executable).resolve()
     script = Path(__file__).resolve().parents[2] / "run_dev.py"
     return str(interpreter), f'"{script}"', str(script.parent)
 

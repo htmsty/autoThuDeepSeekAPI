@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_thu_deepseek_api.backup import BackupManager  # noqa: E402
-from auto_thu_deepseek_api.preflight import run_preflight  # noqa: E402
+from auto_thu_deepseek_api.preflight import CheckItem, PreflightReport, run_preflight  # noqa: E402
 from auto_thu_deepseek_api.settings import AppSettings  # noqa: E402
 from auto_thu_deepseek_api.sync import build_targets  # noqa: E402
 
@@ -86,6 +86,32 @@ class PreflightTest(unittest.TestCase):
         report = run_preflight(self.settings, FAKE_NEW_TOKEN, MODELS)
         self.assertFalse(report.ok)
         self.assertIn("dsh", report.blocked_targets())
+
+    def test_global_checks_block_every_target(self) -> None:
+        """Token 不是 JWT / 模型清单不合法属于全局问题：所有目标都不许写。
+
+        以前这两项失败的 target_key 是 token / models，blocked_targets() 认不出来，
+        结果预检虽然报了失败，写入还是照跑。
+        """
+
+        token_report = PreflightReport(items=[CheckItem("token", "Token", False, "不是 JWT")])
+        self.assertEqual(token_report.blocked_targets(), {"dsh", "ccswitch"})
+
+        models_report = PreflightReport(items=[CheckItem("models", "模型清单", False, "id 非法")])
+        self.assertEqual(models_report.blocked_targets(), {"dsh", "ccswitch"})
+
+        one_target = PreflightReport(items=[CheckItem("dsh", "DSH", False, "渲染失败")])
+        self.assertEqual(one_target.blocked_targets(), {"dsh"})
+
+    def test_run_sync_writes_nothing_when_token_is_not_jwt(self) -> None:
+        """端到端：拿到的不是 JWT 时，两个目标一个都不写。"""
+
+        from auto_thu_deepseek_api.sync import run_sync
+
+        before = self._snapshot()
+        report = run_sync(self.settings, "not-a-jwt", verify=False, fetch_model_list=False)
+        self.assertFalse(report.ok)
+        self.assertEqual(self._snapshot(), before, "Token 不合法时不该写任何文件")
 
     def test_preflight_accepts_profile_with_js_expressions(self) -> None:
         profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"

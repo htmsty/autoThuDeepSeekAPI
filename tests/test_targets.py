@@ -888,6 +888,42 @@ refs:
         self.assertEqual(json.loads(row[1])["auth"]["OPENAI_API_KEY"], FAKE_NEW_TOKEN)
         self.assertEqual(json.loads(row[2])["apiFormat"], "openai_chat")
 
+    def test_ccswitch_json_insert_keeps_other_apps(self) -> None:
+        """live-state.json 还没有 apps.codex 时：只补出 codex 那一段，
+        claude 的排版（紧凑单行）一个字节都不动。"""
+
+        target = CcSwitchTarget(TargetPaths(base_dir=self.sandbox.ccswitch_dir))
+        live = self.sandbox.ccswitch_dir / "live-state.json"
+        original = (
+            "{\n"
+            '  "version": 1,\n'
+            '  "apps": {\n'
+            '    "claude": { "mode": "direct", "note": "紧凑一行" }\n'
+            "  },\n"
+            '  "updatedAt": 1759999999123\n'
+            "}\n"
+        )
+        live.write_text(original, encoding="utf-8")
+        data = json.loads(original)
+        data["apps"]["codex"] = {"proxy_route": "deepseek-thu"}
+
+        changed = target._write_json(
+            live,
+            data,
+            self.backup,
+            "ccswitch-live-state",
+            patch=("proxy_route", None),
+            insert=(("apps", "codex"), "proxy_route", "deepseek-thu"),
+        )
+        self.assertTrue(changed)
+        after = live.read_text(encoding="utf-8")
+        self.assertIn(
+            '"claude": { "mode": "direct", "note": "紧凑一行" }',
+            after,
+            "别的应用的排版被改写了",
+        )
+        self.assertEqual(json.loads(after), data)
+
     def test_ccswitch_second_run_touches_nothing(self) -> None:
         """没有变化就别再备份、别再写库（CC Switch 运行中时这点很重要）。"""
 
@@ -1139,6 +1175,101 @@ refs:
         self.assertEqual(profile.read_text(encoding="utf-8"), text, "文件应当原样不动")
 
     # —— 备份与还原 ——
+
+    def test_new_provider_insert_keeps_foreign_raw_text(self) -> None:
+        """原先没有 madmodel 的 profile：新 provider 只能插到 providers 块尾部，
+        同一文件里别人 provider 的原文（注释/单引号/流式列表）一字都不许动。"""
+
+        text = """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      glm:                      # 别人的：混着注释与单引号
+        displayName: 'GLM'      # 单引号风格
+        apiKeyEnv: GLM_API_KEY
+        api: openai-completions
+        baseURL: "https://open.bigmodel.cn/api/coding/paas/v4/"
+        models: [{ id: glm-5.3-flash, name: glm-5.3-flash }]   # 流式列表
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: glm
+    model: glm-5.3-flash
+"""
+        marker = "\n- id: agent-default-model"
+        profile = self._write_profile(text)
+        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        after = profile.read_text(encoding="utf-8")
+        foreign_before = text[text.index("      glm:") : text.index(marker)]
+        foreign_after = after[after.index("      glm:") : after.index("      madmodel:")]
+        self.assertEqual(
+            foreign_after.rstrip("\n"), foreign_before.rstrip("\n"), "别人的 provider 原文被改写了"
+        )
+
+        providers = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]
+        self.assertEqual(providers["glm"]["apiKeyEnv"], "GLM_API_KEY")
+        self.assertIn("madmodel", providers)
+        self.assertEqual(
+            providers["madmodel"]["baseURL"], "https://madmodel.cs.tsinghua.edu.cn/v1"
+        )
+
+    def test_insert_goes_into_our_entry_not_someone_elses_providers(self) -> None:
+        """同一文件里别的条目也有 providers 时，新建的 madmodel 必须插进 llm-pi-ai
+        自己的 providers 块，绝不能插到别人条目的 providers 里。"""
+
+        text = """- id: llm-deepseek
+  name: "@deepseek-ai/dsh-llm-deepseek"
+  config:
+    providers:
+      legacy:                 # 别人条目里的 providers
+        apiKeyEnv: LEGACY_KEY
+        baseURL: https://ai.paratera.com/v1
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      glm:                    # 我们这个条目里的别人
+        apiKeyEnv: GLM_API_KEY
+        baseURL: https://open.bigmodel.cn/api/coding/paas/v4/
+"""
+        profile = self._write_profile(text)
+        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        entries = self._parse_entries(profile)
+        self.assertIn("madmodel", entries["llm-pi-ai"]["config"]["providers"])
+        self.assertNotIn(
+            "madmodel",
+            entries["llm-deepseek"]["config"]["providers"],
+            "不能把 provider 插到别人条目的 providers 里",
+        )
+        after = profile.read_text(encoding="utf-8")
+        self.assertIn("      legacy:                 # 别人条目里的 providers", after)
+
+    def test_inline_madmodel_is_not_rewritten_wholesale(self) -> None:
+        """madmodel 写成内联 map、旁边还有别人的 provider 时：宁可报错不写，
+        也不能靠"整份重写"完成任务（那会把别人的排版一起重排）。"""
+
+        text = """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      glm:
+        displayName: GLM
+        apiKeyEnv: GLM_API_KEY
+        api: openai-completions
+        baseURL: https://open.bigmodel.cn/api/coding/paas/v4/
+        models:
+          - id: glm-5.3-flash
+            name: glm-5.3-flash
+      madmodel: {displayName: DeepSeek (THU), apiKeyEnv: MADMODEL_API_KEY, api: openai-completions, baseURL: https://madmodel.cs.tsinghua.edu.cn/v1, models: [{id: DeepSeek-V4.1-Flash, name: DeepSeek-V4.1-Flash}]}
+"""
+        profile = self._write_profile(text)
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertFalse(result.ok, "定位不到我们的块时不该硬写")
+        self.assertEqual(profile.read_text(encoding="utf-8"), text, "文件应当原样不动")
 
     def test_backup_and_restore_returns_original(self) -> None:
         credentials = self.sandbox.dsh_dir / ".credentials.yaml"

@@ -49,6 +49,9 @@ def setup_logging(level: int = logging.INFO) -> Path:
         root.removeHandler(handler)
         # 只是从 logger 上摘掉并不会关闭文件句柄；这里必须真的关掉
         _close_handler(handler)
+        # 关掉的 handler 也从"我们开过的"清单里去掉，别让它一直挂在列表上
+        if handler in _CREATED_FILE_HANDLERS:
+            _CREATED_FILE_HANDLERS.remove(handler)
 
     formatter = logging.Formatter(LOG_FORMAT)
 

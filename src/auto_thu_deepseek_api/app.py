@@ -82,6 +82,19 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
 
     if not instance.acquire_with_retry(_lock_wait_seconds(argv)):
+        error_name = instance.last_error()
+        if error_name and error_name != "LockFailedError":
+            # 不是"有别的实例"，而是锁文件建不出来（目录只读、被占用等）：
+            # 这种情况说"程序已经在运行"会误导用户。
+            logger.error("获取运行锁失败（%s），运行数据目录：%s", error_name, paths.data_root())
+            if not start_minimized and QSystemTrayIcon.isSystemTrayAvailable():
+                QMessageBox.warning(
+                    None,
+                    constants.APP_DISPLAY_NAME,
+                    f"无法在运行数据目录建立锁文件（{error_name}）。\n"
+                    f"请检查这个目录是否可写：\n{paths.data_root()}",
+                )
+            return 0
         logger.info("程序已经在运行，退出本次启动")
         # 开机启动（--minimized）是后台拉起，别弹窗打扰用户
         if not start_minimized and QSystemTrayIcon.isSystemTrayAvailable():

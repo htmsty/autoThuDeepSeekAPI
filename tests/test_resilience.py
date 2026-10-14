@@ -311,5 +311,25 @@ class TokenTimeTest(unittest.TestCase):
         self.assertEqual(jwt_utils.expiry_moment(no_exp, ""), None)
 
 
+class CorruptStateFileTest(unittest.TestCase):
+    """状态文件是合法 JSON、但不是对象时：加载必须退回默认状态，不能把启动带崩。"""
+
+    def test_state_file_that_is_not_an_object(self) -> None:
+        from auto_thu_deepseek_api import paths
+        from auto_thu_deepseek_api.state_store import AppState
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_root = paths.data_root
+            paths.data_root = lambda: Path(tmp)  # type: ignore[assignment]
+            try:
+                (Path(tmp) / "state.json").write_text("[]", encoding="utf-8")
+                state = AppState.load()
+                self.assertEqual(state.last_token, "")
+                self.assertFalse(state.desktop_note_ack)
+                self.assertFalse(state.targets_note_ack)
+            finally:
+                paths.data_root = original_root  # type: ignore[assignment]
+
+
 if __name__ == "__main__":
     unittest.main()

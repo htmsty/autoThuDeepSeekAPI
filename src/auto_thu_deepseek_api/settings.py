@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 from . import paths
 from .constants import DEFAULT_SYNC_INTERVAL_MINUTES
@@ -23,7 +23,6 @@ RESET_KEEP_FIELDS = (
     "launch_at_startup",  # 开机启动写在注册表里，恢复默认不该动系统
     "last_sync_at",
     "last_sync_summary",
-    "extra",
 )
 
 
@@ -76,7 +75,6 @@ class AppSettings:
     # 最近一次成功同步时间（ISO 字符串，仅供界面显示）
     last_sync_at: str = ""
     last_sync_summary: str = ""
-    extra: dict = field(default_factory=dict)
 
     # —— 读写 ——
 
@@ -88,6 +86,13 @@ class AppSettings:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            return cls()
+        if not isinstance(raw, dict):
+            # 合法 JSON 但不是对象（手改成数组/字符串、别处写坏都算）：
+            # 按"没有设置"处理，绝不让加载过程把程序带崩。
+            logging.getLogger(__name__).warning(
+                "设置文件结构不是 JSON 对象，按默认设置处理：%s", path
+            )
             return cls()
         version = raw.get("settings_version")
         try:
@@ -120,7 +125,10 @@ class AppSettings:
         if version < SETTINGS_VERSION:
             settings.settings_version = SETTINGS_VERSION
             if migrated:
-                settings.save()
+                try:
+                    settings.save()
+                except OSError as exc:  # pragma: no cover - 目录不可写时别让启动崩
+                    logging.getLogger(__name__).warning("保存迁移后的设置失败：%s", exc)
         settings.normalize()
         return settings
 

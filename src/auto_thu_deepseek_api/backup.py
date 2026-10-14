@@ -96,7 +96,12 @@ class BackupManager:
             for payload in snapshot.iterdir():
                 if not payload.is_file() or payload.name == SOURCE_MARKER:
                     continue
-                created = datetime.fromtimestamp(payload.stat().st_mtime).isoformat(timespec="milliseconds")
+                try:
+                    stat = payload.stat()
+                except OSError:
+                    # 文件在读目录和取属性之间被删/移走（并发清理）：跳过它，别让整个自愈失败
+                    continue
+                created = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="milliseconds")
                 rebuilt.append(
                     asdict(
                         BackupEntry(
@@ -105,7 +110,7 @@ class BackupManager:
                             backup=str(payload),
                             created=created,
                             sha256=_sha256(payload),
-                            size=payload.stat().st_size,
+                            size=stat.st_size,
                         )
                     )
                 )

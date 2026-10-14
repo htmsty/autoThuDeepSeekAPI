@@ -87,7 +87,7 @@ class DshTarget:
         else:
             result.note(f"未找到凭据文件，跳过：{credentials}")
 
-        self._write_profiles(token, models, backup, result)
+        self._write_profiles(models, backup, result)
         return result
 
     def _write_credentials(
@@ -206,11 +206,14 @@ class DshTarget:
         # 只有"明确就是我们"的 profile 才在范围内：正文里有清华站点域名，或有 madmodel 这个 provider 键。
         # 早先还看"正文里有没有 MADMODEL_API_KEY"——可这个标记可能是旧版本误写到别人的 provider
         # （例如 isearcher / ollama）身上的，于是会把别人的 profile 也拉进来处理，必须去掉。
-        return constants.MADMODEL_HOST in text or f"{constants.DSH_PROVIDER_KEY}:" in text
+        # 另外 "madmodel:" 必须出现在**键的位置**（行首缩进后），注释里提到它不算。
+        key_line = re.compile(
+            rf"(?m)^\s*['\"]?{re.escape(constants.DSH_PROVIDER_KEY)}['\"]?\s*:"
+        )
+        return constants.MADMODEL_HOST in text or key_line.search(text) is not None
 
     def _write_profiles(
         self,
-        token: str,
         models: list[dict],
         backup: BackupManager,
         result: ApplyResult,
@@ -301,6 +304,23 @@ class DshTarget:
             provider_key = key
             result.note(f"{name}：已找到 provider {key}")
 
+        # 整个补丁文件里除"我们这一条（llm-pi-ai 里的 provider_key）"以外的 provider 都算别人的：
+        # 只要还有别人，就绝不允许整份重写（那会重排他们的排版），宁可这次不写并报错。
+        our_entry = self._find_entry(data, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME)
+        foreign_providers: set[str] = set()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            item_config = item.get("config")
+            item_providers = item_config.get("providers") if isinstance(item_config, dict) else None
+            if not isinstance(item_providers, dict):
+                continue
+            for key in item_providers:
+                if item is our_entry and str(key) == provider_key:
+                    continue
+                foreign_providers.add(str(key))
+        other_provider_keys = sorted(foreign_providers)
+
         # 硬护栏：**绝不改别的模型的配置**。
         # 只有"这个 provider 的标记就是我们"（或域名就是清华站点）才继续写；
         # 它的 apiKeyEnv 另有其人时宁可报错退出，也不动它一个字。
@@ -365,6 +385,16 @@ class DshTarget:
 
         provider_changed = provider != provider_before
 
+        # 数据层确认 agent-default-model 条目原本在不在：文本层万一定位不到它，
+        # 只有"原本就没有"才允许追加缺的那块，否则会写出两条同名条目。
+        entry_existed_before = (
+            self._find_entry(
+                data,
+                constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+                constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+            )
+            is not None
+        )
         if self.unify_all_profiles:
             entry_changed = self._point_default_model(data, merged, provider_key, result)
         else:
@@ -389,6 +419,9 @@ class DshTarget:
             provider_key=provider_key,
             provider_changed=provider_changed,
             entry_changed=bool(entry_changed),
+            provider_created=created_here,
+            entry_existed=entry_existed_before,
+            allow_full_rewrite=not other_provider_keys,
         )
 
         # 落盘前先确认 dump 出来的是合法的顶层数组，且我们的 provider 真在里面。
@@ -550,7 +583,7 @@ class DshTarget:
         providers_indent: int | None = None
         key_indent: int | None = None
         start: int | None = None
-        key_pattern = re.compile(rf"^\s*{re.escape(provider_key)}\s*:\s*(#.*)?$")
+        key_pattern = re.compile(rf"^\s*['\"]?{re.escape(provider_key)}['\"]?\s*:\s*(#.*)?$")
         for index, line in enumerate(lines):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -570,21 +603,87 @@ class DshTarget:
         return (start, len(lines)) if start is not None else None
 
     @staticmethod
-    def _entry_span(lines: list[str], entry_id: str) -> tuple[int, int] | None:
-        """找出顶层数组里某个 `- id: xxx` 条目的行范围 [start, end)。"""
+    def _providers_block_end(
+        lines: list[str], start: int = 0, end: int | None = None
+    ) -> int | None:
+        """`providers:` 块最后一个子项之后的行号（新 provider 插到这里）。
 
-        pattern = re.compile(rf"^\s*-\s*id\s*:\s*{re.escape(entry_id)}\s*$")
-        for index, line in enumerate(lines):
-            if not pattern.match(line):
+        只在"块式写法"上有效；`providers: {…}` 这种内联写法返回 None，
+        调用方会退回整份重写（没有别人时）或直接报错（有别人时）。
+        `start` / `end` 限定在某个条目范围内找 —— 同一文件里别的条目也可能有 providers。
+        """
+
+        providers_indent: int | None = None
+        last_child: int | None = None
+        limit = len(lines) if end is None else min(end, len(lines))
+        for index in range(max(0, start), limit):
+            line = lines[index]
+            stripped = line.strip()
+            if providers_indent is None:
+                if stripped and not stripped.startswith("#") and re.match(
+                    r"^\s*providers\s*:\s*(#.*)?$", line
+                ):
+                    providers_indent = len(line) - len(line.lstrip(" "))
                 continue
-            item_indent = len(line) - len(line.lstrip(" "))
-            for follow in range(index + 1, len(lines)):
-                stripped = lines[follow].strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if (len(lines[follow]) - len(lines[follow].lstrip(" "))) <= item_indent:
-                    return index, follow
-            return index, len(lines)
+            if not stripped or stripped.startswith("#"):
+                continue
+            if (len(line) - len(line.lstrip(" "))) <= providers_indent:
+                break
+            last_child = index
+        if providers_indent is None or last_child is None:
+            return None
+        return last_child + 1
+
+    @staticmethod
+    def _entry_span(
+        lines: list[str], entry_id: str, entry_name: str | None = None
+    ) -> tuple[int, int] | None:
+        """找出顶层数组里某个条目的行范围 [start, end)。
+
+        按"整块文本"匹配 id / name：`- id: xxx`、id 带引号、`- name:` 写在前面
+        这些写法都能认出来。尾部紧跟着的注释/空行不算在这个条目的替换范围里，
+        换块的时候会原样留在文件里。
+        """
+
+        starts: list[int] = []
+        indents: list[int] = []
+        for line in lines:
+            match = re.match(r"^(\s*)-\s+\S", line)
+            if match:
+                indents.append(len(match.group(1)))
+        if not indents:
+            return None
+        base_indent = min(indents)
+        for index, line in enumerate(lines):
+            match = re.match(r"^(\s*)-\s+\S", line)
+            if match and len(match.group(1)) == base_indent:
+                starts.append(index)
+        if not starts:
+            return None
+
+        id_re = re.compile(
+            rf"^\s*(?:-\s+)?id\s*:\s*['\"]?{re.escape(entry_id)}['\"]?\s*(?:#.*)?$",
+            re.MULTILINE,
+        )
+        name_re = (
+            re.compile(
+                rf"^\s*(?:-\s+)?name\s*:\s*['\"]?{re.escape(entry_name)}['\"]?\s*(?:#.*)?$",
+                re.MULTILINE,
+            )
+            if entry_name
+            else None
+        )
+        bounds = [*starts, len(lines)]
+        for position in range(len(starts)):
+            start, end = bounds[position], bounds[position + 1]
+            block = "".join(lines[start:end])
+            if id_re.search(block) or (name_re is not None and name_re.search(block)):
+                # 尾部的空行/注释不属于这个条目，替换时留在原位
+                while end > start + 1 and (
+                    not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")
+                ):
+                    end -= 1
+                return start, end
         return None
 
     @classmethod
@@ -596,48 +695,103 @@ class DshTarget:
         provider_key: str,
         provider_changed: bool,
         entry_changed: bool,
+        provider_created: bool = False,
+        entry_existed: bool = True,
+        allow_full_rewrite: bool = True,
     ) -> str:
-        """把新文本里"我们改的那两块"贴回原文件，别的地方一个字节都不动。
+        """把新文本里"我们改动的那几块"贴回原文件，别的地方一个字节都不动。
 
         整份 dump 虽然是合法的，但 ruamel 会把别人 provider 里的流式列表空格、注释对齐
-        这类排版重排一遍 —— 那也算改了用户的配置。这里改成只替换：
-        · 我们的 provider 块（字段真的有变化时）；
-        · `agent-default-model` 条目（真的被我们改了时）。
-        定位不到就退回整份新文本（宁可排版动一点，也不能写错内容）。
+        这类排版重排一遍 —— 那也算改了用户的配置。这里只允许三种最小改动：
+        · 我们的 provider 块（字段真的有变化时，整块替换）；
+        · 新 provider（原文里还没有 madmodel 时，插到 `providers:` 块的末尾）；
+        · `agent-default-model` 条目（被我们改了时整块替换；原文里没有才追加到末尾）。
+
+        定位失败时的口径：
+        · 同一文件里没有别的 provider（`allow_full_rewrite=True`）→ 退回整份重写：
+          此时不可能碰到别人的配置，宁可排版动一点也不写错内容；
+        · 有别的 provider → 直接报错、这次不写：绝不为了写对内容而重排别人的配置。
         """
+
+        def cannot_locate(reason: str) -> str:
+            if allow_full_rewrite:
+                logger.info("%s，这次退回整份重写", reason)
+                return new_text
+            raise ValueError(f"{reason}；同一文件里还有其它 provider，为不动它们这次没有写入")
 
         orig_lines = original.splitlines(keepends=True)
         new_lines = new_text.splitlines(keepends=True)
-        replaces: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        # (起始行, 结束行, 新内容)；插入是起止相同的空区间。按行号从后往前应用。
+        edits: list[tuple[int, int, list[str]]] = []
         appends: list[str] = []
 
         if provider_changed:
-            orig_span = cls._provider_span(orig_lines, provider_key)
             new_span = cls._provider_span(new_lines, provider_key)
-            if orig_span is None or new_span is None:
-                logger.info("定位不到 provider %s 的文本块，这次退回整份重写", provider_key)
-                return new_text
-            replaces.append((orig_span, new_span))
+            if new_span is None:
+                return cannot_locate(f"新文本里定位不到 provider {provider_key} 的块")
+            orig_span = cls._provider_span(orig_lines, provider_key)
+            if orig_span is not None:
+                edits.append((orig_span[0], orig_span[1], new_lines[new_span[0] : new_span[1]]))
+            elif provider_created:
+                # 只能插到**我们这个条目**（llm-pi-ai）的 providers 块里：
+                # 同一文件里别的条目也可能有自己的 providers，插错地方就动了别人的配置
+                llm_span = cls._entry_span(
+                    orig_lines, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME
+                )
+                insert_at = (
+                    cls._providers_block_end(orig_lines, llm_span[0], llm_span[1])
+                    if llm_span is not None
+                    else None
+                )
+                if insert_at is None:
+                    return cannot_locate(
+                        f"原文里的 providers 不是块式写法，没法把 provider {provider_key} 插进去"
+                    )
+                edits.append((insert_at, insert_at, new_lines[new_span[0] : new_span[1]]))
+            else:
+                # 数据层找到了它、文本层却定位不到（例如写成了内联 map）：
+                # 宁可报错也不整份重写，否则会连带重排同一文件里别人的 provider
+                return cannot_locate(f"原文里定位不到 provider {provider_key} 的文本块")
 
         if entry_changed:
-            orig_span = cls._entry_span(orig_lines, constants.DSH_DEFAULT_MODEL_ENTRY_ID)
-            new_span = cls._entry_span(new_lines, constants.DSH_DEFAULT_MODEL_ENTRY_ID)
+            new_span = cls._entry_span(
+                new_lines,
+                constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+                constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+            )
             if new_span is None:
-                return new_text
-            if orig_span is None:
+                return cannot_locate("新文本里定位不到 agent-default-model 条目")
+            orig_span = cls._entry_span(
+                orig_lines,
+                constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+                constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+            )
+            if orig_span is not None:
+                edits.append((orig_span[0], orig_span[1], new_lines[new_span[0] : new_span[1]]))
+            elif not entry_existed:
                 # 原来没有这个条目（我们新建的）：整块追加到文件末尾
                 appends.extend(new_lines[new_span[0] : new_span[1]])
             else:
-                replaces.append((orig_span, new_span))
+                # 数据层确认它原本存在：append 会写出两条同名条目，只能报错/退回整份重写
+                return cannot_locate("原文里定位不到 agent-default-model 条目")
 
-        if not replaces and not appends:
+        if not edits and not appends:
             return new_text
 
         result = list(orig_lines)
-        for (o_start, o_end), (n_start, n_end) in sorted(
-            replaces, key=lambda item: item[0][0], reverse=True
-        ):
-            result[o_start:o_end] = new_lines[n_start:n_end]
+
+        def edit_order(item: tuple[int, int, list[str]]) -> tuple[int, int]:
+            """从后往前应用；行号相同时**替换先做、插入后做**。
+
+            否则"在 providers 块末尾插入新 provider"会和"替换紧跟在后面的
+            agent-default-model 条目"撞在同一个起点上，替换会把插入块的开头吃掉。
+            """
+
+            start, end, _chunk = item
+            return (start, 0 if start == end else 1)
+
+        for start, end, chunk in sorted(edits, key=edit_order, reverse=True):
+            result[start:end] = chunk
         if appends:
             if result and not result[-1].endswith("\n"):
                 result[-1] += "\n"

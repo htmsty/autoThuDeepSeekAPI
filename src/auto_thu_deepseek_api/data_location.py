@@ -124,10 +124,18 @@ def desktop_notice(
     if clicked is leave_button:
         logger.info("用户选择退出程序去换本程序位置（不记「已处理」，下次仍会提醒）")
         return False
+    if clicked is None:
+        # 按 ESC / 点标题栏 ×：用户没做选择。不能偷偷替他记成"已处理"
+        # （否则下次启动就再也不提醒了），这次继续运行，下次启动照常提醒。
+        logger.info("用户直接关掉了「程序在桌面」提醒：本次继续运行，不记「已处理」")
+        return True
     if clicked is choose_button and not choose_private_dir(parent, prepare=prepare, after=after):
         return True  # 没选成：不记状态，下次启动再说
 
     state.desktop_note_ack = True
-    state.save()
+    try:
+        state.save()
+    except OSError as exc:  # pragma: no cover - 写不进去也要让程序继续跑
+        logger.warning("记「程序在桌面」的提醒状态失败（下次还会提醒）：%s", exc)
     logger.info("已记住「程序在桌面」这件事，以后不再提醒")
     return True

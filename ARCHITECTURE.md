@@ -112,16 +112,20 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   `大写键: 值` 形式的引用（`DEEPSEEK_API_KEY` 这类；不会把 `kind`/`secret`/`id` 混进去），
   重写成 `version: 1` + `refs` 的合法结构；一个键都捞不回来就如实报错，不改文件。
 - 供应商：`<.dsh>/profiles/<profile>/cordis.patch.yml` 里 `llm-pi-ai` 的 `config.providers`。
-  先**按标记认领**已有 provider，规则（2.5.5 起从严，只认"确定是我们自己的"）：
-  1. `apiKeyEnv: MADMODEL_API_KEY`（最硬的标记）；
-  2. `baseURL` 指向 `madmodel.cs.tsinghua.edu.cn`；
-  3. 本地转发 `http://127.0.0.1:xxxx/v1` —— **必须**同时满足"provider 键名就叫 `madmodel`"
-     且"没有别人的 `apiKeyEnv`"。
-  **绝不认领别人的 provider**（`ollama` 默认就是 `127.0.0.1:11434/v1`，早先只按"本地转发"
-  判断时会把它误认成我们的，进而改掉别人的 `apiKeyEnv` 与模型列表——2.5.5 修的就是这个）。
+  认领规则（2.5.6 起**只认两个信号**，其它一律不碰）：
+  1. `baseURL` 的域名就是 `madmodel.cs.tsinghua.edu.cn`（认得出就是我家的服务）；
+  2. provider 键名就叫 `madmodel`，且它确实像我们的（站点地址 / 我们的 `apiKeyEnv` /
+     键名为 madmodel 的本地转发）。
+  **"光有 `apiKeyEnv: MADMODEL_API_KEY`"不再作为认领依据**：老版本曾用"本地转发就算我们的"
+  这条宽规则误改过 `ollama` / `isearcher` 这类别人的本地 provider，并把我们的 `apiKeyEnv`
+  写在它们身上；再用这个标记去认领，就会一次又一次继续改人家（用户报的
+  `isearcher` + `infini-ai` + `does not support reasoning effort "low"` 就是这么来的）。
   写之前还有一道硬护栏：如果该 provider 的 `apiKeyEnv` 另有其人且域名不是清华站，直接报错退出、
-  一个字节都不写。找不到我们的 provider 时，`madmodel` 键空着才新建；键被别的配置占用则
-  **报错并保持文件原样，不覆盖**。
+  一个字节都不写。扫到"带着我们的标记、地址却不是清华站、键名也不是 madmodel"的 provider 时，
+  只提醒用户去检查/从备份还原，程序不动它。
+  不勾"统一所有 profile"时，profile 是否归我们管只看正文里有没有清华域名或 `madmodel:` 键
+  （不再看"出现过 MADMODEL_API_KEY"，避免被残留标记带偏）。找不到我们的 provider 时，
+  `madmodel` 键空着才新建；键被别的配置占用则**报错并保持文件原样，不覆盖**。
 - 只合并我们负责的字段：`apiKeyEnv` 与 `models`；`displayName` 只在空、或被填成模型 id 时纠正，
   `baseURL` / `api` / `reasoning` 只在缺失时补上，用户自己改过的值不动。
 - **思考档（2.5.3 起的规则）**：provider 级 `reasoning` **只在"用户设的值有模型不支持"时**才改成

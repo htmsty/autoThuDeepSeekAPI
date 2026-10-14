@@ -128,8 +128,8 @@ class TargetTestCase(unittest.TestCase):
         self.assertIn("madmodel", web)
         self.assertIn("provider: madmodel", web)
 
-    def test_unify_points_default_model_at_the_provider_we_updated(self) -> None:
-        """统一时默认模型要指向真正被更新的那个 provider，而不是死写 madmodel。"""
+    def test_unify_points_default_model_at_our_own_provider(self) -> None:
+        """统一模式只把默认模型指向**我们自己的** provider；别人的本地转发一个字节都不动。"""
 
         profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
         profile.write_text(
@@ -166,7 +166,15 @@ class TargetTestCase(unittest.TestCase):
 
         data = YAML(typ="safe").load(profile.read_text(encoding="utf-8"))
         entries = {entry["id"]: entry for entry in data}
-        self.assertEqual(entries["agent-default-model"]["config"]["provider"], "thu-local")
+        # thu-local 只是"键名不是 madmodel、地址也不是清华站"的本地转发 —— 不认识它，
+        # 于是按"统一"的语义新建我们自己的 madmodel，并把默认模型指到它
+        self.assertEqual(entries["agent-default-model"]["config"]["provider"], "madmodel")
+        providers = entries["llm-pi-ai"]["config"]["providers"]
+        thu = providers["thu-local"]
+        self.assertEqual(thu.get("displayName"), "我的中转", "不该覆盖用户自己的名称")
+        self.assertEqual(thu.get("baseURL"), "http://127.0.0.1:8788/v1")
+        self.assertNotIn("models", thu, "没被认领的 provider 不该被写进模型列表")
+        self.assertIn("madmodel", providers, "统一模式应当新建我们自己的 provider")
         self.assertEqual(entries["agent-default-model"]["config"]["model"], "DeepSeek-V4.1-Flash")
 
     def test_dsh_repairs_crossed_fields(self) -> None:
@@ -525,11 +533,15 @@ class TargetTestCase(unittest.TestCase):
         self.assertIn("本目标不做网络校验", note)
         self.assertIn("指纹", note)
 
-    def test_dsh_updates_provider_behind_local_forward(self) -> None:
-        """provider 走本地转发（127.0.0.1/v1）时，按 apiKeyEnv 认出来，不再建重复的。"""
+    def test_dsh_leaves_ambiguous_local_forward_alone(self) -> None:
+        """键名不是 madmodel、地址也不是清华站的本地转发：哪怕带着我们的 apiKeyEnv 也不认领。
+
+        旧版本就是凭这个标记把它误认成自己的（`isearcher` / `ollama` 那种悲剧）；
+        现在只提醒、不动手，文件一个字节都不改。
+        """
 
         profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
-        profile.write_text(
+        original = (
             """# local forward profile
 - id: llm-pi-ai
   name: "@deepseek-ai/dsh-llm-pi-ai"
@@ -548,9 +560,9 @@ class TargetTestCase(unittest.TestCase):
   config:
     provider: thu-local
     model: old-model
-""",
-            encoding="utf-8",
+"""
         )
+        profile.write_text(original, encoding="utf-8")
         target = DshTarget(
             TargetPaths(
                 base_dir=self.sandbox.dsh_dir,
@@ -560,16 +572,60 @@ class TargetTestCase(unittest.TestCase):
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
-        self.assertTrue(any("已找到 provider thu-local" in note for note in result.messages), result.messages)
+        # 不勾统一时，这种 profile 不在范围内（正文里既没有清华域名，也没有 madmodel: 键）
+        self.assertTrue(
+            any("没有 profile 已配置 madmodel" in note for note in result.messages), result.messages
+        )
+        self.assertEqual(profile.read_text(encoding="utf-8"), original, "文件应当原封不动")
 
-        from ruamel.yaml import YAML
+    def test_dsh_only_warns_about_provider_leftover_from_old_versions(self) -> None:
+        """被旧版本误写过标记的别人的 provider（isearcher 那种）：只提醒，绝不改它。"""
 
-        data = YAML(typ="safe").load(profile.read_text(encoding="utf-8"))
-        entries = {entry["id"]: entry for entry in data}
-        providers = entries["llm-pi-ai"]["config"]["providers"]
-        self.assertEqual(list(providers.keys()), ["thu-local"], "不该另外建一个 madmodel")
-        self.assertEqual(providers["thu-local"]["displayName"], "我的中转", "不该覆盖用户自己的名称")
-        self.assertEqual([m["id"] for m in providers["thu-local"]["models"]], ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        original = """# 被旧版本误改过的样子：isearcher 身上留了我们的 apiKeyEnv
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      isearcher:
+        displayName: Isearcher
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        reasoning: low
+        baseURL: http://127.0.0.1:9527/v1
+        models:
+          - id: infini-ai
+            name: infini-ai
+      madmodel:
+        displayName: DeepSeek (THU)
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: isearcher
+    model: infini-ai
+"""
+        profile.write_text(original, encoding="utf-8")
+        before = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]["isearcher"]
+
+        # 统一模式也会遍历到这个 profile：isearcher 依然一个字节都不许动
+        target = self._dsh_target(unify=True)
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        after = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]
+        self.assertEqual(after["isearcher"], before, "带残留标记的别人的 provider 被改动了")
+        self.assertTrue(
+            any("有没有被旧版本改过" in note for note in result.messages),
+            f"应当提醒用户这个 provider 可能被旧版本误改过：{result.messages}",
+        )
+        # 我们自己的 madmodel 仍然照常维护
+        self.assertIn("qwen3.8-27b", [model["id"] for model in after["madmodel"]["models"]])
 
     def test_dsh_refuses_when_madmodel_key_is_taken(self) -> None:
         """madmodel 这个键被别的配置占用时，宁可不写也不覆盖。"""

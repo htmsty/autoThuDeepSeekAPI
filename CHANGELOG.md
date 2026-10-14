@@ -1,5 +1,42 @@
 # 更新记录
 
+## 2.5.6 — 修"已经留了我们标记的别人的 provider 还会被继续改"（isearcher / infini-ai 那例）
+
+用户报：DSH 里 `isearcher` 的 `infini-ai` 配置和默认模型被改，运行报
+`pi-ai provider "isearcher" model "infini-ai" does not support reasoning effort "low"`、
+还有"模型不存在"；9/26 和 10/11 都出现过。
+
+### 为什么 2.5.5 没堵住
+
+2.5.5 把"认领"规则收紧了，但**只堵住了新认领**：
+老版本通过"本地转发就算我们的"把 `isearcher` 误认过一次，**那次已经往它身上写了
+`apiKeyEnv: MADMODEL_API_KEY`**。2.5.5 里仍然有一条"`apiKeyEnv == MADMODEL_API_KEY` 就算我们的"，
+于是这个残留标记让后续每次同步继续把它当自己人 —— 改模型列表、写 provider 级 `reasoning: low`，
+（勾"统一所有 profile"时）还会把默认模型指到它 → 就是你看到的报错与"更严重"。
+
+### 这一版的修法（彻底去掉"猜"的成分）
+
+1. **只认两个信号**，其它一律不碰：
+   - `baseURL` 域名就是清华站点（`madmodel.cs.tsinghua.edu.cn`）；
+   - provider 键名就叫 `madmodel`，且它看起来确实像我们的（有站点地址 / 我们的 apiKeyEnv /
+     或是键名为 madmodel 的本地转发）。
+   "光有 `apiKeyEnv: MADMODEL_API_KEY`"**不再**作为认领依据 —— 那个标记可能是旧版本留下的。
+2. **不勾"统一所有 profile"时**，profile 是否"归我们管"只看正文里有没有清华域名或 `madmodel:`
+   键；不再看"正文里出现过 MADMODEL_API_KEY"（同样是残留标记会误伤别人）。
+3. **误改检测**：扫到"带着我们的 apiKeyEnv、地址却不是清华站、键名也不是 madmodel"的 provider，
+   就写一条明确的提醒（日志 + 同步说明），建议用「一键还原」从备份恢复或手动检查 ——
+   **但程序不会去改它**。
+4. 勾"统一所有 profile"而切换默认模型时，会明确记一条日志/说明
+   （"按「统一所有 profile 到 madmodel」把默认模型从 X 切到 madmodel，不想要就在设置里取消勾选"）。
+
+### 验证
+
+- 新增/改写用例：`isearcher` 那种"带残留标记 + 自己的模型 + 默认模型指着它"的 provider
+  在**统一模式**下也一字不动、并且给出提醒；键名不是 madmodel 的本地转发（thu-local）
+  在不勾统一时整个 profile 跳过、勾统一时只新建我们自己的 `madmodel`（不碰它）；
+  键名为 `madmodel` 但明显是别人配置时依旧报"已被其它配置占用"且文件原封不动。
+- 测试 116 → **117 项全绿**；打包 2.5.6 留档，两个版本 `--selftest` 通过。
+
 ## 2.5.5 — 绝不改别人的 provider（修"同步把别的模型的 api 改了"）
 
 用户报：同步把**别的模型**的配置改掉了（附了自己真实的 `cordis.patch.yml`：

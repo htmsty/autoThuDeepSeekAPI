@@ -195,12 +195,10 @@ class DshTarget:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return False
-        # 指向清华站点、已经叫 madmodel、或者带着我们的凭据引用（本地转发的情形）都算在范围内
-        return (
-            constants.MADMODEL_HOST in text
-            or f"{constants.DSH_PROVIDER_KEY}:" in text
-            or constants.DSH_CREDENTIAL_KEY in text
-        )
+        # 只有"明确就是我们"的 profile 才在范围内：正文里有清华站点域名，或有 madmodel 这个 provider 键。
+        # 早先还看"正文里有没有 MADMODEL_API_KEY"——可这个标记可能是旧版本误写到别人的 provider
+        # （例如 isearcher / ollama）身上的，于是会把别人的 profile 也拉进来处理，必须去掉。
+        return constants.MADMODEL_HOST in text or f"{constants.DSH_PROVIDER_KEY}:" in text
 
     def _write_profiles(
         self,
@@ -264,6 +262,9 @@ class DshTarget:
         found = self._find_provider(providers)
         name = path.parent.name
         created_here = False
+        self._warn_about_suspicious_providers(
+            providers, ours_key=found[0] if found else "", profile_name=name, result=result
+        )
 
         if found is None:
             occupied = providers.get(constants.DSH_PROVIDER_KEY)
@@ -354,7 +355,7 @@ class DshTarget:
             provider["displayName"] = constants.PROVIDER_DISPLAY_NAME
 
         if self.unify_all_profiles:
-            self._point_default_model(data, merged, provider_key)
+            self._point_default_model(data, merged, provider_key, result)
         else:
             self._repair_default_model(data, merged, provider_key)
 
@@ -410,6 +411,37 @@ class DshTarget:
             return ""
 
     @classmethod
+    def _warn_about_suspicious_providers(
+        cls,
+        providers: dict,
+        *,
+        ours_key: str,
+        profile_name: str,
+        result,  # noqa: ANN001 - ApplyResult
+    ) -> None:
+        """`带着我们的 apiKeyEnv、却明显不是我们的 provider` 要提醒用户去修。
+
+        这种多半是旧版本误改留下的（对方身上被写进了 `MADMODEL_API_KEY`，地址又不是清华站点）。
+        只提醒、不自动改：原来的值可能要用户自己定，程序不该猜。
+        """
+
+        for key, entry in providers.items():
+            if not isinstance(entry, dict) or str(key) == ours_key:
+                continue
+            if entry.get("apiKeyEnv") != constants.DSH_CREDENTIAL_KEY:
+                continue
+            if cls._is_madmodel_url(str(entry.get("baseURL") or "")):
+                continue
+            message = (
+                f"{profile_name}：provider {key} 带着 MADMODEL_API_KEY 标记，但地址不是清华站点、"
+                "键名也不是 madmodel。本程序不会再动它；如果它是你自己的其它服务，"
+                "请检查它的 apiKeyEnv / models / reasoning 有没有被旧版本改过"
+                "（可以用主界面「一键还原」从备份恢复）。"
+            )
+            logger.warning(message)
+            result.note("注意：" + message)
+
+    @classmethod
     def _is_madmodel_url(cls, value: str) -> bool:
         return cls._url_host(value) == constants.MADMODEL_HOST
 
@@ -424,43 +456,39 @@ class DshTarget:
 
     @classmethod
     def _find_provider(cls, providers: dict) -> tuple[str, dict] | None:
-        """只认**确定是我们自己的** provider，别的模型（ollama / lm-studio / GLM…）一律不碰。
+        """只认**看得出来的**我们自己，其它一律不碰（宁可新建也不猜）。
 
-        认领规则（从严到宽）：
-        1. `apiKeyEnv: MADMODEL_API_KEY` —— 最硬的标记，一定是我们写的；
-        2. `baseURL` 的域名就是清华站点（madmodel.cs.tsinghua.edu.cn）；
-        3. 本地转发（`http://127.0.0.1:*/v1`）**同时**满足：provider 的键名就叫 `madmodel`，
-           而且它没有别的 `apiKeyEnv`（或本来就是我们的）。
+        只有两种情况算我们的 provider：
+        1. `baseURL` 的域名就是清华站点（`madmodel.cs.tsinghua.edu.cn`）——认得出就是它；
+        2. provider 的键名就叫 `madmodel`——这个名字是我们约定的，且 `apiKeyEnv` 要么空、
+           要么就是我们的标记（键被别人的配置占着时会走"被占用"的报错分支，不覆盖）。
 
-        第 3 条以前只看"是不是本地转发"，结果把用户自己的 `ollama`
-        （`http://127.0.0.1:11434/v1`）也当成我们的 provider 认领了，
-        于是改了别人的 `apiKeyEnv` 和模型列表——这是必须避免的。
+        以前还有一条"只要是本地转发 `127.0.0.1:*/v1` 就算我们的"：这会误伤用户自己的
+        `ollama`、`isearcher` 这类本地 provider（改掉它们的 `apiKeyEnv`、模型列表，
+        还会把 provider 级的 `reasoning` 写进去，导致 DSH 报
+        `does not support reasoning effort ...`）。而且一旦误改过一次、对方身上就留了
+        `apiKeyEnv: MADMODEL_API_KEY`，后续同步会继续把它当自己人——所以这条规则整条删掉。
         """
 
-        by_env: list[tuple[str, dict]] = []
-        by_url: list[tuple[str, dict]] = []
-        for key, entry in providers.items():
-            if not isinstance(entry, dict):
-                continue
-            base = str(entry.get("baseURL") or "")
-            env = entry.get("apiKeyEnv")
-            if env == constants.DSH_CREDENTIAL_KEY:
-                by_env.append((str(key), entry))
-                continue
-            if cls._is_madmodel_url(base):
-                by_url.append((str(key), entry))
-                continue
-            # 本地转发：必须额外带"我们的痕迹"，否则宁可新建也不认领别人的
-            if cls._is_local_forward(base) and str(key) == constants.DSH_PROVIDER_KEY:
-                if env in (None, "") or env == constants.DSH_CREDENTIAL_KEY:
-                    by_url.append((str(key), entry))
+        named = providers.get(constants.DSH_PROVIDER_KEY)
+        if isinstance(named, dict):
+            env = named.get("apiKeyEnv")
+            base = str(named.get("baseURL") or "")
+            # 键名是我们约定的，但还要看它像不像我们的（占着坑的别人的配置要走"被占用"报错分支）
+            looks_ours = (
+                env == constants.DSH_CREDENTIAL_KEY
+                or cls._is_madmodel_url(base)
+                or (cls._is_local_forward(base) and env in (None, ""))
+            )
+            if looks_ours:
+                return str(constants.DSH_PROVIDER_KEY), named
 
-        for key, entry in by_env:
+        for key, entry in providers.items():
+            if not isinstance(entry, dict) or str(key) == constants.DSH_PROVIDER_KEY:
+                continue
             if cls._is_madmodel_url(str(entry.get("baseURL") or "")):
-                return key, entry
-        if by_env:
-            return by_env[0]
-        return by_url[0] if by_url else None
+                return str(key), entry
+        return None
 
     @staticmethod
     def _merge_models(existing: object, fetched: list[dict]) -> list[dict]:
@@ -613,7 +641,9 @@ class DshTarget:
             return self.default_model_id
         return model_ids[0] if model_ids else ""
 
-    def _point_default_model(self, data: list, models: list[dict], provider_key: str) -> None:
+    def _point_default_model(
+        self, data: list, models: list[dict], provider_key: str, result  # noqa: ANN001 - ApplyResult
+    ) -> None:
         entry = self._find_entry(
             data,
             constants.DSH_DEFAULT_MODEL_ENTRY_ID,
@@ -630,7 +660,14 @@ class DshTarget:
         if not isinstance(config, dict):
             config = {}
             entry["config"] = config
+        previous = config.get("provider")
         config["provider"] = provider_key
+        if previous and previous != provider_key:
+            # 这是"统一所有 profile"这个开关的语义，写清楚点免得用户以为是 bug
+            result.note(
+                f"按「统一所有 profile 到 madmodel」把默认模型从 {previous} 切到 {provider_key}"
+                "（不想要就在设置里取消勾选）"
+            )
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
             # 换 provider 时必须一起换 model，否则会留下"指着 madmodel 却填别的模型 id"的组合

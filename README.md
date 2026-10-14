@@ -65,14 +65,15 @@
 DSH 在请求没带显式思考档时会回落到 provider 的 `reasoning`
 （本体代码：`resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning)`）。
 如果这个值有哪个模型不支持，DSH 会直接报 `does not support reasoning effort "…"`，
-所以程序按这两条规则写：
+所以程序按这两条规则写（**核心原则：你自己设的档位不动，只有不合法才纠正**）：
 
-- provider 级 `reasoning` 只写**所有已注册模型都支持**的档位（取交集；当前两个模型的交集是
-  `low`）。没有公共档位就干脆不写，交给 pi-ai 自己决定。你自己往 provider 里加模型后，
-  下次同步会重新算一遍。
-- `agent-default-model` **总是**带一个显式且合法的 `reasoningEffort`：已有值合法就保留，
-  非法或缺失时按 `high → max → medium → low → xhigh → minimal` 挑一个该模型支持的档位
-  （`DeepSeek-V4.1-Flash` 会选 `high`；它同时支持 `max`）。
+| 字段 | 程序怎么处理 |
+| --- | --- |
+| provider 级 `reasoning` | 你已经设了、而且所有已注册模型都支持 → **原样保留**；你设了但某个模型不支持（会直接报错）→ 改成所有模型都支持的公共档位；原本没有这个字段 → **不替你加**（新建 provider 时例外，会给一个公共档位兜底） |
+| `agent-default-model` 的 `reasoningEffort` | 已有值合法 → **原样保留**；非法或缺失 → 按 `high → max → medium → low → xhigh → minimal` 挑一个该模型支持的档位（`DeepSeek-V4.1-Flash` 会选 `high`，它同时支持 `max`） |
+
+也就是说：同步过一次之后，你在 DSH 里把思考强度调成任何合法值，程序都不会再改回去；
+只有那个值会让 DSH 直接报错时才会被纠正（日志里会写清楚改了什么、为什么）。
 
 这两条也进了预检：不满足就拦住这次写入，不会再出现"第一次运行发消息就报思考档不支持"。
 

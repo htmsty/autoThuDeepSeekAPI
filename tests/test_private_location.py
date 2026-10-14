@@ -443,6 +443,38 @@ class DesktopNoticeTest(unittest.TestCase):
 
 
 class LogHandleTest(unittest.TestCase):
+    def test_repeated_setup_logging_does_not_leak_old_handles(self) -> None:
+        """重复配置日志（启动、DEBUG、换位置各一次）不能把旧文件句柄留着。
+
+        留着就会出现"logs 目录删不掉"（用户报的 WinError 32）——那是本轮的真根因。
+        """
+
+        import logging
+
+        from auto_thu_deepseek_api import logging_setup
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = paths.data_root
+            try:
+                paths.data_root = lambda: Path(tmp) / "p1"  # type: ignore[assignment]
+                first = logging_setup.setup_logging()
+                logging.getLogger("atd-test").info("写一行，确保第一个文件真的被打开")
+
+                paths.data_root = lambda: Path(tmp) / "p2"  # type: ignore[assignment]
+                second = logging_setup.setup_logging()  # 相当于 DEBUG / 换位置时再配一次
+
+                if sys.platform == "win32":
+                    ok, message = paths.delete_path(first)
+                    self.assertTrue(ok, f"换配置后旧日志文件不该还被占着：{message}")
+
+                logging_setup.close_file_handlers()
+                ok, message = paths.delete_path(second)
+                self.assertTrue(ok, message)
+            finally:
+                logging_setup.close_file_handlers()
+                paths.data_root = original  # type: ignore[assignment]
+                logging_setup.setup_logging()
+
     def test_closing_file_handlers_unlocks_log_for_deletion(self) -> None:
         """用户遇到的 WinError 32：日志文件被占着删不掉。关掉句柄后必须能删/能搬。"""
 

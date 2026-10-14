@@ -118,6 +118,10 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   键被别的配置占用则**报错并保持文件原样，不覆盖**。
 - 只合并我们负责的字段：`apiKeyEnv` 与 `models`；`displayName` 只在空、或被填成模型 id 时纠正，
   `baseURL` / `api` / `reasoning` 只在缺失时补上，用户自己改过的值不动。
+- **思考档（2.5.3 起的规则）**：provider 级 `reasoning` **只在"用户设的值有模型不支持"时**才改成
+  公共档位（否则 DSH 会直接报 `UNSUPPORTED_REASONING_EFFORT`）；合法的用户值一个字都不改，
+  原本没有这个字段也不替用户加（只有程序新建 provider 时才写一个公共兜底档）。
+  `agent-default-model.reasoningEffort` 同理：合法保留、非法或缺失才补。
 - 模型 id 被写串（例如显示名被填进 id、或默认模型指向别的 provider 的模型）时自动修回；
   勾选"统一所有 profile 到 madmodel"后处理全部 profile，并把 `agent-default-model` 指到
   `madmodel`，同时保证它的 `model` 是 madmodel 下真实存在的 id。
@@ -159,6 +163,14 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 ### `procinfo.py`
 查当前在跑的进程名（`tasklist`，查一次缓存一次）。只用于"某个程序到底装没装"这类判断：
 装了但还没生成配置文件时，进程名是一条有用的线索。
+
+### `logging_setup.py`
+日志放 `private/logs/`，按大小轮转（2 MB × 5）。有一个坑要记住：
+**重新配置日志时必须真的 `close()` 掉旧的文件 handler** —— 只从 logger 上
+`removeHandler()` 并不会释放文件句柄，Windows 上那个日志文件就删不掉、也搬不走
+（2.5.3 修的 WinError 32 就是这个）。模块里另外记了一份"开过的文件 handler"清单，
+`close_file_handlers()` 把当前挂着的与历史遗留的一起关掉；换 private 位置与干净卸载
+之前都会先调它。
 
 ### `startup.py`
 开机启动（HKCU 的 Run 项）与桌面快捷方式。启动时会核对注册表实际值：路径变了自动纠正，

@@ -23,6 +23,10 @@ class LogBus(QObject):
 
 log_bus = LogBus()
 
+# 记下我们开过的文件 handler：换配置时摘下来的旧句柄也要能关掉，
+# 否则 Windows 上那个日志文件会一直被占着（删不掉、也搬不走）。
+_CREATED_FILE_HANDLERS: list[logging.Handler] = []
+
 
 class QtLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
@@ -43,6 +47,8 @@ def setup_logging(level: int = logging.INFO) -> Path:
     root.setLevel(level)
     for handler in list(root.handlers):
         root.removeHandler(handler)
+        # 只是从 logger 上摘掉并不会关闭文件句柄；这里必须真的关掉
+        _close_handler(handler)
 
     formatter = logging.Formatter(LOG_FORMAT)
 
@@ -55,6 +61,7 @@ def setup_logging(level: int = logging.INFO) -> Path:
         )
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
+        _CREATED_FILE_HANDLERS.append(file_handler)
     except OSError:  # pragma: no cover - 依赖具体环境
         pass
 
@@ -79,14 +86,25 @@ def close_file_handlers() -> int:
     """
 
     root = logging.getLogger()
+    targets: list[logging.Handler] = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+    targets += [h for h in _CREATED_FILE_HANDLERS if h not in targets]
+
     closed = 0
-    for handler in list(root.handlers):
-        if isinstance(handler, logging.FileHandler):
-            try:
-                handler.close()
-            except Exception:  # pragma: no cover - 关不掉也要把它摘掉
-                pass
+    for handler in targets:
+        if handler in root.handlers:
             root.removeHandler(handler)
+        if _close_handler(handler):
             closed += 1
+    _CREATED_FILE_HANDLERS.clear()
     return closed
+
+
+def _close_handler(handler: logging.Handler) -> bool:
+    """关掉一个 handler（关不掉也不算错）。"""
+
+    try:
+        handler.close()
+        return True
+    except Exception:  # pragma: no cover - 关不掉就算了，别影响主流程
+        return False
 

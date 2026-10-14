@@ -192,13 +192,18 @@ class TargetTestCase(unittest.TestCase):
         entries = {entry["id"]: entry for entry in data}
         provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
         self.assertEqual(provider["displayName"], "DeepSeek (THU)")
-        # provider 级 reasoning 只能是所有模型都支持的档位（否则请求会被 DSH 直接拒掉）
+        # provider 级 reasoning：有值就必须所有模型都支持；没设就不动（用户/DSH 自己的选择）
         supported_sets = [
             {str(level) for level in model["reasoningEfforts"].keys()}
             for model in provider["models"]
             if model.get("reasoningEfforts")
         ]
-        self.assertIn(provider.get("reasoning"), set.intersection(*supported_sets))
+        common = set.intersection(*supported_sets)
+        reasoning = provider.get("reasoning")
+        self.assertTrue(
+            reasoning is None or reasoning in common,
+            f"provider reasoning 不合法：{reasoning}（合法集合 {common}）",
+        )
         ids = [model["id"] for model in provider["models"]]
         self.assertEqual(ids, ["DeepSeek-V4.1-Flash", "qwen3.8-27b"])
         self.assertEqual(provider["models"][0]["name"], "DeepSeek-V4.1-Flash (THU)")
@@ -339,6 +344,167 @@ class TargetTestCase(unittest.TestCase):
             {str(level) for level in chosen["reasoningEfforts"].keys()},
             "默认模型必须显式写一个它支持的思考档",
         )
+
+    def test_dsh_keeps_valid_user_reasoning(self) -> None:
+        """用户设的 thinking 档位合法就一个字都不改——**第一次同步之后尤其不能改**。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(
+            """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: DeepSeek (THU)
+        api: openai-completions
+        apiKeyEnv: MADMODEL_API_KEY
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        reasoning: low
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+            contextWindow: 1000000
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: qwen3.8-27b
+            name: qwen3.8-27b (THU)
+            contextWindow: 1000000
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: madmodel
+    model: DeepSeek-V4.1-Flash
+    reasoningEffort: max
+""",
+            encoding="utf-8",
+        )
+        models = [
+            {
+                "id": "DeepSeek-V4.1-Flash",
+                "name": "DeepSeek-V4.1-Flash (THU)",
+                "contextWindow": 1000000,
+                "input": ["text", "image"],
+                "reasoningEfforts": {"low": "low", "high": "high", "max": "max"},
+            },
+            {
+                "id": "qwen3.8-27b",
+                "name": "qwen3.8-27b (THU)",
+                "contextWindow": 1000000,
+                "input": ["text", "image"],
+                "reasoningEfforts": {"low": "low", "high": "high", "max": "max"},
+            },
+        ]
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, models, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="rt").load(profile.read_text(encoding="utf-8"))
+        entries = {entry["id"]: entry for entry in data}
+        provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
+        # low / high / max 都合法；程序自己"更想"写 high，但不能动用户设的 low
+        self.assertEqual(provider.get("reasoning"), "low", "合法的用户档位被改掉了")
+        self.assertEqual(
+            entries["agent-default-model"]["config"].get("reasoningEffort"),
+            "max",
+            "默认模型上合法的用户档位也被改掉了",
+        )
+
+    def test_dsh_does_not_add_provider_reasoning_when_absent(self) -> None:
+        """原本没有 provider reasoning 的，不替用户加（缺省不算「不合法」）。"""
+
+        profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        profile.write_text(
+            """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      madmodel:
+        displayName: DeepSeek (THU)
+        api: openai-completions
+        apiKeyEnv: MADMODEL_API_KEY
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+            contextWindow: 1000000
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              high: high
+""",
+            encoding="utf-8",
+        )
+        models = [
+            {
+                "id": "DeepSeek-V4.1-Flash",
+                "name": "DeepSeek-V4.1-Flash (THU)",
+                "contextWindow": 1000000,
+                "input": ["text", "image"],
+                "reasoningEfforts": {"low": "low", "high": "high"},
+            }
+        ]
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, models, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="rt").load(profile.read_text(encoding="utf-8"))
+        entries = {entry["id"]: entry for entry in data}
+        provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
+        self.assertNotIn("reasoning", provider, "用户没设 provider 档位，不该替他加")
+
+    def test_new_provider_gets_safe_reasoning(self) -> None:
+        """我们自己新建的 provider 才给一个兜底档位，而且必须是所有模型都支持的。"""
+
+        target = DshTarget(
+            TargetPaths(
+                base_dir=self.sandbox.dsh_dir,
+                credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
+                profiles_dir=self.sandbox.dsh_dir / "profiles",
+            ),
+            unify_all_profiles=True,
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        from ruamel.yaml import YAML
+
+        web = YAML(typ="rt").load(
+            (self.sandbox.dsh_dir / "profiles" / "web" / "cordis.patch.yml").read_text(encoding="utf-8")
+        )
+        entries = {entry["id"]: entry for entry in web}
+        provider = entries["llm-pi-ai"]["config"]["providers"]["madmodel"]
+        common = set.intersection(
+            *[
+                {str(level) for level in model["reasoningEfforts"].keys()}
+                for model in provider["models"]
+                if model.get("reasoningEfforts")
+            ]
+        )
+        self.assertIn(provider.get("reasoning"), common, "新建 provider 的兜底档位必须公共")
 
     def test_credentials_note_says_it_is_not_a_validation(self) -> None:
         """日志里"已是该 Token，无需改动"只是文件比对，不是 API 校验——文案要说清楚。"""

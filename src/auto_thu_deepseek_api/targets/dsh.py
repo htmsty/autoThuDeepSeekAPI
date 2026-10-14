@@ -263,6 +263,7 @@ class DshTarget:
         # 不会在旁边再建一个重复的 provider。
         found = self._find_provider(providers)
         name = path.parent.name
+        created_here = False
 
         if found is None:
             occupied = providers.get(constants.DSH_PROVIDER_KEY)
@@ -282,9 +283,9 @@ class DshTarget:
             providers[constants.DSH_PROVIDER_KEY] = provider
             provider["displayName"] = constants.PROVIDER_DISPLAY_NAME
             provider["api"] = "openai-completions"
-            provider["reasoning"] = "medium"
             provider["baseURL"] = constants.MADMODEL_API_BASE
             provider_key = constants.DSH_PROVIDER_KEY
+            created_here = True
             result.note(f"{name}：已新建 provider madmodel")
         else:
             key, provider = found
@@ -294,8 +295,6 @@ class DshTarget:
         # 只合并我们负责的字段：apiKeyEnv 与 models。其余字段只在缺失时补上，
         # 不覆盖用户在 DSH 里自己对名称/地址/思考档的调整。
         provider["apiKeyEnv"] = constants.DSH_CREDENTIAL_KEY
-        if not provider.get("reasoning"):
-            provider["reasoning"] = "medium"
         if not provider.get("api"):
             provider["api"] = "openai-completions"
         if not provider.get("baseURL"):
@@ -307,13 +306,26 @@ class DshTarget:
 
         # provider 级 reasoning 是"请求没带思考档时的兜底默认"——DSH 里是
         # resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning)。
-        # 只要这个值有哪个模型不支持，请求就会直接报 UNSUPPORTED_REASONING_EFFORT，
-        # 所以这里只写"所有已注册模型都支持"的档位；没有公共档位就干脆不写。
+        # 规则（用户要求：别改用户设的档位，除非不合法）：
+        #   · 用户已经设了、而且所有模型都支持 → 原样保留，不动；
+        #   · 用户设了但某些模型不支持 → 会直接报 UNSUPPORTED_REASONING_EFFORT，必须纠正；
+        #   · 原本没有这个字段 → 不替他加（除非 provider 是我们这次刚新建的，那才给个兜底）。
         safe_reasoning = self._safe_provider_reasoning(merged or [])
-        if safe_reasoning:
-            provider["reasoning"] = safe_reasoning
-        else:
-            provider.pop("reasoning", None)
+        current_reasoning = provider.get("reasoning")
+        has_reasoning = isinstance(current_reasoning, str) and bool(current_reasoning.strip())
+        if created_here and not has_reasoning:
+            if safe_reasoning:
+                provider["reasoning"] = safe_reasoning
+        elif has_reasoning and not self._reasoning_ok_for_all(str(current_reasoning), merged or []):
+            if safe_reasoning:
+                provider["reasoning"] = safe_reasoning
+                result.note(
+                    f"{name}：provider 的 reasoning={current_reasoning} 有模型不支持，"
+                    f"已改成公共档位 {safe_reasoning}"
+                )
+            else:
+                provider.pop("reasoning", None)
+                result.note(f"{name}：provider 的 reasoning={current_reasoning} 有模型不支持，已删除")
 
         # 名称是空、或被写成了某个模型 id（DSH 界面把字段填串的典型样子）才纠正，
         # 用户自己起的名字不动。
@@ -526,6 +538,19 @@ class DshTarget:
             if level in common:
                 return level
         return sorted(common)[0]
+
+    @classmethod
+    def _reasoning_ok_for_all(cls, level: str, models: list[dict]) -> bool:
+        """这个档位是不是所有声明了思考档的模型都支持。
+
+        没有模型声明档位时无从判断，按"合法"处理——**宁可不动用户的值**。
+        """
+
+        declared = [set(cls._supported_efforts(model)) for model in models]
+        declared = [item for item in declared if item]
+        if not declared:
+            return True
+        return all(level in item for item in declared)
 
     def _ensure_default_effort(self, config: dict, models: list[dict]) -> None:
         """默认模型的思考档必须是该模型支持的——不支持就换一个支持的。

@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -347,26 +348,38 @@ def delete_path(path: Path) -> tuple[bool, str]:
     return True, f"已永久删除（回收站不可用：{message}）"
 
 
-def remove_managed_data(root: Path, *, keep: tuple[str, ...] = ()) -> list[str]:
+def remove_managed_data(
+    root: Path, *, keep: tuple[str, ...] = (), attempts: int = 3, pause: float = 0.3
+) -> list[str]:
     """删掉 private 里由程序管理的条目，返回说明行。
 
     只删顶层这些条目，用户自己放进来的文件一律不动；删完目录还剩下东西就留着，
-    不整个删目录（「干净卸载」也是这个口径）。删除一律先走回收站。
+    不整个删目录（「干净卸载」也是这个口径）。删除一律先走回收站；
+    删不掉的会等一小会儿再试（Windows 释放文件句柄有几毫秒到几百毫秒的延迟）。
     """
 
-    messages: list[str] = []
     base = Path(root)
-    for name in MANAGED_ENTRIES:
-        if name in keep:
-            continue
-        target = base / name
-        if not target.exists():
-            continue
-        try:
-            ok, detail = delete_path(target)
-        except OSError as exc:  # pragma: no cover - delete_path 内部已经兜住
-            ok, detail = False, f"没删掉 {target}：{exc}"
-        messages.append(f"{'OK' if ok else '跳过'} {target}：{detail}")
+    messages: list[str] = []
+    pending = [name for name in MANAGED_ENTRIES if name not in keep]
+    rounds = max(1, int(attempts))
+    for attempt in range(1, rounds + 1):
+        failed: list[str] = []
+        for name in pending:
+            target = base / name
+            if not target.exists():
+                continue
+            try:
+                ok, detail = delete_path(target)
+            except OSError as exc:  # pragma: no cover - delete_path 内部已经兜住
+                ok, detail = False, f"没删掉 {target}：{exc}"
+            messages.append(f"{'OK' if ok else '跳过'} {target}：{detail}")
+            if not ok:
+                failed.append(name)
+        pending = failed
+        if not failed or attempt == rounds:
+            break
+        logger.info("有 %d 项没删掉，%s 秒后再试一次", len(failed), pause)
+        time.sleep(pause)
     # 目录空了就顺手删掉；还留着用户的东西就保持原样
     try:
         if base.is_dir() and not any(base.iterdir()):

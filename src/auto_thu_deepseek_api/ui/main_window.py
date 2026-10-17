@@ -37,11 +37,17 @@ from ..sync import SyncReport, both_targets_missing, detect_targets
 from ..targets.ccswitch import is_running as ccswitch_is_running
 from ..token.capture import TokenCaptureSession, build_profile
 from ..token.jwt_utils import describe_expiry, is_expired
+from ..token.verifier import site_reachable
 from .icon import app_icon
 from .settings_dialog import SettingsDialog
 from .workers import PreflightWorker, SyncWorker
 
 logger = logging.getLogger(__name__)
+
+# 自动同步失败后的重试策略：开机时网络 / 登录会话可能都还没就绪，
+# 失败一次就干等下一个周期（默认 180 分钟）太久，这里补几次短间隔重试。
+AUTO_RETRY_BUDGET = 3
+AUTO_RETRY_DELAY_MS = 5 * 60 * 1000
 
 
 class MainWindow(QMainWindow):
@@ -51,12 +57,15 @@ class MainWindow(QMainWindow):
         state: AppState,
         *,
         desktop_notice_done: bool = False,
+        started_minimized: bool = False,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.state = state
         # 启动早期（主窗口还没建）已经弹过"程序在桌面"的提醒：这一次启动别再弹第二遍
         self._desktop_notice_done = bool(desktop_notice_done)
+        # 是不是开机启动（--minimized）拉起来的：静默失败要打开登录窗口、重试策略更积极
+        self._started_minimized = bool(started_minimized)
         self._quitting = False
         self._sync_worker: SyncWorker | None = None
         self._preflight_worker: PreflightWorker | None = None
@@ -71,6 +80,16 @@ class MainWindow(QMainWindow):
         self._moving_from: Path | None = None
         # 正在搬 private / 卸载：这期间不让自动同步插进来
         self._maintenance = False
+        # 自动同步失败后的短间隔重试（开机场景）
+        self._auto_retry_left = AUTO_RETRY_BUDGET
+        self._auto_retry_timer = QTimer(self)
+        self._auto_retry_timer.setSingleShot(True)
+        self._auto_retry_timer.timeout.connect(lambda: self.start_sync(interactive=False))
+        # 本次取 Token 是不是静默（自动）模式；本次同步是不是自动发起的
+        self._capture_silent = False
+        self._sync_is_auto = False
+        # 开机静默失败后只自动打开一次登录窗口，避免反复弹
+        self._login_offered_after_silent_failure = False
 
         # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
         try:
@@ -363,7 +382,7 @@ class MainWindow(QMainWindow):
             logger.error("保存手动粘贴的 Token 失败：%s", exc)
         self.refresh_status()
         logger.info("使用手动粘贴的 Token 开始同步")
-        self._start_sync_worker(dialog.manual_token)
+        self._start_sync_worker(dialog.manual_token, auto=False)
 
     def open_log(self) -> None:
         log_dir = paths.logs_dir()
@@ -768,6 +787,7 @@ class MainWindow(QMainWindow):
     def quit_app(self) -> None:
         self._quitting = True
         self._auto_timer.stop()
+        self._auto_retry_timer.stop()
         if self._capture is not None:
             self._capture.cancel()
         worker = self._sync_worker
@@ -857,6 +877,11 @@ class MainWindow(QMainWindow):
                     "DSH 写入和 CC Switch 写入现在都是关着的，同步不会写任何东西。\n"
                     "请先在「设置…」里打开至少一个写入目标。",
                 )
+            return
+        if not interactive and not site_reachable():
+            # 开机时网络经常还没就绪：先别去取 Token（那要白等 40 秒），过几分钟自动重试
+            logger.info("站点暂时连不上（可能网络还没就绪），本次自动同步先跳过")
+            self._schedule_auto_retry("网络还没就绪")
             return
         if self._busy():
             if not interactive:
@@ -983,6 +1008,7 @@ class MainWindow(QMainWindow):
         return False
 
     def _open_capture(self, silent: bool) -> None:
+        self._capture_silent = silent
         if self._browser_profile is None:
             self._browser_profile = build_profile(paths.browser_profile_dir())
 
@@ -1022,21 +1048,35 @@ class MainWindow(QMainWindow):
     def _on_capture_failed(self, message: str) -> None:
         self._capture = None
         self._restore_status_hint()
+        was_silent = self._capture_silent
+        self._capture_silent = False
         logger.warning(message)
         fallback = self.state.last_token
         if fallback and not is_expired(fallback):
             logger.info("取新 Token 失败，沿用现有仍有效的 Token 继续同步")
-            self._start_sync_worker(fallback)
+            self._start_sync_worker(fallback, auto=was_silent)
             return
         self.refresh_status()
+        if was_silent and self._started_minimized and not self._login_offered_after_silent_failure:
+            # 开机启动时静默取 Token 失败（多半是登录会话过期）：
+            # 直接把登录窗口打开，用户回来就能登录，而不是只留一条托盘气泡。
+            self._login_offered_after_silent_failure = True
+            logger.info("开机静默取 Token 失败：打开登录窗口等用户登录")
+            self.notify("自动更新需要重新登录，已打开登录窗口", warning=True)
+            self._open_capture(silent=False)
+            return
         self.notify(message + "：请点「立即获取并同步」并完成登录。", warning=True)
+        if was_silent:
+            self._schedule_auto_retry("取 Token 失败")
 
     def _on_capture_cancelled(self) -> None:
         self._capture = None
         self._restore_status_hint()
         logger.info("已取消取 Token")
 
-    def _start_sync_worker(self, token: str) -> None:
+    def _start_sync_worker(self, token: str, *, auto: bool | None = None) -> None:
+        # auto=True 表示这次是自动（静默）发起的：失败后要安排短间隔重试
+        self._sync_is_auto = self._capture_silent if auto is None else auto
         self.sync_button.setEnabled(False)
         worker = SyncWorker(self.settings, token, self)
         self._sync_worker = worker
@@ -1071,6 +1111,11 @@ class MainWindow(QMainWindow):
             # 是我们自己请它停下的，别弹"同步完成"的通知吓人
             logger.info("同步已按你的要求安全停下")
             return
+        if report.ok:
+            # 成功一次就把重试预算补满（下一次失败还能重试几次）
+            self._auto_retry_left = AUTO_RETRY_BUDGET
+        elif self._sync_is_auto:
+            self._schedule_auto_retry("上次同步没有成功")
         logger.info("同步完成：%s", summary)
         self.notify(summary, warning=not report.ok)
         if self.settings.minimize_after_sync:
@@ -1083,6 +1128,8 @@ class MainWindow(QMainWindow):
         logger.error("同步失败：%s", message)
         self._restore_status_hint()
         self.notify(f"同步失败：{message}", warning=True)
+        if self._sync_is_auto:
+            self._schedule_auto_retry("同步过程出错")
 
     def _on_sync_thread_finished(self, worker=None) -> None:
         if worker is None:
@@ -1104,4 +1151,26 @@ class MainWindow(QMainWindow):
         if self._quitting:
             return
         self.start_sync(interactive=True)
+
+    def _schedule_auto_retry(self, reason: str) -> None:
+        """自动同步没成功时，过几分钟再试一次，而不是干等下一个周期。
+
+        开机场景里网络、站点登录会话都可能还没就绪；重试预算用完就安静等下一个周期，
+        成功一次会把预算补满（见 _on_sync_report）。
+        """
+
+        if self._quitting or self._maintenance:
+            return
+        if self._auto_retry_left <= 0:
+            logger.info("自动重试次数已用完（原因：%s），等下一个同步周期", reason)
+            return
+        self._auto_retry_left -= 1
+        minutes = AUTO_RETRY_DELAY_MS // 60000
+        logger.info(
+            "%d 分钟后自动重试一次（原因：%s；还能重试 %d 次）",
+            minutes,
+            reason,
+            self._auto_retry_left,
+        )
+        self._auto_retry_timer.start(AUTO_RETRY_DELAY_MS)
 

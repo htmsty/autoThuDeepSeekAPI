@@ -137,7 +137,12 @@ def main(argv: list[str] | None = None) -> int:
     if not QSystemTrayIcon.isSystemTrayAvailable():
         logger.warning("系统托盘不可用：关闭窗口会直接退出程序")
 
-    window = MainWindow(settings, state, desktop_notice_done=desktop_notice_done)
+    window = MainWindow(
+        settings,
+        state,
+        desktop_notice_done=desktop_notice_done,
+        started_minimized=start_minimized,
+    )
 
     # 首次运行自动留一份原始配置，且这份备份不会被清理逻辑删掉，
     # 用户随时能在设置里"一键还原"到程序第一次动它之前的状态。
@@ -155,7 +160,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # 启动检查（程序在桌面 / 两个目标都没装）走完再决定要不要同步；
     # 顺序固定：先"程序在桌面"，再"都没装"。
-    QTimer.singleShot(300, window.startup_then_sync)
+    #
+    # 开机启动（--minimized）时多等一会儿：刚开机那阵网络、磁盘都可能还没就绪，
+    # 太早去取 Token 只会白白失败一次（"开机自动更新基本都失败"的常见原因之一）。
+    startup_delay_ms = 90_000 if start_minimized else 300
+    if start_minimized:
+        logger.info("开机启动：先等 %d 秒，等系统与网络就绪再同步", startup_delay_ms // 1000)
+    QTimer.singleShot(startup_delay_ms, window.startup_then_sync)
     logger.info("启动检查与自动同步将在窗口显示后开始")
 
     logger.info("%s %s 已启动（作者：%s）", constants.APP_DISPLAY_NAME, constants.APP_VERSION, constants.APP_AUTHOR)

@@ -34,6 +34,33 @@ class VerifierTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 1, "会话接口给了结论就不该再打模型请求")
         self.assertIn("auth-login", self.calls[0][0])
 
+    def test_site_reachable_true_when_site_answers(self) -> None:
+        """站点能回话（哪怕 4xx）就算可达：开机时用它判断网络是否就绪。"""
+
+        from unittest import mock
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):  # noqa: ANN204
+                return self
+
+            def __exit__(self, *args) -> bool:  # noqa: ANN002
+                return False
+
+        with mock.patch.object(
+            verifier.urllib.request, "urlopen", return_value=FakeResponse()
+        ):
+            self.assertTrue(verifier.site_reachable(timeout=1))
+
+    def test_site_reachable_false_when_network_is_down(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(
+            verifier.urllib.request, "urlopen", side_effect=OSError("网络还没就绪")
+        ):
+            self.assertFalse(verifier.site_reachable(timeout=1))
+
     def test_refused_token(self) -> None:
         self._stub([(401, b"", "")])
         result = verifier.verify_token("tok")

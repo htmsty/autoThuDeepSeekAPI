@@ -519,6 +519,25 @@ class CcSwitchTarget:
                         (payload, provider_id, app_type),
                     )
 
+                # 提交前读回校验：确认写进这张卡片的就是我们要写的内容。
+                # 有出入就抛异常 → 外层 rollback，数据库保持原样，
+                # 而不是"先提交、之后再发现写坏了"。
+                check = connection.execute(
+                    "SELECT settings_config, meta FROM providers WHERE id = ? AND app_type = ?",
+                    (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
+                ).fetchone()
+                if check is None:
+                    raise RuntimeError("写入后读不到 DeepSeek (THU) 卡片")
+                check_settings = self._json_object(check[0])
+                check_auth = check_settings.get("auth")
+                check_key = (
+                    check_auth.get("OPENAI_API_KEY") if isinstance(check_auth, dict) else None
+                )
+                if check_key != token:
+                    raise RuntimeError("写入后卡片里的 Token 与预期不一致，已回滚")
+                if self._json_object(check[1]).get("apiFormat") != constants.CCSWITCH_API_FORMAT:
+                    raise RuntimeError("写入后卡片的 apiFormat 与预期不一致，已回滚")
+
                 connection.commit()
             except Exception:
                 connection.rollback()

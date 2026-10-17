@@ -348,6 +348,18 @@ class DshTarget:
             provider["api"] = "openai-completions"
         if not provider.get("baseURL"):
             provider["baseURL"] = constants.MADMODEL_API_BASE
+        elif self._is_madmodel_url(existing_base) and not self._is_canonical_madmodel_base(
+            existing_base
+        ):
+            # 域名是清华站点、但路径被写歪了：典型是把 OpenAI 的 chat 接口地址
+            # （.../v1/chat/completions）当成了 API 根地址。pi-ai 会在 baseURL 后面
+            # 拼 /models 做模型发现，多这一截就变成 /v1/chat/completions/models，必然 404。
+            # 既然这个 provider 已经由我们维护（域名是站点），就把地址纠正回标准根地址。
+            provider["baseURL"] = constants.MADMODEL_API_BASE
+            result.note(
+                f"{name}：provider {provider_key} 的地址 {existing_base} 路径不对"
+                f"（会导致模型列表 404），已纠正为 {constants.MADMODEL_API_BASE}"
+            )
 
         merged = self._merge_models(provider.get("models"), models)
         if merged:
@@ -479,14 +491,28 @@ class DshTarget:
 
         这种多半是旧版本误改留下的（对方身上被写进了 `MADMODEL_API_KEY`，地址又不是清华站点）。
         只提醒、不自动改：原来的值可能要用户自己定，程序不该猜。
+
+        另外也会提醒：地址指向清华站点、但路径写歪（例如 /v1/chat/completions）的
+        其它 provider —— 那种配置会让模型发现 404，同样只提醒、不修改。
         """
 
         for key, entry in providers.items():
             if not isinstance(entry, dict) or str(key) == ours_key:
                 continue
+            base = str(entry.get("baseURL") or "")
+            if cls._is_madmodel_url(base) and not cls._is_canonical_madmodel_base(base):
+                message = (
+                    f"{profile_name}：provider {key} 的地址是 {base}，路径多了一截"
+                    "（pi-ai 会在它后面拼 /models，多这一截就会 404）。"
+                    "它不是本程序维护的 provider，所以没有动它；用不到建议删掉，"
+                    "或者把它改成标准地址交给本程序维护。"
+                )
+                logger.warning(message)
+                result.note("注意：" + message)
+                continue
             if entry.get("apiKeyEnv") != constants.DSH_CREDENTIAL_KEY:
                 continue
-            if cls._is_madmodel_url(str(entry.get("baseURL") or "")):
+            if cls._is_madmodel_url(base):
                 continue
             message = (
                 f"{profile_name}：provider {key} 带着 MADMODEL_API_KEY 标记，但地址不是清华站点、"
@@ -500,6 +526,19 @@ class DshTarget:
     @classmethod
     def _is_madmodel_url(cls, value: str) -> bool:
         return cls._url_host(value) == constants.MADMODEL_HOST
+
+    @classmethod
+    def _is_canonical_madmodel_base(cls, value: str) -> bool:
+        """是不是标准的清华 API 根地址（路径只到 /v1，或者干脆不写路径）。
+
+        写歪的典型是 `.../v1/chat/completions`（那是 OpenAI 的对话接口地址，
+        不是 API 根地址）：pi-ai 会用它拼 `/models` 做模型发现，多这一截必然 404。
+        """
+
+        parts = urlsplit(value)
+        if (parts.hostname or "").lower() != constants.MADMODEL_HOST:
+            return False
+        return (parts.path or "").rstrip("/") in ("", "/v1")
 
     @classmethod
     def _is_local_forward(cls, value: str) -> bool:

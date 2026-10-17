@@ -1176,6 +1176,79 @@ refs:
 
     # —— 备份与还原 ——
 
+    def test_claimed_provider_with_wrong_base_url_is_fixed(self) -> None:
+        """只有一条 tsinghua provider、地址写成 .../v1/chat/completions 时：
+        认领它（域名就是清华站点）并把地址纠正回 /v1 —— 否则模型发现必然 404。
+
+        这是真机上出现过的写法：把对话接口地址当成了 API 根地址。
+        """
+
+        text = """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      tsinghua:
+        displayName: tsinghua
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions
+        models:
+          - id: "1"
+            name: "1"
+"""
+        profile = self._write_profile(text)
+        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+
+        providers = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]
+        self.assertIn("tsinghua", providers)
+        self.assertEqual(
+            providers["tsinghua"]["baseURL"],
+            "https://madmodel.cs.tsinghua.edu.cn/v1",
+            "坏地址应当被纠正成标准根地址",
+        )
+        self.assertEqual(providers["tsinghua"]["apiKeyEnv"], "MADMODEL_API_KEY")
+        model_ids = [model["id"] for model in providers["tsinghua"]["models"]]
+        self.assertIn("DeepSeek-V4.1-Flash", model_ids, "模型列表应当被换成站点清单")
+
+    def test_foreign_provider_with_wrong_base_url_is_warned_not_touched(self) -> None:
+        """madmodel 已经在场时，旁边那条地址写歪的 tsinghua 一个字节都不许动，
+        但必须在消息里提醒用户（提醒不是改动）。"""
+
+        text = """- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      tsinghua:
+        displayName: tsinghua
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions
+        models:
+          - id: "1"
+            name: "1"
+      madmodel:
+        displayName: DeepSeek (THU)
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: https://madmodel.cs.tsinghua.edu.cn/v1
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: DeepSeek-V4.1-Flash (THU)
+"""
+        profile = self._write_profile(text)
+        before = profile.read_text(encoding="utf-8")
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        after = profile.read_text(encoding="utf-8")
+
+        def tsinghua_block(value: str) -> str:
+            return value[value.index("      tsinghua:") : value.index("      madmodel:")]
+
+        self.assertEqual(tsinghua_block(after), tsinghua_block(before), "别人的 provider 原文被改了")
+        self.assertTrue(
+            any("tsinghua" in note and "路径多了一截" in note for note in result.messages),
+            f"应当提醒这条地址写歪了：{result.messages}",
+        )
+
     def test_new_provider_insert_keeps_foreign_raw_text(self) -> None:
         """原先没有 madmodel 的 profile：新 provider 只能插到 providers 块尾部，
         同一文件里别人 provider 的原文（注释/单引号/流式列表）一字都不许动。"""

@@ -468,6 +468,84 @@ class UiInteractionTest(unittest.TestCase):
         finally:
             self._close(window)
 
+    def test_auto_retry_budget_is_finite(self) -> None:
+        """自动同步失败的重试次数有限：安排完预算就不再安排（避免无限重试）。"""
+
+        from auto_thu_deepseek_api.ui.main_window import AUTO_RETRY_BUDGET
+
+        window = MainWindow(AppSettings(), AppState())
+        scheduled: list[int] = []
+        window._auto_retry_timer.start = lambda ms: scheduled.append(ms)  # type: ignore[assignment]
+        try:
+            for _ in range(AUTO_RETRY_BUDGET + 2):
+                window._schedule_auto_retry("测试用原因")
+            self.assertEqual(len(scheduled), AUTO_RETRY_BUDGET, "重试次数应当正好用完预算")
+            self.assertEqual(window._auto_retry_left, 0)
+        finally:
+            self._close(window)
+
+    def test_successful_sync_refills_retry_budget(self) -> None:
+        """同步成功一次就把重试预算补满（下一次失败还能重试几次）。"""
+
+        from auto_thu_deepseek_api.sync import SyncReport
+        from auto_thu_deepseek_api.targets.base import ApplyResult
+        from auto_thu_deepseek_api.token.verifier import VerifyResult
+        from auto_thu_deepseek_api.ui.main_window import AUTO_RETRY_BUDGET
+
+        window = MainWindow(AppSettings(), AppState())
+        try:
+            window._persist_settings = lambda: True  # type: ignore[assignment]
+            window.state.remember_status = lambda summary: None  # type: ignore[assignment]
+            window.notify = lambda *a, **k: None  # type: ignore[assignment]
+            window._auto_retry_left = 0
+            report = SyncReport(
+                verified=VerifyResult(True, "站点确认 Token 可用"),
+                results=[ApplyResult("dsh", "DSH")],
+            )
+            self.assertTrue(report.ok, "构造的报告应当是成功状态")
+            window._on_sync_report(report)
+            self.assertEqual(window._auto_retry_left, AUTO_RETRY_BUDGET)
+        finally:
+            self._close(window)
+
+    def test_auto_sync_skips_when_site_unreachable(self) -> None:
+        """网络还没就绪时不浪费 40 秒去取 Token：直接安排过几分钟重试。"""
+
+        from unittest import mock
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        window = MainWindow(AppSettings(), AppState())
+        scheduled: list[str] = []
+        window._schedule_auto_retry = lambda reason: scheduled.append(reason)  # type: ignore[assignment]
+        try:
+            with mock.patch.object(main_window_module, "site_reachable", return_value=False):
+                window.start_sync(interactive=False)
+            self.assertEqual(len(scheduled), 1, "连不上站点时要安排重试")
+            self.assertIsNone(window._capture, "连不上站点时不该去取 Token")
+        finally:
+            self._close(window)
+
+    def test_startup_silent_failure_opens_login_window_once(self) -> None:
+        """开机启动时静默取 Token 失败：自动打开一次登录窗口等用户登录，不反复弹。"""
+
+        window = MainWindow(AppSettings(), AppState(), started_minimized=True)
+        opened: list[bool] = []
+        window._open_capture = lambda silent: opened.append(silent)  # type: ignore[assignment]
+        window.notify = lambda *a, **k: None  # type: ignore[assignment]
+        window._schedule_auto_retry = lambda reason: None  # type: ignore[assignment]
+        try:
+            window._capture_silent = True
+            window._on_capture_failed("静默取 Token 超时：多半需要重新登录")
+            self.assertEqual(opened, [False], "开机静默失败后要打开可见登录窗口")
+
+            # 再失败一次（例如那个窗口后来也超时了）：不该再自动弹第二个
+            window._capture_silent = True
+            window._on_capture_failed("等待登录超时")
+            self.assertEqual(opened, [False], "只自动打开一次登录窗口")
+        finally:
+            self._close(window)
+
     def test_preflight_worker_emits_report(self) -> None:
         """「校验写入内容」走后台线程：跑完要把报告发回主线程。"""
 

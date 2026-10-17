@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -36,6 +37,19 @@ class QtLogHandler(logging.Handler):
             pass
 
 
+def _open_file_handler(log_file: Path, formatter: logging.Formatter) -> logging.Handler | None:
+    """开一个按大小轮转的文件 handler；打不开（被占用 / 只读）返回 None。"""
+
+    try:
+        handler = RotatingFileHandler(
+            log_file, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+    except OSError:
+        return None
+    handler.setFormatter(formatter)
+    return handler
+
+
 def setup_logging(level: int = logging.INFO) -> Path:
     """配置根日志。返回本次日志文件路径。"""
 
@@ -58,15 +72,20 @@ def setup_logging(level: int = logging.INFO) -> Path:
     # 日志写不进去不该拖垮程序（只读目录、共享目录断掉都可能发生）
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        # 按大小轮转：长期挂着也不会把日志写到天上去
-        file_handler = RotatingFileHandler(
-            log_file, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
-        )
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
-        _CREATED_FILE_HANDLERS.append(file_handler)
     except OSError:  # pragma: no cover - 依赖具体环境
         pass
+    # 按大小轮转：长期挂着也不会把日志写到天上去
+    file_handler = _open_file_handler(log_file, formatter)
+    if file_handler is None:
+        # 主日志文件打不开（最常见的原因：另一个实例正开着它）时换一个带进程号的备用名。
+        # 宁可文件名怪一点，也别留下一个 0 字节的日志让人无从排查。
+        fallback = log_dir / f"{log_file.stem}-{os.getpid()}.log"
+        file_handler = _open_file_handler(fallback, formatter)
+        if file_handler is not None:
+            log_file = fallback
+    if file_handler is not None:
+        root.addHandler(file_handler)
+        _CREATED_FILE_HANDLERS.append(file_handler)
 
     ui_handler = QtLogHandler()
     ui_handler.setFormatter(formatter)

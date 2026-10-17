@@ -17,7 +17,9 @@
    - DSH 凭据 `%USERPROFILE%\.dsh\.credentials.yaml` 的 `MADMODEL_API_KEY`；
    - DSH 供应商 `%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml` 的
      `llm-pi-ai.providers.madmodel`（名称 `DeepSeek (THU)`，地址
-     `https://madmodel.cs.tsinghua.edu.cn/v1`）；
+     `https://madmodel.cs.tsinghua.edu.cn/v1`）。如果这个 provider 的地址被写成
+     带了 `/chat/completions` 之类的路径（pi-ai 拼 `/models` 会 404），程序会把它纠正回 `/v1`；
+     同一文件里**别人**的 provider 地址写歪时只提醒、一个字节都不动；
    - CC Switch 数据库 `%USERPROFILE%\.cc-switch\cc-switch.db` 的供应商卡片
      `deepseek-thu / DeepSeek (THU)`（只有你显式打开「顺带刷新同站点旧卡片」时，
      才会连带刷新同站点旧卡片的 Token 字段）；
@@ -38,6 +40,10 @@
   DSH / CC Switch 安装状态、Token 状态（显示"有效至 …"）与程序日志。
 - 第一次运行、还没有任何缓存 Token 时，"启动时立即同步"会直接打开浏览器窗口让你登录，
   不再先静默等一轮超时；之后有缓存就静默取。
+- 开机启动（`--minimized`）时，第一次同步会先等 90 秒再开始（刚开机网络与磁盘可能还没就绪）；
+  自动同步失败后每 5 分钟重试一次、最多 3 次（成功一次就把次数补满）。
+  如果静默取 Token 失败（多半是登录会话过期），程序会自动打开登录窗口并在托盘提示，
+  你回来直接完成登录即可。
 - 点击 `×` 最小化到系统托盘并从任务栏消失；托盘图标左键单击打开主界面，右键单击弹出菜单。
 
 ### 主界面按钮

@@ -159,3 +159,23 @@ def fetch_models(token: str, timeout: int = 15) -> list[dict] | None:
             models.append({"id": item["id"]})
     return models or None
 
+
+def site_reachable(timeout: int = 5) -> bool:
+    """轻量探测站点能不能连上（只看首页有没有回应，不涉及登录态）。
+
+    开机启动时网络经常还没就绪：先探一下再决定要不要开始取 Token，
+    省得白白等一轮 40 秒的静默超时，失败后再靠短间隔重试补上。
+    """
+
+    request = urllib.request.Request(f"{MADMODEL_ORIGIN}/", method="HEAD")
+    request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) autoThuDeepSeekAPI")
+    context = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as exc:
+        # 能回 4xx 说明网络是通的（只是不接受 HEAD 这种方式），同样算可达
+        return exc.code < 500
+    except Exception:  # noqa: BLE001 - 网络异常种类多，统一当"连不上"
+        return False
+

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
+import random
 import subprocess
 import time
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QFont
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,16 +24,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import backup_ops, constants, data_location, instance, paths, startup
-from ..logging_setup import close_file_handlers, log_bus, setup_logging
+from .. import backup_ops, constants, credentials, data_location, instance, paths, startup
+from ..logging_setup import close_file_handlers, setup_logging
 from ..settings import CCSWITCH_POLICY_DIRECT, AppSettings
 from ..state_store import AppState
 from ..sync import SyncReport, both_targets_missing, detect_targets
@@ -45,7 +46,7 @@ from .workers import PreflightWorker, SyncWorker
 logger = logging.getLogger(__name__)
 
 # 自动同步失败后的重试策略：开机时网络 / 登录会话可能都还没就绪，
-# 失败一次就干等下一个周期（默认 180 分钟）太久，这里补几次短间隔重试。
+# 失败一次就干等下一个周期（默认 60 分钟）太久，这里补几次短间隔重试。
 AUTO_RETRY_BUDGET = 3
 AUTO_RETRY_DELAY_MS = 5 * 60 * 1000
 
@@ -108,16 +109,16 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(constants.APP_DISPLAY_NAME)
         self.setWindowIcon(app_icon())
-        # 按钮那一行很长，窗口再窄就会被挤到看不清
-        self.setMinimumSize(820, 560)
-        self.resize(880, 640)
+        self.setMinimumSize(620, 420)
+        self.resize(720, 500)
 
         self._build_ui()
         self._build_tray()
         self._wire_signals()
 
         self._auto_timer = QTimer(self)
-        self._auto_timer.timeout.connect(lambda: self.start_sync(interactive=False))
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._auto_tick)
         self._apply_auto_timer()
         self.refresh_status()
 
@@ -158,82 +159,23 @@ class MainWindow(QMainWindow):
         # 操作
         actions_box = QGroupBox("操作")
         actions_layout = QVBoxLayout(actions_box)
-        first_row = QHBoxLayout()
+        action_row = QHBoxLayout()
         self.sync_button = QPushButton("立即获取并同步")
-        self.sync_button.setMinimumHeight(34)
-        self.preflight_button = QPushButton("校验写入内容")
-        self.preflight_button.setToolTip("只读检查：把将要写入 DSH / CC Switch 的内容渲染出来并校验合法性")
-        self.backup_button = QPushButton("手动备份")
-        self.backup_button.setToolTip("立刻把 DSH / CC Switch 的关键文件各留一份备份")
-        self.restore_button = QPushButton("一键还原")
-        self.restore_button.setToolTip("把各文件恢复成最早的备份（= 第一次修改前的状态）")
-        for button in (self.sync_button, self.preflight_button, self.backup_button, self.restore_button):
-            first_row.addWidget(button)
-        first_row.addStretch(1)
-        actions_layout.addLayout(first_row)
-
-        second_row = QHBoxLayout()
+        self.sync_button.setMinimumHeight(38)
         self.config_button = QPushButton("设置…")
-        self.config_button.setToolTip("写入目标、CC Switch 策略、备份与维护都在这里")
-        self.shortcut_button = QPushButton("创建桌面快捷方式")
-        self.shortcut_button.setToolTip("在桌面生成一个指向本程序的快捷方式，双击即可启动")
-        self.log_button = QPushButton("打开日志")
-        self.data_button = QPushButton("打开数据目录")
-        self.about_button = QPushButton("关于…")
-        self.about_button.setToolTip("版本、作者、项目主页与运行数据目录")
+        self.config_button.setToolTip("同步、目标、登录、备份与维护都在这里")
+        self.config_button.setMinimumHeight(38)
         self.exit_button = QPushButton("退出")
-        for button in (
-            self.config_button,
-            self.shortcut_button,
-            self.log_button,
-            self.data_button,
-            self.about_button,
-            self.exit_button,
-        ):
-            second_row.addWidget(button)
-        second_row.addStretch(1)
-        actions_layout.addLayout(second_row)
-
-        settings_row = QHBoxLayout()
-        self.startup_check = QCheckBox("开机启动（最小化到托盘）")
-        self.startup_check.setChecked(self.settings.launch_at_startup)
-        self.sync_on_start_check = QCheckBox("启动时立即同步")
-        self.sync_on_start_check.setChecked(self.settings.sync_on_start)
-        self.auto_sync_check = QCheckBox("自动同步")
-        self.auto_sync_check.setChecked(self.settings.auto_sync_enabled)
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, 1440)
-        self.interval_spin.setSuffix(" 分钟")
-        self.interval_spin.setValue(self.settings.sync_interval_minutes)
-        self.minimize_after_check = QCheckBox("同步完成立即最小化到托盘")
-        self.minimize_after_check.setChecked(self.settings.minimize_after_sync)
-
-        settings_row.addWidget(self.startup_check)
-        settings_row.addWidget(self.sync_on_start_check)
-        settings_row.addSpacing(12)
-        settings_row.addWidget(self.auto_sync_check)
-        settings_row.addWidget(self.interval_spin)
-        for minutes in (20, 60, 180):
-            preset = QPushButton(f"{minutes} 分")
-            preset.setMaximumWidth(64)
-            preset.clicked.connect(lambda _=False, value=minutes: self.interval_spin.setValue(value))
-            settings_row.addWidget(preset)
-        settings_row.addWidget(self.minimize_after_check)
-        settings_row.addStretch(1)
-        actions_layout.addLayout(settings_row)
+        action_row.addWidget(self.sync_button, 2)
+        action_row.addWidget(self.config_button, 1)
+        action_row.addWidget(self.exit_button, 1)
+        actions_layout.addLayout(action_row)
+        self.next_sync_status = QLabel("下一次自动同步：计算中…")
+        self.next_sync_status.setWordWrap(True)
+        actions_layout.addWidget(self.next_sync_status)
         layout.addWidget(actions_box)
 
-        # 日志
-        log_box = QGroupBox("程序日志")
-        log_layout = QVBoxLayout(log_box)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(4000)
-        font = QFont("Consolas")
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        self.log_view.setFont(font)
-        log_layout.addWidget(self.log_view)
-        layout.addWidget(log_box, 1)
+        layout.addStretch(1)
 
         self._restore_status_hint()
 
@@ -246,47 +188,29 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.show_window)
         sync_action = QAction("立即获取并同步", self)
         sync_action.triggered.connect(lambda: self.start_sync(interactive=True))
-        log_action = QAction("打开日志", self)
-        log_action.triggered.connect(self.open_log)
+        self.pause_action = QAction("暂停自动同步", self)
+        self.pause_action.triggered.connect(self.toggle_auto_pause)
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self.open_settings)
-        about_action = QAction("关于", self)
-        about_action.triggered.connect(self.show_about)
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.quit_app)
 
         menu.addAction(open_action)
         menu.addAction(sync_action)
-        menu.addSeparator()
-        menu.addAction(log_action)
+        menu.addAction(self.pause_action)
         menu.addAction(settings_action)
-        menu.addAction(about_action)
         menu.addSeparator()
         menu.addAction(quit_action)
+        self._update_pause_action()
         self.tray_menu = menu
         self.tray.setContextMenu(menu)
         self.tray.show()
 
     def _wire_signals(self) -> None:
         self.sync_button.clicked.connect(lambda: self.start_sync(interactive=True))
-        self.preflight_button.clicked.connect(self.check_preflight)
-        self.backup_button.clicked.connect(self.manual_backup)
-        self.restore_button.clicked.connect(self.restore_backup)
         self.config_button.clicked.connect(self.open_settings)
-        self.shortcut_button.clicked.connect(self.create_shortcut)
-        self.log_button.clicked.connect(self.open_log)
-        self.data_button.clicked.connect(lambda: self._open_path(paths.data_root()))
-        self.about_button.clicked.connect(self.show_about)
         self.exit_button.clicked.connect(self.quit_app)
-
-        self.startup_check.toggled.connect(self._toggle_startup)
-        self.sync_on_start_check.toggled.connect(self._save_from_ui)
-        self.auto_sync_check.toggled.connect(self._on_auto_toggled)
-        self.interval_spin.valueChanged.connect(self._on_interval_changed)
-        self.minimize_after_check.toggled.connect(self._save_from_ui)
-
         self.tray.activated.connect(self._on_tray_activated)
-        log_bus.message.connect(self.append_log)
 
     # —— 设置项 ——
 
@@ -311,61 +235,94 @@ class MainWindow(QMainWindow):
             logger.error("保存运行状态失败：%s", exc)
             return False
 
-    def _save_from_ui(self) -> None:
-        self.settings.sync_on_start = self.sync_on_start_check.isChecked()
-        self.settings.auto_sync_enabled = self.auto_sync_check.isChecked()
-        self.settings.sync_interval_minutes = self.interval_spin.value()
-        self.settings.minimize_after_sync = self.minimize_after_check.isChecked()
-        self._persist_settings()
-
-    def _toggle_startup(self, checked: bool) -> None:
-        ok, message = startup.set_enabled(checked)
-        logger.info(message)
-        if not ok:
-            QMessageBox.warning(self, "开机启动", message)
-            self.startup_check.blockSignals(True)
-            self.startup_check.setChecked(not checked)
-            self.startup_check.blockSignals(False)
-            return
-        self.settings.launch_at_startup = checked
-        self._persist_settings()
-
     def _on_auto_toggled(self, checked: bool) -> None:
-        self._save_from_ui()
+        self.settings.auto_sync_enabled = checked
+        self._persist_settings()
         self._apply_auto_timer()
+        self._update_pause_action()
         logger.info("自动同步已%s（间隔 %d 分钟）", "开启" if checked else "关闭", self.settings.sync_interval_minutes)
 
-    def _on_interval_changed(self, value: int) -> None:
-        self._save_from_ui()
-        self._apply_auto_timer()
-        logger.info("同步间隔改为 %d 分钟", value)
+    def toggle_auto_pause(self) -> None:
+        self._on_auto_toggled(not self.settings.auto_sync_enabled)
+
+    def _update_pause_action(self) -> None:
+        action = getattr(self, "pause_action", None)
+        if action is not None:
+            action.setText(
+                "暂停自动同步" if self.settings.auto_sync_enabled else "继续自动同步"
+            )
 
     def _apply_auto_timer(self) -> None:
         if self.settings.auto_sync_enabled:
-            self._auto_timer.start(max(1, self.settings.sync_interval_minutes) * 60 * 1000)
+            base = max(1, self.settings.sync_interval_minutes)
+            jitter = constants.SYNC_INTERVAL_JITTER_MINUTES
+            low = max(1, base - jitter)
+            high = max(low, min(24 * 60, base + jitter))
+            minutes = random.randint(low, high)
+            self._auto_timer.start(minutes * 60 * 1000)
+            self.next_sync_status.setText(
+                f"下一次自动同步：约 {minutes} 分钟后（基准 {base} 分钟）"
+            )
+            logger.info("下一次自动同步预计在 %d 分钟后（基准 %d 分钟）", minutes, base)
         else:
             self._auto_timer.stop()
+            self.next_sync_status.setText("自动同步已暂停")
+        self._update_pause_action()
+
+    def _auto_tick(self) -> None:
+        # 下一轮在开始前先排好，避免某次提前返回时自动同步永久停摆。
+        self._apply_auto_timer()
+        self.start_sync(interactive=False)
 
     # —— 界面动作 ——
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
-        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
-            return
+        dialog.settings_applied.connect(lambda: self._consume_manual_dialog_token(dialog))
+        dialog.exec()
+
+    def apply_settings_from_dialog(self, draft: AppSettings) -> bool:
+        """Apply one settings draft immediately (used by Apply and OK)."""
+
         if self._skip_save_on_quit or self._quitting:
             # 设置对话框里刚做过"干净卸载"或正在退出：别再写设置文件，否则刚删的会被建回来
-            return
+            return False
+
+        old_settings = copy.deepcopy(self.settings)
+        old_startup = startup.is_enabled()
+        startup_changed = draft.launch_at_startup != old_startup
+        if startup_changed:
+            ok, message = startup.set_enabled(draft.launch_at_startup)
+            logger.info(message)
+            if not ok:
+                QMessageBox.warning(self, "开机启动", message)
+                return False
+
         previous_level = self.settings.log_level
-        dialog.apply_to(self.settings)
-        self._persist_settings()
+        for field in fields(AppSettings):
+            setattr(self.settings, field.name, getattr(draft, field.name))
+        self.settings.launch_at_startup = startup.is_enabled()
+        if not self._persist_settings():
+            for field in fields(AppSettings):
+                setattr(self.settings, field.name, getattr(old_settings, field.name))
+            if startup_changed:
+                startup.set_enabled(old_startup)
+            return False
         if self.settings.log_level != previous_level:
             # 改日志级别立刻生效，不用等下次启动
             setup_logging(logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO)
             logger.info("日志级别已切换为 %s", self.settings.log_level)
         logger.info("设置已保存")
+        self.apply_settings_to_ui()
+        self._apply_auto_timer()
         self.refresh_status()
+        return True
+
+    def _consume_manual_dialog_token(self, dialog: SettingsDialog) -> None:
         if not dialog.manual_token:
             return
+        token = dialog.manual_token
+        dialog.manual_token = ""
         if self._maintenance or self._busy():
             # 忙碌时不能再起一个写入线程：两个线程同时写同一批文件会打架
             logger.info("正在忙，手动粘贴的 Token 这次没有使用")
@@ -377,12 +334,12 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            self.state.remember_token(dialog.manual_token)
+            self.state.remember_token(token)
         except OSError as exc:
             logger.error("保存手动粘贴的 Token 失败：%s", exc)
         self.refresh_status()
         logger.info("使用手动粘贴的 Token 开始同步")
-        self._start_sync_worker(dialog.manual_token, auto=False)
+        self._start_sync_worker(token, auto=False)
 
     def open_log(self) -> None:
         log_dir = paths.logs_dir()
@@ -564,19 +521,8 @@ class MainWindow(QMainWindow):
     # —— 维护动作 ——
 
     def apply_settings_to_ui(self) -> None:
-        """把 settings 的值刷到主界面控件上（「恢复默认设置」之后要立刻看到）。"""
+        """Refresh the compact main window after settings are applied."""
 
-        for widget, value in (
-            (self.sync_on_start_check, self.settings.sync_on_start),
-            (self.auto_sync_check, self.settings.auto_sync_enabled),
-            (self.minimize_after_check, self.settings.minimize_after_sync),
-        ):
-            widget.blockSignals(True)
-            widget.setChecked(value)
-            widget.blockSignals(False)
-        self.interval_spin.blockSignals(True)
-        self.interval_spin.setValue(self.settings.sync_interval_minutes)
-        self.interval_spin.blockSignals(False)
         self._apply_auto_timer()
         self.refresh_status()
 
@@ -628,7 +574,6 @@ class MainWindow(QMainWindow):
         if self._preflight_worker is not None:
             logger.info("上一次校验还没结束，忽略这次请求")
             return
-        self.preflight_button.setEnabled(False)
         self._show_status_hint("正在校验将要写入的内容…（只读，不改文件）")
         worker = PreflightWorker(self.settings, token, self)
         self._preflight_worker = worker
@@ -640,7 +585,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - 预检本身出问题也要如实说
             logger.exception("预检线程启动失败")
             self._preflight_worker = None
-            self.preflight_button.setEnabled(True)
             self._restore_status_hint()
             QMessageBox.warning(self, "校验写入内容", f"预检启动失败：{exc}")
 
@@ -663,7 +607,6 @@ class MainWindow(QMainWindow):
         if worker is not None and worker is not self._preflight_worker:
             return
         self._preflight_worker = None
-        self.preflight_button.setEnabled(True)
         self._restore_status_hint()
 
     def manual_backup(self) -> None:
@@ -679,36 +622,15 @@ class MainWindow(QMainWindow):
             "\n".join(lines) + f"\n\n共 {done} 份\n备份目录：{backup_ops.backup_dir()}",
         )
 
-    def restore_backup(self) -> None:
-        entries = backup_ops.pending_restore(self.settings)
-        if not entries:
-            QMessageBox.information(self, "一键还原", "还没有任何备份，不需要还原。")
-            return
-        detail = "\n".join(
-            f"· {Path(source).name} ← {Path(entry.backup).parent.name}" for source, entry in entries.items()
-        )
-        if QMessageBox.question(
-            self,
-            "一键还原",
-            "将把下列文件恢复成最早的备份（当前状态会先被备份一份）：\n\n" + detail,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            messages = backup_ops.restore_original(self.settings)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("一键还原失败")
-            QMessageBox.warning(self, "一键还原", f"还原失败：{exc}")
-            return
-        QMessageBox.information(self, "一键还原", "\n".join(messages) or "没有可还原的内容。")
-        self.refresh_status()
-
     # —— 状态栏与关于 ——
 
     def _restore_status_hint(self) -> None:
         """状态栏回到默认提示（运行数据目录）。"""
 
         self.statusBar().showMessage(f"数据目录：{paths.data_root()}")
+
+    def _open_data_dir(self) -> None:
+        self._open_path(paths.data_root())
 
     def _show_status_hint(self, message: str) -> None:
         """状态栏显示当前正在做什么：取 Token / 写入 / 校验都是要等好几秒的动作。"""
@@ -741,9 +663,6 @@ class MainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", str(path)])
         except OSError as exc:
             logger.warning("打开 %s 失败：%s", path, exc)
-
-    def append_log(self, line: str) -> None:
-        self.log_view.appendPlainText(line)
 
     def show_window(self) -> None:
         self.showNormal()
@@ -845,8 +764,16 @@ class MainWindow(QMainWindow):
 
         if not self.settings.enable_dsh:
             self.dsh_status.setText("已关闭写入（设置里可重新开启）")
+        elif not (
+            self.settings.enable_dsh_credentials or self.settings.enable_dsh_provider
+        ):
+            self.dsh_status.setText("已关闭全部 DSH 写入项（设置里可重新开启）")
         if not self.settings.enable_ccswitch:
             self.ccswitch_status.setText("已关闭写入（设置里可重新开启）")
+        elif not (
+            self.settings.enable_ccswitch_card or self.settings.enable_ccswitch_activate
+        ):
+            self.ccswitch_status.setText("已关闭全部 CC Switch 写入项（设置里可重新开启）")
 
         token = self.state.last_token
         if token and is_expired(token) is not True:
@@ -867,14 +794,19 @@ class MainWindow(QMainWindow):
         if self._maintenance:
             logger.info("正在搬 private 位置或卸载，本次同步先跳过")
             return
-        if not (self.settings.enable_dsh or self.settings.enable_ccswitch):
-            # 两个目标都被关掉时同步没有意义：直接说清楚，别让它跑到"没有任何目标被写入"
-            logger.warning("DSH 与 CC Switch 写入都关着，本次同步没有意义")
+        dsh_active = self.settings.enable_dsh and (
+            self.settings.enable_dsh_credentials or self.settings.enable_dsh_provider
+        )
+        ccswitch_active = self.settings.enable_ccswitch and (
+            self.settings.enable_ccswitch_card or self.settings.enable_ccswitch_activate
+        )
+        if not (dsh_active or ccswitch_active):
+            logger.warning("DSH 与 CC Switch 的所有具体写入项都关着，本次同步没有意义")
             if interactive:
                 QMessageBox.warning(
                     self,
                     "没有启用任何写入目标",
-                    "DSH 写入和 CC Switch 写入现在都是关着的，同步不会写任何东西。\n"
+                    "DSH 与 CC Switch 的具体写入项现在都是关着的，同步不会写任何东西。\n"
                     "请先在「设置…」里打开至少一个写入目标。",
                 )
             return
@@ -952,6 +884,8 @@ class MainWindow(QMainWindow):
 
         if interactive:
             return False
+        if self.settings.auto_login_enabled:
+            return True
         return bool(self.state.last_token) or bool(self.current_token())
 
     def _busy(self) -> bool:
@@ -1012,15 +946,34 @@ class MainWindow(QMainWindow):
         if self._browser_profile is None:
             self._browser_profile = build_profile(paths.browser_profile_dir())
 
+        auto_username = ""
+        auto_password = ""
+        if self.settings.auto_login_enabled:
+            try:
+                stored = credentials.load_login()
+            except OSError as exc:
+                logger.warning("读取自动登录凭据失败：%s", exc)
+                stored = None
+            if stored is None:
+                logger.info("已启用自动登录，但 Credential Manager 里没有凭据")
+                if silent:
+                    silent = False
+            else:
+                auto_username = stored.username
+                auto_password = stored.password
+
         self._capture = TokenCaptureSession(
             self._browser_profile,
             silent=silent,
             timeout_seconds=None if not silent else self.settings.silent_capture_timeout_seconds,
+            auto_username=auto_username,
+            auto_password=auto_password,
             parent=self,
         )
         self._capture.captured.connect(self._on_token_captured)
         self._capture.failed.connect(self._on_capture_failed)
         self._capture.cancelled.connect(self._on_capture_cancelled)
+        self._capture.manual_intervention_required.connect(self._on_manual_login_required)
         if silent:
             logger.info("开始静默取 Token（自动同步）")
             self._show_status_hint("正在静默获取 Token…")
@@ -1032,6 +985,10 @@ class MainWindow(QMainWindow):
             logger.exception("打开取 Token 流程失败")
             self._capture = None
             self.notify(f"取 Token 失败：{exc}", warning=True)
+
+    def _on_manual_login_required(self, reason: str) -> None:
+        self._show_status_hint("自动登录已暂停，请在登录窗口中完成验证…")
+        self.notify(f"{reason}。已暂停自动登录并打开登录窗口。", warning=True)
 
     def _on_token_captured(self, token: str) -> None:
         self._capture = None
@@ -1114,6 +1071,7 @@ class MainWindow(QMainWindow):
         if report.ok:
             # 成功一次就把重试预算补满（下一次失败还能重试几次）
             self._auto_retry_left = AUTO_RETRY_BUDGET
+            self._apply_auto_timer()
         elif self._sync_is_auto:
             self._schedule_auto_retry("上次同步没有成功")
         logger.info("同步完成：%s", summary)

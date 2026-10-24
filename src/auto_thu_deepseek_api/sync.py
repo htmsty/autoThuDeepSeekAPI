@@ -77,14 +77,18 @@ def build_targets(settings: AppSettings) -> list[object]:
         targets.append(
             DshTarget(
                 paths.resolve_dsh_paths(settings.dsh_dir),
-                settings.unify_all_profiles,
-                settings.default_model_id,
+                enable_credentials=settings.enable_dsh_credentials,
+                enable_provider=settings.enable_dsh_provider,
+                profile=settings.dsh_profile,
+                default_model_id=settings.default_model_id,
             )
         )
     if settings.enable_ccswitch:
         targets.append(
             CcSwitchTarget(
                 paths.resolve_ccswitch_paths(settings.ccswitch_dir),
+                enable_card=settings.enable_ccswitch_card,
+                activate=settings.enable_ccswitch_activate,
                 refresh_sibling_cards=settings.ccswitch_refresh_sibling_cards,
             )
         )
@@ -203,7 +207,11 @@ def run_sync(
         return report
 
     if verify:
-        report.verified = verify_token(token, models[0]["id"] if models else None)
+        report.verified = verify_token(
+            token,
+            models[0]["id"] if models else None,
+            allow_chat_fallback=settings.chat_verification_enabled,
+        )
         logger.info(
             "Token 校验（向站点发起会话校验请求，指纹 %s）：%s",
             fingerprint(token),

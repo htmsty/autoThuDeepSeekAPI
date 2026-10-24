@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 import copy
 from pathlib import Path
+from urllib.parse import urljoin
 
 from .. import constants, paths
 from .verifier import fetch_models
@@ -29,6 +30,7 @@ REQUEST_TIMEOUT = 25
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) autoThuDeepSeekAPI"
 
 ASSET_REF = re.compile(r"""["']([^"']*assets/js/[^"']+\.js)["']""")
+MODEL_LIST = re.compile(r"""["']?modelList["']?\s*:\s*\[""")
 SUPPORT_IMAGE = re.compile(r"supportImage:!0|supportImage:true")
 EFFORT_OPTIONS = re.compile(r"effortOptions:\[([^\]]*)\]")
 
@@ -53,7 +55,7 @@ def _slice_bracket(js: str, start: int) -> str | None:
                 quote = ""
             index += 1
             continue
-        if char in "\"'":
+        if char in "\"'`":
             quote = char
         elif char == "[":
             depth += 1
@@ -82,7 +84,7 @@ def _split_top_level_objects(body: str) -> list[str]:
                 quote = ""
             index += 1
             continue
-        if char in "\"'":
+        if char in "\"'`":
             quote = char
             current += char
         elif char == "{":
@@ -101,8 +103,13 @@ def _split_top_level_objects(body: str) -> list[str]:
 
 
 def _field_string(entry: str, key: str) -> str:
-    match = re.search(rf'{re.escape(key)}:"([^"]*)"', entry)
-    return match.group(1) if match else ""
+    match = re.search(
+        rf"""{re.escape(key)}\s*["']?\s*:\s*["']([^"']*)["']""",
+        entry,
+    )
+    if not match:
+        return ""
+    return match.group(1)
 
 
 def extract_model_list(js: str) -> list[dict] | None:
@@ -110,10 +117,11 @@ def extract_model_list(js: str) -> list[dict] | None:
 
     if not isinstance(js, str) or not js:
         return None
-    at = js.find("modelList:[")
-    if at < 0:
+    marker = MODEL_LIST.search(js)
+    if marker is None:
         return None
-    body = _slice_bracket(js, js.find("[", at))
+    bracket = js.find("[", marker.start())
+    body = _slice_bracket(js, bracket)
     if not body:
         return None
 
@@ -139,6 +147,36 @@ def extract_model_list(js: str) -> list[dict] | None:
             }
         )
     return models or None
+
+
+def _valid_provider_models(models: object) -> list[dict] | None:
+    if not isinstance(models, list):
+        return None
+    result: list[dict] = []
+    seen: set[str] = set()
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if (
+            not model_id
+            or model_id in seen
+            or len(model_id) > 64
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", model_id) is None
+        ):
+            continue
+        window = item.get("contextWindow")
+        if not isinstance(window, int) or window <= 0:
+            continue
+        modalities = item.get("input")
+        if not isinstance(modalities, list) or not modalities:
+            continue
+        seen.add(model_id)
+        result.append(item)
+    return result or None
 
 
 def to_provider_models(site_models: list[dict] | None) -> list[dict] | None:
@@ -210,24 +248,25 @@ def fetch_site_models() -> list[dict] | None:
     page = _get_text(f"{constants.MADMODEL_ORIGIN}/", PAGE_MAX_BYTES)
     if not page:
         return None
-    match = ASSET_REF.search(page)
-    if not match:
+    paths = list(dict.fromkeys(ASSET_REF.findall(page)))
+    if not paths:
         logger.info("站点首页里没找到 assets/js 包引用")
         return None
 
-    path = match.group(1)
-    if path.startswith("http"):
-        url = path
-    else:
-        url = constants.MADMODEL_ORIGIN + ("" if path.startswith("/") else "/") + path
-    bundle = _get_text(url, BUNDLE_MAX_BYTES)
-    if not bundle:
-        return None
-
-    models = to_provider_models(extract_model_list(bundle))
-    if models:
-        logger.info("已从站点前端包读到 %d 个模型：%s", len(models), [m["id"] for m in models])
-    return models
+    for path in paths[:4]:
+        url = urljoin(constants.MADMODEL_ORIGIN + "/", path)
+        bundle = _get_text(url, BUNDLE_MAX_BYTES)
+        if not bundle:
+            continue
+        models = to_provider_models(extract_model_list(bundle))
+        if models:
+            logger.info(
+                "已从站点前端包读到 %d 个模型：%s",
+                len(models),
+                [m["id"] for m in models],
+            )
+            return models
+    return None
 
 
 # —— 缓存 ——
@@ -259,8 +298,7 @@ def _load_cache() -> list[dict] | None:
     if not isinstance(raw_models, list):
         return None
     # 只认字典条目：缓存被手改/写坏时，脏数据不该流进写入流程
-    models = [item for item in raw_models if isinstance(item, dict) and item.get("id")]
-    return models or None
+    return _valid_provider_models(raw_models)
 
 
 def _save_cache(models: list[dict]) -> None:
@@ -297,8 +335,10 @@ def resolve_models(token: str | None = None, *, use_cache: bool = True) -> list[
             ] or None
 
     if live:
-        _save_cache(live)
-        return live
+        validated = _valid_provider_models(live)
+        if validated:
+            _save_cache(validated)
+            return validated
 
     logger.info("模型列表读不到，回退内置名单")
     return [copy.deepcopy(model) for model in constants.DEFAULT_MODELS]

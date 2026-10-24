@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import auto_thu_deepseek_api.targets.base as targets_base  # noqa: E402
+from auto_thu_deepseek_api import crypto  # noqa: E402
 from auto_thu_deepseek_api.backup import BackupManager  # noqa: E402
 from auto_thu_deepseek_api.paths import TargetPaths  # noqa: E402
 from auto_thu_deepseek_api.targets.ccswitch import CcSwitchTarget  # noqa: E402
@@ -39,13 +40,14 @@ MODELS = [
 
 
 def _dsh_target(sandbox: Sandbox, unify: bool = False) -> DshTarget:
+    # Kept as a compatibility parameter for older tests; profile unification is gone.
+    _ = unify
     return DshTarget(
         TargetPaths(
             base_dir=sandbox.dsh_dir,
             credentials_file=sandbox.dsh_dir / ".credentials.yaml",
             profiles_dir=sandbox.dsh_dir / "profiles",
         ),
-        unify_all_profiles=unify,
     )
 
 
@@ -84,16 +86,16 @@ class WriteRollbackTest(unittest.TestCase):
             manager = BackupManager(sandbox.backups_dir, keep=5)
             target = _dsh_target(sandbox)
 
-            original_writer = targets_base.write_text_atomic
+            original_writer = targets_base.write_bytes_atomic
 
-            def boom(path, text, encoding="utf-8"):
+            def boom(path, payload):
                 raise OSError("磁盘满了")
 
-            targets_base.write_text_atomic = boom  # type: ignore[assignment]
+            targets_base.write_bytes_atomic = boom  # type: ignore[assignment]
             try:
                 result = target.apply(FAKE_NEW_TOKEN, MODELS, manager)
             finally:
-                targets_base.write_text_atomic = original_writer  # type: ignore[assignment]
+                targets_base.write_bytes_atomic = original_writer  # type: ignore[assignment]
 
             self.assertFalse(result.ok, result.messages)
             self.assertTrue(any("回滚" in error or "写入失败" in error for error in result.errors), result.errors)
@@ -168,10 +170,33 @@ class CcSwitchCompatTest(unittest.TestCase):
             self.assertIsNotNone(backup_path)
             assert backup_path is not None
 
-            check = sqlite3.connect(backup_path)
+            plain_db = root / "backup-check.db"
+            plain_db.write_bytes(crypto.unprotect_bytes(backup_path.read_bytes()))
+            check = sqlite3.connect(plain_db)
             name = check.execute("SELECT name FROM providers WHERE id='deepseek-thu'").fetchone()[0]
             check.close()
             self.assertEqual(name, "WAL 里的改动", "WAL 里未落盘的改动也要进备份")
+
+    def test_database_backup_does_not_leave_plaintext_when_encryption_fails(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sandbox = Sandbox.create(root)
+            db = sandbox.ccswitch_dir / "cc-switch.db"
+            manager = BackupManager(sandbox.backups_dir, keep=5)
+            with mock.patch(
+                "auto_thu_deepseek_api.backup.crypto.protect_bytes",
+                side_effect=OSError("DPAPI unavailable"),
+            ):
+                with self.assertRaises(OSError):
+                    manager.backup_sqlite(db, "ccswitch-db")
+            leftovers = [
+                path
+                for path in sandbox.backups_dir.rglob("*")
+                if path.is_file() and path.name.endswith(".db")
+            ]
+            self.assertEqual(leftovers, [], "加密失败后不能遗留明文数据库副本")
 
 
 class PathEdgeCaseTest(unittest.TestCase):

@@ -47,18 +47,27 @@ try {
 
     if (-not $OneFileOnly) {
         Write-Host '== building folder version ==' -ForegroundColor Cyan
+        if (Test-Path -LiteralPath $scratch) {
+            Remove-Item -LiteralPath $scratch -Recurse -Force
+        }
         $env:ATD_ONEFILE = ''
         $env:ATD_NAME = 'autoThuDeepSeekAPI'
         & $python -m PyInstaller @common $spec
         if ($LASTEXITCODE -ne 0) { throw "folder build failed (exit $LASTEXITCODE)" }
 
         $folderTarget = Join-Path $finalDist 'autoThuDeepSeekAPI'
+        if (Test-Path -LiteralPath $folderTarget) {
+            Remove-Item -LiteralPath $folderTarget -Recurse -Force
+        }
         New-Item -ItemType Directory -Force -Path $folderTarget | Out-Null
         Copy-Item -Path (Join-Path $scratch 'autoThuDeepSeekAPI\*') -Destination $folderTarget -Recurse -Force
     }
 
     if (-not $FolderOnly) {
         Write-Host '== building single-file version ==' -ForegroundColor Cyan
+        if (Test-Path -LiteralPath $scratch) {
+            Remove-Item -LiteralPath $scratch -Recurse -Force
+        }
         $env:ATD_ONEFILE = '1'
         $env:ATD_NAME = 'autoThuDeepSeekAPI'
         & $python -m PyInstaller @common $spec

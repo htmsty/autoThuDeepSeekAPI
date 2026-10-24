@@ -16,7 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from auto_thu_deepseek_api import paths  # noqa: E402
-from auto_thu_deepseek_api.settings import CCSWITCH_POLICY_DIRECT, AppSettings  # noqa: E402
+from auto_thu_deepseek_api.settings import (  # noqa: E402
+    CCSWITCH_POLICY_DIRECT,
+    CCSWITCH_POLICY_PROMPT,
+    AppSettings,
+)
 from auto_thu_deepseek_api.state_store import AppState  # noqa: E402
 from auto_thu_deepseek_api.token.jwt_utils import expiry_moment  # noqa: E402
 from auto_thu_deepseek_api.ui.main_window import MainWindow  # noqa: E402
@@ -67,15 +71,34 @@ class UiSmokeTest(unittest.TestCase):
         window._quitting = True
         window.close()
 
+    def test_tray_menu_has_exact_five_actions(self) -> None:
+        window = MainWindow(AppSettings(), AppState())
+        labels = [
+            action.text()
+            for action in window.tray_menu.actions()
+            if not action.isSeparator()
+        ]
+        self.assertEqual(
+            labels,
+            ["打开主界面", "立即获取并同步", "暂停自动同步", "设置", "退出"],
+        )
+        window._quitting = True
+        window.close()
+
     def test_settings_dialog_round_trip(self) -> None:
         settings = AppSettings()
         dialog = SettingsDialog(settings)
         dialog.dsh_enabled.setChecked(False)
+        dialog.dsh_provider_check.setChecked(False)
         dialog.ccswitch_enabled.setChecked(True)
+        dialog.ccswitch_card_check.setChecked(False)
+        dialog.ccswitch_activate_check.setChecked(True)
         dialog.policy_direct.setChecked(True)
         dialog.keep_spin.setValue(3)
-        dialog.unify_profiles.setChecked(True)
         dialog.dsh_dir_edit.setText(r"D:\some\dsh")
+        dialog.dsh_profile_edit.setText("desktop")
+        dialog.chat_verify_check.setChecked(True)
+        dialog.interval_spin.setValue(75)
         dialog.preflight_check.setChecked(False)
         dialog.close_to_tray_check.setChecked(False)
         dialog.silent_timeout_spin.setValue(75)
@@ -84,11 +107,16 @@ class UiSmokeTest(unittest.TestCase):
         dialog.apply_to(settings)
 
         self.assertFalse(settings.enable_dsh)
+        self.assertFalse(settings.enable_dsh_provider)
         self.assertTrue(settings.enable_ccswitch)
+        self.assertFalse(settings.enable_ccswitch_card)
+        self.assertTrue(settings.enable_ccswitch_activate)
         self.assertEqual(settings.ccswitch_running_policy, CCSWITCH_POLICY_DIRECT)
         self.assertEqual(settings.backup_keep, 3)
-        self.assertTrue(settings.unify_all_profiles)
         self.assertEqual(settings.dsh_dir, r"D:\some\dsh")
+        self.assertEqual(settings.dsh_profile, "desktop")
+        self.assertTrue(settings.chat_verification_enabled)
+        self.assertEqual(settings.sync_interval_minutes, 75)
         self.assertFalse(settings.preflight_enabled)
         self.assertFalse(settings.close_to_tray)
         self.assertEqual(settings.silent_capture_timeout_seconds, 75)
@@ -129,11 +157,41 @@ class UiSmokeTest(unittest.TestCase):
     def test_settings_dialog_has_shortcut_button_and_ccswitch_default(self) -> None:
         settings = AppSettings()
         dialog = SettingsDialog(settings)
-        # 默认不弹「CC Switch 正在运行」提醒 = 运行策略选「不提示，直接改」
-        self.assertTrue(dialog.policy_direct.isChecked())
+        self.assertTrue(dialog.policy_prompt.isChecked())
+        self.assertFalse(dialog.auto_login_check.isChecked())
+        self.assertFalse(dialog.ccswitch_activate_check.isChecked())
         # 目标里要有"创建桌面快捷方式"功能
         self.assertTrue(hasattr(dialog, "shortcut_button"))
         dialog.close()
+
+    def test_settings_has_apply_ok_cancel_and_login_controls(self) -> None:
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        dialog = SettingsDialog(AppSettings())
+        buttons = dialog.findChild(QDialogButtonBox)
+        assert buttons is not None
+        self.assertIsNotNone(buttons.button(QDialogButtonBox.StandardButton.Apply))
+        self.assertIsNotNone(buttons.button(QDialogButtonBox.StandardButton.Ok))
+        self.assertIsNotNone(buttons.button(QDialogButtonBox.StandardButton.Cancel))
+        self.assertFalse(dialog.auto_login_check.isChecked())
+        self.assertFalse(dialog.ccswitch_activate_check.isChecked())
+        dialog.close()
+
+    def test_auto_sync_interval_is_jittered_within_bounds(self) -> None:
+        from unittest import mock
+
+        window = MainWindow(AppSettings(sync_interval_minutes=60), AppState())
+        started: list[int] = []
+        window._auto_timer.start = lambda ms: started.append(ms)  # type: ignore[assignment]
+        try:
+            with mock.patch("auto_thu_deepseek_api.ui.main_window.random.randint", return_value=50) as rand:
+                window._apply_auto_timer()
+            rand.assert_called_once_with(50, 70)
+            self.assertEqual(started[-1], 50 * 60 * 1000)
+            self.assertIn("50", window.next_sync_status.text())
+        finally:
+            window._quitting = True
+            window.close()
 
     def test_settings_dialog_is_actually_openable(self) -> None:
         """回归：2.4 曾经把设置对话框的布局顶掉，点「打开配置」什么都看不到。"""
@@ -146,16 +204,18 @@ class UiSmokeTest(unittest.TestCase):
         dialog.show()
         self.assertTrue(dialog.isVisible(), "show() 之后应当可见")
         self.assertTrue(dialog._content.isVisible(), "内容区应当显示出来")
-        self.assertTrue(dialog.unify_profiles.isVisible(), "设置项应当显示出来")
+        self.assertTrue(dialog.tabs.isVisible(), "分类设置页应当显示出来")
         dialog.close()
         window._quitting = True
         window.close()
 
-    def test_main_window_has_desktop_shortcut_button(self) -> None:
+    def test_shortcut_lives_in_settings(self) -> None:
         window = MainWindow(AppSettings(), AppState())
-        self.assertTrue(hasattr(window, "shortcut_button"))
-        self.assertIn("快捷方式", window.shortcut_button.text())
+        dialog = SettingsDialog(window.settings, window)
+        self.assertFalse(hasattr(window, "shortcut_button"))
+        self.assertIn("快捷方式", dialog.shortcut_button.text())
         self.assertTrue(callable(getattr(window, "create_shortcut", None)))
+        dialog.close()
         window._quitting = True
         window.close()
 
@@ -377,7 +437,7 @@ class UiInteractionTest(unittest.TestCase):
                 dialog.refresh_siblings_check.isChecked(),
                 "「顺带刷新同站点旧卡片」没有跟着恢复默认（点确定时会被写回去）",
             )
-            self.assertTrue(dialog.policy_direct.isChecked(), "运行策略要回到默认的「直接改」")
+            self.assertTrue(dialog.policy_prompt.isChecked(), "运行策略要回到默认的「先提示」")
             self.assertEqual(dialog.keep_spin.value(), AppSettings().backup_keep)
         finally:
             dialog.close()
@@ -396,8 +456,17 @@ class UiInteractionTest(unittest.TestCase):
 
             def __init__(self, settings, parent=None) -> None:  # noqa: ANN001, ANN002
                 self.manual_token = FAKE_OLD_TOKEN
+                callbacks = []
+                self.settings_applied = type(
+                    "FakeSignal",
+                    (),
+                    {"connect": lambda _self, callback: callbacks.append(callback)},
+                )()
+                self._callbacks = callbacks
 
             def exec(self):  # noqa: ANN201
+                for callback in self._callbacks:
+                    callback()
                 return QDialog.DialogCode.Accepted
 
             def apply_to(self, settings) -> None:  # noqa: ANN001
@@ -445,7 +514,14 @@ class UiInteractionTest(unittest.TestCase):
 
         from PySide6.QtWidgets import QMessageBox
 
-        settings = AppSettings(enable_dsh=False, enable_ccswitch=False)
+        settings = AppSettings(
+            enable_dsh=True,
+            enable_dsh_credentials=False,
+            enable_dsh_provider=False,
+            enable_ccswitch=True,
+            enable_ccswitch_card=False,
+            enable_ccswitch_activate=False,
+        )
         window = MainWindow(settings, AppState())
         try:
             window.start_sync(interactive=False)

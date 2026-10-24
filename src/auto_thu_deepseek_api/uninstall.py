@@ -27,7 +27,7 @@ def clean_uninstall(settings: AppSettings, *, restore_targets: bool) -> tuple[bo
 
     if restore_targets:
         try:
-            messages = backup_ops.restore_original(settings)
+            messages = backup_ops.restore_original(settings, allow_legacy_full_restore=True)
         except Exception as exc:  # noqa: BLE001 - 卸载流程不能因为一个异常就中断清理
             ok = False
             lines.append(f"还原 DSH / CC Switch 失败：{exc}")

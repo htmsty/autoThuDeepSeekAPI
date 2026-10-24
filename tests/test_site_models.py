@@ -35,6 +35,41 @@ class SiteModelsTest(unittest.TestCase):
         self.assertIsNone(site_models.extract_model_list("var a=1;"))
         self.assertIsNone(site_models.extract_model_list(""))
 
+    def test_quoted_model_list_with_whitespace_is_supported(self) -> None:
+        bundle = """
+        window.x = { "modelList" : [
+          { 'label': 'Model A', 'value': 'model-a', effortOptions: ['low'] }
+        ] };
+        """
+        models = site_models.extract_model_list(bundle)
+        self.assertIsNotNone(models)
+        assert models is not None
+        self.assertEqual(models[0]["id"], "model-a")
+
+    def test_fetch_tries_multiple_asset_bundles(self) -> None:
+        page = """
+        <script src="/assets/js/vendor.js"></script>
+        <script src="/assets/js/app.js"></script>
+        """
+
+        def fake_get(url: str, _max_bytes: int, timeout: int = 25) -> str | None:
+            _ = timeout
+            if url.endswith("app.js"):
+                return BUNDLE
+            if url.endswith("vendor.js"):
+                return "var vendor=1;"
+            return page
+
+        original = site_models._get_text
+        site_models._get_text = fake_get  # type: ignore[assignment]
+        try:
+            models = site_models.fetch_site_models()
+        finally:
+            site_models._get_text = original  # type: ignore[assignment]
+        self.assertIsNotNone(models)
+        assert models is not None
+        self.assertIn("DeepSeek-V4.1-Flash", [item["id"] for item in models])
+
     def test_to_provider_models_filters_and_shapes(self) -> None:
         provider_models = site_models.to_provider_models(site_models.extract_model_list(BUNDLE))
         self.assertIsNotNone(provider_models)

@@ -68,6 +68,12 @@ EXCLUDED_QT_PREFIXES = (
 
 # DevTools 的调试资源有 70 多 MB，运行时用不到。
 EXCLUDED_DATA_SUFFIXES = ("qtwebengine_devtools_resources.debug.pak",)
+LOCALIZATION_FILES = {
+    "qt_zh_cn.qm",
+    "qtbase_zh_cn.qm",
+    "qtdeclarative_zh_cn.qm",
+    "qtwebengine_zh_cn.qm",
+}
 
 block_cipher = None
 
@@ -111,6 +117,11 @@ analysis.datas = [
     entry
     for entry in analysis.datas
     if not Path(entry[0]).name.lower().endswith(EXCLUDED_DATA_SUFFIXES)
+    and not (
+        "translations" in [part.lower() for part in Path(entry[0]).parts]
+        and Path(entry[0]).name.lower().endswith(".qm")
+        and Path(entry[0]).name.lower() not in LOCALIZATION_FILES
+    )
 ]
 
 # _ssl.pyd 需要 OpenSSL，而解释器把它们放在 Python 安装的 DLLs/ 下；
@@ -146,6 +157,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ROOT / "assets" / "icon.ico"),
+    version=str(ROOT / "build" / "version_info.txt"),
 )
 
 if onefile:

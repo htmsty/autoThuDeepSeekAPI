@@ -1,11 +1,12 @@
 """内置浏览器捕获 Token。
 
-登录永远由用户本人在窗口里完成：程序不模拟点击、不注入点击脚本。
-页面脚本只做三件事：扫浏览器存储、钩网络响应、扫一次页面文本，命中 JWT 即交给 Python。
+默认仍由用户手动登录。用户显式开启自动登录并保存凭据后，程序才在清华域名下
+自动填充并提交；遇到验证码或二次验证会立即停下并打开窗口请用户接手。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QLabel, QMainWindow, QVBoxLayout, QWidget
 
 from .. import constants
-from .jwt_utils import find_jwt, looks_like_jwt
+from .jwt_utils import JwtCandidate, choose_jwt, looks_like_jwt
 
 logger = logging.getLogger(__name__)
 
@@ -35,40 +36,60 @@ class CaptureWindow(QMainWindow):
         if event.isAccepted():
             self.user_closed.emit()
 
-# 页面脚本：只读，不点击。
+# 页面脚本：扫描浏览器存储、网络响应和页面文本中的多个 JWT 候选。
 CAPTURE_SCRIPT = r"""
 (function () {
   if (window.__atdInstalled) { return; }
   window.__atdInstalled = true;
   window.__atdToken = '';
-  var JWT = /eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}/;
+  window.__atdCandidates = [];
+  var JWT = /eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}/g;
 
-  function take(value) {
+  function take(value, source, key) {
     if (typeof value !== 'string' || !value) { return false; }
-    var m = value.match(JWT);
-    if (m) { window.__atdToken = m[0]; return true; }
-    return false;
+    if (value.length > 2 * 1024 * 1024) { return false; }
+    var found = false;
+    var match;
+    JWT.lastIndex = 0;
+    while ((match = JWT.exec(value)) !== null) {
+      var token = match[0];
+      found = true;
+      window.__atdToken = token;
+      var exists = window.__atdCandidates.some(function (item) {
+        return item.token === token;
+      });
+      if (!exists) {
+        window.__atdCandidates.push({
+          token: token,
+          source: source || 'text',
+          key: key || '',
+          url: location.href || ''
+        });
+      }
+      if (window.__atdCandidates.length > 80) { window.__atdCandidates.shift(); }
+    }
+    return found;
   }
 
   function scanStores() {
     try {
       for (var i = 0; i < localStorage.length; i++) {
         var key = localStorage.key(i);
-        if (take(localStorage.getItem(key))) { return; }
-        if (key && JWT.test(key)) { window.__atdToken = key.match(JWT)[0]; return; }
+        take(localStorage.getItem(key), 'localStorage', key);
+        if (key) { take(key, 'localStorageKey', key); }
       }
     } catch (e) { }
     try {
       for (var j = 0; j < sessionStorage.length; j++) {
         var key2 = sessionStorage.key(j);
-        if (take(sessionStorage.getItem(key2))) { return; }
+        take(sessionStorage.getItem(key2), 'sessionStorage', key2);
       }
     } catch (e) { }
   }
 
   function scanText() {
     try {
-      if (document.body) { take(document.body.innerText || ''); }
+      if (document.body) { take(document.body.innerText || '', 'text', ''); }
     } catch (e) { }
   }
 
@@ -80,7 +101,15 @@ CAPTURE_SCRIPT = r"""
       try {
         result.then(function (response) {
           try {
-            response.clone().text().then(take, function () { });
+            var contentType = response.headers.get('content-type') || '';
+            var contentLength = Number(response.headers.get('content-length') || 0);
+            if (contentLength > 2 * 1024 * 1024 ||
+                !/json|text|javascript/i.test(contentType)) {
+              return;
+            }
+            response.clone().text().then(function (text) {
+              take(text, 'network', response.url || '');
+            }, function () { });
           } catch (e) { }
         }, function () { });
       } catch (e) { }
@@ -94,7 +123,11 @@ CAPTURE_SCRIPT = r"""
       XMLHttpRequest.prototype.open = function () {
         try {
           this.addEventListener('load', function () {
-            try { take(this.responseText); } catch (e) { }
+            try {
+              if (this.responseText.length <= 2 * 1024 * 1024) {
+                take(this.responseText, 'network', this.responseURL || '');
+              }
+            } catch (e) { }
           });
         } catch (e) { }
         return open.apply(this, arguments);
@@ -108,6 +141,74 @@ CAPTURE_SCRIPT = r"""
   scanStores();
   scanText();
 })();
+"""
+
+AUTO_LOGIN_SCRIPT = r"""
+(function (username, password) {
+  var host = (location.hostname || '').toLowerCase();
+  if (!(host === 'tsinghua.edu.cn' || host.endsWith('.tsinghua.edu.cn'))) {
+    return {action: 'ignore'};
+  }
+  var bodyText = document.body ? (document.body.innerText || '') : '';
+  var manualMarkers = [
+    '二次验证', '双因素', '动态口令', '动态验证码', '手机验证码',
+    '身份验证器', 'MFA', '两步验证', '请完成验证'
+  ];
+  var captcha = document.querySelector(
+    'input[name*="captcha" i], input[id*="captcha" i], img[src*="captcha" i], .captcha'
+  );
+  var manual = captcha !== null || manualMarkers.some(function (marker) {
+    return bodyText.indexOf(marker) >= 0;
+  });
+  if (manual) {
+    return {action: 'manual', reason: '检测到验证码或二次验证，请手动完成'};
+  }
+
+  var passwordInput = document.querySelector('input[type="password"]');
+  if (!passwordInput || passwordInput.offsetParent === null) {
+    return {action: 'none'};
+  }
+  var scope = passwordInput.form || document;
+  var candidates = Array.prototype.slice.call(
+    scope.querySelectorAll('input[type="text"], input[type="email"], input:not([type])')
+  );
+  var usernameInput = candidates.find(function (item) {
+    var marker = ((item.name || '') + ' ' + (item.id || '') + ' ' +
+      (item.autocomplete || '')).toLowerCase();
+    return /user|account|mail|login|学号|账号/.test(marker);
+  }) || candidates.find(function (item) { return item.offsetParent !== null; });
+  if (!usernameInput) {
+    return {action: 'none'};
+  }
+
+  function setValue(input, value) {
+    var descriptor = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(input), 'value'
+    );
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(input, value);
+    } else {
+      input.value = value;
+    }
+    input.dispatchEvent(new Event('input', {bubbles: true}));
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+  }
+  setValue(usernameInput, username);
+  setValue(passwordInput, password);
+
+  var button = scope.querySelector('button[type="submit"], input[type="submit"]');
+  if (!button) {
+    var buttons = Array.prototype.slice.call(scope.querySelectorAll('button'));
+    button = buttons.find(function (item) {
+      return /登录|登陆|sign\s*in|log\s*in/i.test(item.innerText || item.value || '');
+    });
+  }
+  if (!button) {
+    return {action: 'filled-no-submit'};
+  }
+  setTimeout(function () { button.click(); }, 250);
+  return {action: 'submitted'};
+})(__ATD_USERNAME__, __ATD_PASSWORD__)
 """
 
 
@@ -136,6 +237,7 @@ class TokenCaptureSession(QObject):
     captured = Signal(str)
     failed = Signal(str)
     cancelled = Signal()
+    manual_intervention_required = Signal(str)
 
     def __init__(
         self,
@@ -144,6 +246,8 @@ class TokenCaptureSession(QObject):
         silent: bool = False,
         timeout_seconds: int | None = None,
         url: str | None = None,
+        auto_username: str = "",
+        auto_password: str = "",
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -155,6 +259,11 @@ class TokenCaptureSession(QObject):
             DEFAULT_SILENT_TIMEOUT_S if silent else DEFAULT_INTERACTIVE_TIMEOUT_S
         )
         self._cookie_values: list[str] = []
+        self._poll_count = 0
+        self._auto_username = auto_username
+        self._auto_password = auto_password
+        self._manual_prompted = False
+        self._auto_submit_enabled = bool(auto_username and auto_password)
 
         self._page = QWebEnginePage(profile, self)
         self._window: QMainWindow | None = None
@@ -173,6 +282,8 @@ class TokenCaptureSession(QObject):
         self._deadline.timeout.connect(self._on_timeout)
 
         profile.cookieStore().cookieAdded.connect(self._on_cookie_added)
+        if self._auto_username and self._auto_password:
+            self._page.loadFinished.connect(self._on_load_finished)
 
     # —— 界面 ——
 
@@ -220,8 +331,46 @@ class TokenCaptureSession(QObject):
         self._page.load(QUrl(self._url))
         logger.info("已打开登录窗口（%s 模式）：%s", "静默" if self._silent else "交互", self._url)
 
+    def _ensure_window(self) -> QMainWindow:
+        if self._window is not None:
+            return self._window
+        self._window, self._view = self._build_window()
+        if isinstance(self._window, CaptureWindow):
+            self._window.user_closed.connect(self._on_window_closed)
+        self._window.show()
+        self._window.raise_()
+        self._window.activateWindow()
+        return self._window
+
+    def _on_load_finished(self, ok: bool) -> None:
+        if self._finished or not ok or not self._auto_submit_enabled:
+            return
+        if not self._page.url().host().lower().endswith("tsinghua.edu.cn"):
+            return
+        script = AUTO_LOGIN_SCRIPT.replace(
+            "__ATD_USERNAME__", json.dumps(self._auto_username, ensure_ascii=False)
+        ).replace("__ATD_PASSWORD__", json.dumps(self._auto_password, ensure_ascii=False))
+        self._page.runJavaScript(script, self._on_auto_login_result)
+
+    def _on_auto_login_result(self, value: object) -> None:
+        if self._finished or not isinstance(value, dict):
+            return
+        action = value.get("action")
+        if action != "manual":
+            return
+        reason = str(value.get("reason") or "需要人工完成登录验证")
+        self._auto_submit_enabled = False
+        self._ensure_window()
+        self._silent = False
+        self._deadline.start(DEFAULT_INTERACTIVE_TIMEOUT_S * 1000)
+        logger.warning("自动登录暂停：%s", reason)
+        if not self._manual_prompted:
+            self._manual_prompted = True
+            self.manual_intervention_required.emit(reason)
+
     def finish(self) -> None:
         self._finished = True
+        self._auto_password = ""
         self._timer.stop()
         self._deadline.stop()
         try:
@@ -252,16 +401,42 @@ class TokenCaptureSession(QObject):
     def _poll(self) -> None:
         if self._finished:
             return
-        self._page.runJavaScript("window.__atdToken || ''", self._on_js_result)
+        self._poll_count += 1
+        self._page.runJavaScript(
+            "JSON.stringify(window.__atdCandidates || [])", self._on_js_result
+        )
 
     def _on_js_result(self, value: object) -> None:
         if self._finished:
             return
-        token = find_jwt(value if isinstance(value, str) else "")
-        if token is None and self._cookie_values:
-            token = self._cookie_values[-1]
+        candidates: list[JwtCandidate] = []
+        if isinstance(value, str) and value:
+            try:
+                raw = json.loads(value)
+            except ValueError:
+                raw = []
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict) or not isinstance(item.get("token"), str):
+                        continue
+                    candidates.append(
+                        JwtCandidate(
+                            token=item["token"],
+                            source=str(item.get("source") or ""),
+                            key=str(item.get("key") or ""),
+                            url=str(item.get("url") or ""),
+                        )
+                    )
+        page_url = self._page.url().toString()
+        candidates.extend(
+            JwtCandidate(token=token, source="cookie", key="cookie", url=page_url)
+            for token in self._cookie_values
+        )
+        token = choose_jwt(candidates)
         if token:
             self._succeed(token)
+        elif len({item.token for item in candidates}) > 1 and self._poll_count % 10 == 0:
+            logger.info("页面里同时存在多个 JWT，候选证据不足，继续等待网络响应")
 
     def _succeed(self, token: str) -> None:
         logger.info("已捕获 Token（长度 %d）", len(token))

@@ -29,7 +29,7 @@ class VerifierTest(unittest.TestCase):
 
     def test_success_from_session_endpoint(self) -> None:
         self._stub([(200, json.dumps({"success": True, "data": "x"}).encode(), "")])
-        result = verifier.verify_token("tok")
+        result = verifier.verify_token("tok", allow_chat_fallback=True)
         self.assertTrue(result.ok)
         self.assertEqual(len(self.calls), 1, "会话接口给了结论就不该再打模型请求")
         self.assertIn("auth-login", self.calls[0][0])
@@ -86,10 +86,17 @@ class VerifierTest(unittest.TestCase):
                 (200, b'{"choices": []}', ""),
             ]
         )
-        result = verifier.verify_token("tok")
+        result = verifier.verify_token("tok", allow_chat_fallback=True)
         self.assertTrue(result.ok)
         self.assertEqual(len(self.calls), 2)
         self.assertIn("/v1/chat/completions", self.calls[1][0])
+
+    def test_unknown_endpoint_does_not_spend_quota_by_default(self) -> None:
+        self._stub([(200, b"not json at all", "")])
+        result = verifier.verify_token("tok")
+        self.assertIsNone(result.ok)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("没有发送最小对话校验", result.detail)
 
     def test_html_reply_skips_the_slow_chat_probe(self) -> None:
         """站点回网页（没登录 / 接口变了）时别再打一次模型请求白等 30 秒。"""

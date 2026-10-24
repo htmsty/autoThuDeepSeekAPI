@@ -17,7 +17,9 @@ CCSWITCH_POLICY_DIRECT = "direct"
 #   v3：默认开启自动同步、间隔 180 分钟，并默认不弹「CC Switch 正在运行」提醒。
 #   v4：「CC Switch 正在运行时」的策略合并成一个选项（原来的"不再弹提醒"复选框
 #       等价于"不提示、直接改"，两个控件会互相矛盾，已去掉）。
-SETTINGS_VERSION = 4
+#   v5：默认 60 分钟并随机浮动；移除"统一所有 profile"；DSH / CC Switch
+#       拆成凭据、Provider、卡片、路由四个独立写入开关。
+SETTINGS_VERSION = 5
 
 # 「恢复默认设置」时**不**动的字段：它们不是"设置项"，而是运行状态或系统状态。
 RESET_KEEP_FIELDS = (
@@ -43,6 +45,8 @@ class AppSettings:
 
     # 取 Token
     silent_capture_timeout_seconds: int = 40
+    auto_login_enabled: bool = False
+    chat_verification_enabled: bool = False
 
     # 写入前预检（把"将要写入的内容"先渲染出来校验，避免写坏目标文件）
     preflight_enabled: bool = True
@@ -56,18 +60,19 @@ class AppSettings:
 
     # 目标开关（检测到哪个写哪个；可分别关闭）
     enable_dsh: bool = True
+    enable_dsh_credentials: bool = True
+    enable_dsh_provider: bool = True
+    dsh_profile: str = ""  # 空 = 自动选择唯一/首选 profile
     enable_ccswitch: bool = True
+    enable_ccswitch_card: bool = True
+    enable_ccswitch_activate: bool = False
 
     # 自定义路径（留空 = 自动探测）
     dsh_dir: str = ""
     ccswitch_dir: str = ""
 
-    # DSH 细节
-    unify_all_profiles: bool = True
-
     # CC Switch 细节
-    # 默认"不提示、直接改"：这和 v3 之前的实际行为一致（那时默认勾着"不再弹提醒"）
-    ccswitch_running_policy: str = CCSWITCH_POLICY_DIRECT
+    ccswitch_running_policy: str = CCSWITCH_POLICY_PROMPT
     # 「顺带刷新同站点旧卡片」会改动别的卡片，默认关（要的用户自己开）
     ccswitch_refresh_sibling_cards: bool = False
 
@@ -105,14 +110,6 @@ class AppSettings:
         data = {k: v for k, v in raw.items() if k in known}
         settings = cls(**data)
         migrated = False
-        if version < 2:
-            # v1 → v2：默认勾选「统一所有 profile 到 madmodel」。只迁一次，
-            # 之后再手动取消勾选就不会被打回。
-            settings.unify_all_profiles = True
-            migrated = True
-            logging.getLogger(__name__).info(
-                "设置已升级到 v%d：默认勾选「统一所有 profile 到 madmodel」", SETTINGS_VERSION
-            )
         if version < 3:
             # v2 → v3：默认开启自动同步，并默认不弹 CC Switch 运行中提醒。
             # 间隔默认值已在 dataclass 里改成 180；用户自己填过的分钟数保留，不覆盖。
@@ -134,6 +131,18 @@ class AppSettings:
                 "设置已升级到 v%d：CC Switch 运行策略合并为一个选项（当前：%s）",
                 SETTINGS_VERSION,
                 settings.ccswitch_running_policy,
+            )
+        if version < 5:
+            # v4 → v5：旧版的 180 分钟也是历史默认值。只把这个历史默认迁移到
+            # 新的 60 分钟；其它用户填过的间隔原样保留。
+            if settings.sync_interval_minutes == 180:
+                settings.sync_interval_minutes = DEFAULT_SYNC_INTERVAL_MINUTES
+            migrated = True
+            logging.getLogger(__name__).info(
+                "设置已升级到 v%d：默认间隔改为 %d 分钟（实际会随机浮动），"
+                "并移除“统一所有 profile”",
+                SETTINGS_VERSION,
+                DEFAULT_SYNC_INTERVAL_MINUTES,
             )
         if version < SETTINGS_VERSION:
             settings.settings_version = SETTINGS_VERSION
@@ -178,6 +187,7 @@ class AppSettings:
 
         self.default_model_id = (self.default_model_id or "").strip()
         self.dsh_dir = (self.dsh_dir or "").strip()
+        self.dsh_profile = (self.dsh_profile or "").strip()
         self.ccswitch_dir = (self.ccswitch_dir or "").strip()
 
 

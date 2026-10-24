@@ -191,11 +191,7 @@ def _check_profile(text: str) -> tuple[bool, str]:
             chosen = str(default_config.get("model") or "")
             supported = supported_by_model.get(chosen, set())
             effort = default_config.get("reasoningEffort")
-            if supported and effort is None:
-                problems.append(
-                    f"默认模型 {chosen} 没写思考档，DSH 会回落到 provider 的 reasoning"
-                )
-            elif supported and effort not in supported:
+            if supported and effort is not None and effort not in supported:
                 problems.append(
                     f"默认模型的思考档 {effort!r} 不被 {chosen} 支持（支持：{sorted(supported)}）"
                 )

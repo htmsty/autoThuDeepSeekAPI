@@ -11,7 +11,8 @@ import logging
 from pathlib import Path
 
 from . import paths
-from .backup import BackupEntry, BackupManager, is_original_label
+from .backup import BackupManager, is_original_label
+from .change_journal import ChangeJournal, restore_all
 from .settings import AppSettings
 
 logger = logging.getLogger(__name__)
@@ -112,18 +113,44 @@ def auto_backup_on_first_run(settings: AppSettings) -> int:
     return done
 
 
-def pending_restore(settings: AppSettings) -> dict[str, BackupEntry]:
-    """一提到"会还原哪些文件"就用它，界面可以先给用户看清楚。"""
-
-    manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
-    return manager.original_entries()
+def has_field_records() -> bool:
+    return bool(ChangeJournal().records())
 
 
-def restore_original(settings: AppSettings) -> list[str]:
-    """一键还原到每个文件最早的那份备份。"""
+def restore_original(
+    settings: AppSettings, *, allow_legacy_full_restore: bool = False
+) -> list[str]:
+    """Prefer field-level undo; legacy full-file restore is explicitly opt-in."""
 
-    manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
-    messages = manager.restore()
+    journal = ChangeJournal()
+    records = journal.records()
+    if records:
+        messages = restore_all(journal)
+        journal_sources = {
+            str(record.get("path") or "")
+            for record in records
+            if isinstance(record, dict)
+        }
+        manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
+        legacy_only = sorted(
+            source
+            for source in manager.original_entries()
+            if source not in journal_sources
+        )
+        if legacy_only:
+            messages.append(
+                "以下文件只有旧版整文件备份，本次未自动覆盖："
+                + "、".join(Path(source).name for source in legacy_only)
+            )
+        messages.append("字段级还原完成；用户后来修改过的冲突字段均已保留。")
+    elif allow_legacy_full_restore:
+        manager = BackupManager(paths.backups_dir(), keep=settings.backup_keep)
+        messages = manager.restore()
+        messages.insert(0, "没有字段级变更日志，已执行旧版整文件还原。")
+    else:
+        messages = [
+            "只有旧版整文件备份，没有字段级变更日志；为避免覆盖用户后来修改，本次未还原。"
+        ]
     logger.info("一键还原：%d 条结果", len(messages))
     return messages
 

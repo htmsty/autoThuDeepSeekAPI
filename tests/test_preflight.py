@@ -41,7 +41,7 @@ class PreflightTest(unittest.TestCase):
         self.settings = AppSettings(
             dsh_dir=str(self.sandbox.dsh_dir),
             ccswitch_dir=str(self.sandbox.ccswitch_dir),
-            unify_all_profiles=True,
+            enable_ccswitch_activate=True,
         )
         self.backup = BackupManager(self.sandbox.backups_dir, keep=5)
 

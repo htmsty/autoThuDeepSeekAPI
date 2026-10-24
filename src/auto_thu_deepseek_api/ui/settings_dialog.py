@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,11 +25,12 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import data_location, paths, startup, uninstall
+from .. import backup_ops, credentials, data_location, paths, startup, uninstall
 from ..backup import BackupManager
 from ..constants import DEFAULT_MODELS
 from ..settings import (
@@ -43,14 +45,24 @@ logger = logging.getLogger(__name__)
 
 
 class SettingsDialog(QDialog):
+    settings_applied = Signal()
+
     def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.settings = settings
+        # 使用草稿副本：取消时不能把已经点过的控件值写回主窗口。
+        self.settings = copy.deepcopy(settings)
         self.manual_token = ""
+        self._saved_username = ""
+        try:
+            stored = credentials.load_login()
+        except OSError as exc:
+            logger.warning("读取已保存登录用户名失败：%s", exc)
+            stored = None
+        if stored is not None:
+            self._saved_username = stored.username
         self.setWindowTitle("设置")
-        # 宽度要放得下最长的复选框文案，窄了右边会被截断；高度交给滚动区
-        self.setMinimumWidth(900)
-        self.resize(920, 760)
+        self.setMinimumSize(760, 620)
+        self.resize(820, 720)
 
         # 只有一个挂在对话框上的布局：滚动区 + 底部按钮。
         # 注意别再造第二个 QVBoxLayout(self)——后建的那个会把先挂的布局顶掉，
@@ -68,31 +80,85 @@ class SettingsDialog(QDialog):
         content_layout = QVBoxLayout(content)
         scroll.setWidget(content)
         self.outer.addWidget(scroll, 1)
-        layout = content_layout
+        tabs = QTabWidget()
+        self.tabs = tabs
+
+        sync_page = QWidget()
+        sync_layout = QVBoxLayout(sync_page)
+        targets_page = QWidget()
+        targets_layout = QVBoxLayout(targets_page)
+        security_page = QWidget()
+        security_layout = QVBoxLayout(security_page)
+        maintenance_page = QWidget()
+        maintenance_page_layout = QVBoxLayout(maintenance_page)
+        advanced_page = QWidget()
+        advanced_layout = QVBoxLayout(advanced_page)
+        tabs.addTab(sync_page, "同步")
+        tabs.addTab(targets_page, "写入目标")
+        tabs.addTab(security_page, "登录与安全")
+        tabs.addTab(maintenance_page, "备份与维护")
+        tabs.addTab(advanced_page, "高级")
+        content_layout.addWidget(tabs)
+
+        # —— 同步 ——
+        sync_box = QGroupBox("自动同步")
+        sync_form = QFormLayout(sync_box)
+        self.auto_sync_check = QCheckBox("启用自动同步")
+        self.auto_sync_check.setChecked(settings.auto_sync_enabled)
+        sync_form.addRow(self.auto_sync_check)
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 1440)
+        self.interval_spin.setSuffix(" 分钟")
+        self.interval_spin.setValue(settings.sync_interval_minutes)
+        self.interval_spin.setToolTip("实际会在基准值前后随机浮动 10 分钟")
+        sync_form.addRow("同步间隔", self.interval_spin)
+        self.sync_on_start_check = QCheckBox("启动时立即同步")
+        self.sync_on_start_check.setChecked(settings.sync_on_start)
+        sync_form.addRow(self.sync_on_start_check)
+        self.minimize_after_check = QCheckBox("同步完成后最小化到托盘")
+        self.minimize_after_check.setChecked(settings.minimize_after_sync)
+        sync_form.addRow(self.minimize_after_check)
+        sync_layout.addWidget(sync_box)
+        sync_layout.addStretch(1)
 
         # —— 目标 ——
         targets_box = QGroupBox("写入目标（检测到哪个写哪个，可分别关闭）")
         targets_form = QFormLayout(targets_box)
 
-        self.dsh_enabled = QCheckBox("启用 DSH 写入（凭据 + provider）")
+        self.dsh_enabled = QCheckBox("启用 DSH 写入")
         self.dsh_enabled.setChecked(settings.enable_dsh)
         targets_form.addRow(self.dsh_enabled)
+
+        self.dsh_credentials_check = QCheckBox("更新凭据 MADMODEL_API_KEY")
+        self.dsh_credentials_check.setChecked(settings.enable_dsh_credentials)
+        targets_form.addRow(self.dsh_credentials_check)
+
+        self.dsh_provider_check = QCheckBox("更新 llm-pi-ai Provider 与模型清单")
+        self.dsh_provider_check.setChecked(settings.enable_dsh_provider)
+        targets_form.addRow(self.dsh_provider_check)
 
         self.dsh_dir_edit = QLineEdit(settings.dsh_dir)
         self.dsh_dir_edit.setPlaceholderText(str(paths.default_dsh_dir()))
         targets_form.addRow("DSH 目录", self._path_row(self.dsh_dir_edit, self._browse_dsh))
 
-        self.unify_profiles = QCheckBox("统一所有 profile 到 madmodel（不勾选时只写已配置 madmodel 的 profile）")
-        self.unify_profiles.setChecked(settings.unify_all_profiles)
-        self.unify_profiles.setToolTip(
-            "勾选：所有 profile 都写，并把默认模型切到 madmodel / DeepSeek-V4.1-Flash。\n"
-            "不勾：只更新已配置 madmodel 的 profile，默认模型保持你在 DSH 里选的那个。"
-        )
-        targets_form.addRow(self.unify_profiles)
+        self.dsh_profile_edit = QLineEdit(settings.dsh_profile)
+        self.dsh_profile_edit.setPlaceholderText("留空自动选择；找不到时只创建到 desktop 或第一个 profile")
+        targets_form.addRow("受管 profile", self.dsh_profile_edit)
 
-        self.ccswitch_enabled = QCheckBox("启用 CC Switch 写入（供应商卡片 + 当前路由）")
+        self.ccswitch_enabled = QCheckBox("启用 CC Switch 写入")
         self.ccswitch_enabled.setChecked(settings.enable_ccswitch)
         targets_form.addRow(self.ccswitch_enabled)
+
+        self.ccswitch_card_check = QCheckBox("更新 DeepSeek (THU) 供应商卡片")
+        self.ccswitch_card_check.setChecked(settings.enable_ccswitch_card)
+        targets_form.addRow(self.ccswitch_card_check)
+
+        self.ccswitch_activate_check = QCheckBox("把 DeepSeek (THU) 设为当前供应商和代理路由")
+        self.ccswitch_activate_check.setChecked(settings.enable_ccswitch_activate)
+        self.ccswitch_activate_check.setToolTip(
+            "会改变 CC Switch 当前供应商，并清理其它卡片同一 app_type 的 is_current；默认关闭。"
+        )
+        targets_form.addRow(self.ccswitch_activate_check)
 
         self.ccswitch_dir_edit = QLineEdit(settings.ccswitch_dir)
         self.ccswitch_dir_edit.setPlaceholderText(str(paths.default_ccswitch_dir()))
@@ -106,7 +172,7 @@ class SettingsDialog(QDialog):
         )
         targets_form.addRow(self.refresh_siblings_check)
 
-        layout.addWidget(targets_box)
+        targets_layout.addWidget(targets_box)
 
         # —— CC Switch 运行中 ——
         policy_box = QGroupBox("CC Switch 正在运行时")
@@ -125,24 +191,76 @@ class SettingsDialog(QDialog):
             self.policy_prompt.setChecked(True)
         policy_layout.addWidget(self.policy_prompt)
         policy_layout.addWidget(self.policy_direct)
-        layout.addWidget(policy_box)
+        targets_layout.addWidget(policy_box)
+        targets_layout.addStretch(1)
+
+        # —— 登录与安全 ——
+        login_box = QGroupBox("自动登录（默认关闭）")
+        login_form = QFormLayout(login_box)
+        self.auto_login_check = QCheckBox("允许在清华域名下自动填充并提交登录信息")
+        self.auto_login_check.setChecked(settings.auto_login_enabled)
+        self.auto_login_check.setToolTip(
+            "遇到验证码、二次验证、页面结构变化时不会绕过，程序会暂停并打开登录窗口提醒你接手。"
+        )
+        login_form.addRow(self.auto_login_check)
+        self.login_username_edit = QLineEdit(self._saved_username)
+        self.login_username_edit.setPlaceholderText("学号或统一身份认证用户名")
+        login_form.addRow("用户名", self.login_username_edit)
+        self.login_password_edit = QLineEdit()
+        self.login_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.login_password_edit.setPlaceholderText(
+            "留空表示保留 Credential Manager 里已保存的密码"
+        )
+        login_form.addRow("密码", self.login_password_edit)
+        self.clear_login_button = QPushButton("删除已保存凭据")
+        self.clear_login_button.clicked.connect(self._clear_saved_login)
+        login_form.addRow(self.clear_login_button)
+        security_layout.addWidget(login_box)
+
+        verify_box = QGroupBox("Token 校验")
+        verify_layout = QVBoxLayout(verify_box)
+        self.chat_verify_check = QCheckBox("允许发送最小对话请求做兜底校验（可能消耗少量额度）")
+        self.chat_verify_check.setChecked(settings.chat_verification_enabled)
+        verify_layout.addWidget(self.chat_verify_check)
+        security_layout.addWidget(verify_box)
+        security_layout.addStretch(1)
 
         # —— 备份 ——
         backup_box = QGroupBox("备份与还原")
-        backup_layout = QHBoxLayout(backup_box)
+        backup_layout = QVBoxLayout(backup_box)
+        keep_row = QHBoxLayout()
         self.keep_spin = QSpinBox()
         self.keep_spin.setRange(1, 200)
         self.keep_spin.setValue(settings.backup_keep)
-        backup_layout.addWidget(QLabel("每个文件保留备份份数"))
-        backup_layout.addWidget(self.keep_spin)
-        backup_layout.addStretch(1)
+        keep_row.addWidget(QLabel("每个文件保留备份份数"))
+        keep_row.addWidget(self.keep_spin)
+        keep_row.addStretch(1)
+        backup_layout.addLayout(keep_row)
+        tool_row = QHBoxLayout()
+        self.manual_backup_button = QPushButton("立即备份")
+        self.manual_backup_button.clicked.connect(self._manual_backup)
+        self.preflight_button = QPushButton("校验写入内容")
+        self.preflight_button.clicked.connect(self._run_preflight)
+        self.log_button = QPushButton("打开日志")
+        self.log_button.clicked.connect(self._open_log)
         self.restore_button = QPushButton("还原到首次修改前")
         self.restore_button.clicked.connect(self._restore)
-        backup_layout.addWidget(self.restore_button)
+        for button in (
+            self.manual_backup_button,
+            self.preflight_button,
+            self.log_button,
+            self.restore_button,
+        ):
+            tool_row.addWidget(button)
+        tool_row.addStretch(1)
+        backup_layout.addLayout(tool_row)
         self.paste_button = QPushButton("手动粘贴 Token…")
         self.paste_button.clicked.connect(self._paste_token)
-        backup_layout.addWidget(self.paste_button)
-        layout.addWidget(backup_box)
+        token_row = QHBoxLayout()
+        token_row.addWidget(self.paste_button)
+        token_row.addStretch(1)
+        backup_layout.addLayout(token_row)
+        maintenance_page_layout.addWidget(backup_box)
 
         # —— 运行数据与维护 ——
         maintenance_box = QGroupBox("运行数据与维护")
@@ -178,11 +296,16 @@ class SettingsDialog(QDialog):
         maintain_row.addWidget(self.uninstall_button)
         maintain_row.addStretch(1)
         maintenance_layout.addLayout(maintain_row)
-        layout.addWidget(maintenance_box)
+        maintenance_page_layout.addWidget(maintenance_box)
+        maintenance_page_layout.addStretch(1)
 
         # —— 更多 ——
         more_box = QGroupBox("更多")
         more_form = QFormLayout(more_box)
+
+        self.startup_check = QCheckBox("开机启动（最小化到托盘）")
+        self.startup_check.setChecked(settings.launch_at_startup)
+        more_form.addRow(self.startup_check)
 
         self.preflight_check = QCheckBox("同步前先预检将要写入的内容（不通过就这次不写）")
         self.preflight_check.setChecked(settings.preflight_enabled)
@@ -209,7 +332,7 @@ class SettingsDialog(QDialog):
             self.default_model_combo.addItem(str(model["id"]))
         self.default_model_combo.setCurrentText(settings.default_model_id or str(DEFAULT_MODELS[0]["id"]))
         self.default_model_combo.setToolTip(
-            "勾选「统一所有 profile」时，DSH 的默认模型用哪个 id（要能在站点清单里找到；留空=用第一个）"
+            "自动创建 provider 时，默认模型优先用哪个 id（要能在站点清单里找到；留空=用第一个）"
         )
         more_form.addRow("DSH 默认模型", self.default_model_combo)
 
@@ -224,7 +347,17 @@ class SettingsDialog(QDialog):
         self.shortcut_button.clicked.connect(self._create_shortcut)
         more_form.addRow("快捷方式", self.shortcut_button)
 
-        layout.addWidget(more_box)
+        utility_row = QHBoxLayout()
+        self.data_dir_button = QPushButton("打开数据目录")
+        self.data_dir_button.clicked.connect(self._open_data_dir)
+        self.about_button = QPushButton("关于…")
+        self.about_button.clicked.connect(self._show_about)
+        utility_row.addWidget(self.data_dir_button)
+        utility_row.addWidget(self.about_button)
+        utility_row.addStretch(1)
+        more_form.addRow("工具", utility_row)
+
+        advanced_layout.addWidget(more_box)
 
         note = QLabel(
             f"运行数据目录：{paths.data_root()}\n"
@@ -232,12 +365,16 @@ class SettingsDialog(QDialog):
         )
         note.setWordWrap(True)
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(note)
+        advanced_layout.addWidget(note)
+        advanced_layout.addStretch(1)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Apply
+            | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.apply)
         buttons.rejected.connect(self.reject)
         # 按钮固定在窗口底部，不跟着内容一起滚
         self.outer.addWidget(buttons)
@@ -273,7 +410,7 @@ class SettingsDialog(QDialog):
             return current
         return str(fallback)
 
-    def accept(self) -> None:  # noqa: D102 - QDialog 约定
+    def _validate(self) -> bool:
         problems: list[str] = []
         for label, edit in (("DSH", self.dsh_dir_edit), ("CC Switch", self.ccswitch_dir_edit)):
             value = edit.text().strip()
@@ -287,28 +424,137 @@ class SettingsDialog(QDialog):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return
-        super().accept()
+                return False
+        return True
+
+    def _store_login_if_needed(self) -> bool:
+        if not self.auto_login_check.isChecked():
+            return True
+        username = self.login_username_edit.text().strip()
+        password = self.login_password_edit.text()
+        if not username:
+            QMessageBox.warning(self, "自动登录", "启用自动登录时必须填写用户名。")
+            return False
+        try:
+            existing = credentials.load_login()
+        except OSError as exc:
+            QMessageBox.warning(self, "自动登录", f"无法读取 Windows 凭据：{exc}")
+            return False
+        if not password and (
+            existing is None or existing.username.strip() != username
+        ):
+            QMessageBox.warning(
+                self,
+                "自动登录",
+                "没有找到这个用户名对应的已保存密码，请填写密码后再应用。",
+            )
+            return False
+        if password:
+            try:
+                credentials.save_login(username, password)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "自动登录", f"保存到 Windows Credential Manager 失败：{exc}")
+                return False
+            self.login_password_edit.clear()
+            self._saved_username = username
+        return True
+
+    def apply(self) -> bool:
+        """Apply without closing; returns False when validation failed."""
+
+        if not self._validate() or not self._store_login_if_needed():
+            return False
+        self.apply_to(self.settings)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "apply_settings_from_dialog"):
+            if not parent.apply_settings_from_dialog(self.settings):
+                return False
+        self.settings_applied.emit()
+        return True
+
+    def accept(self) -> None:  # noqa: D102 - QDialog 约定
+        if self.apply():
+            super().accept()
 
     # —— 动作 ——
+
+    def _clear_saved_login(self) -> None:
+        try:
+            deleted = credentials.delete_login()
+        except OSError as exc:
+            QMessageBox.warning(self, "自动登录", f"删除 Windows 凭据失败：{exc}")
+            return
+        self.login_password_edit.clear()
+        self._saved_username = ""
+        self.auto_login_check.setChecked(False)
+        QMessageBox.information(
+            self,
+            "自动登录",
+            "已删除保存的凭据。" if deleted else "Windows 凭据库里没有保存过登录信息。",
+        )
+
+    def _call_parent(self, method: str) -> bool:
+        parent = self.parent()
+        callback = getattr(parent, method, None) if parent is not None else None
+        if callback is None:
+            return False
+        callback()
+        return True
+
+    def _manual_backup(self) -> None:
+        self._call_parent("manual_backup")
+
+    def _run_preflight(self) -> None:
+        self._call_parent("check_preflight")
+
+    def _open_log(self) -> None:
+        self._call_parent("open_log")
+
+    def _open_data_dir(self) -> None:
+        self._call_parent("_open_data_dir")
+
+    def _show_about(self) -> None:
+        self._call_parent("show_about")
 
     def _restore(self) -> None:
         manager = BackupManager(paths.backups_dir(), keep=self.settings.backup_keep)
         entries = manager.original_entries()
-        if not entries:
+        field_records = backup_ops.has_field_records()
+        if not entries and not field_records:
             QMessageBox.information(self, "还原", "还没有任何备份，不需要还原。")
             return
-        detail = "\n".join(f"· {Path(source).name} ← {Path(entry.backup).name}" for source, entry in entries.items())
-        confirm = QMessageBox.question(
-            self,
-            "还原到首次修改前",
-            "将用最早的备份覆盖以下文件（当前状态会先被备份）：\n\n" + detail,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
+        allow_legacy = False
+        if not field_records:
+            detail = "\n".join(
+                f"· {Path(source).name} ← {Path(entry.backup).name}"
+                for source, entry in entries.items()
+            )
+            confirm = QMessageBox.warning(
+                self,
+                "旧版整文件还原",
+                "这次备份没有字段级变更日志，只能用旧版整文件覆盖：\n\n"
+                + detail
+                + "\n\n风险：程序写入后，你后来对同一文件做的其它修改也可能被覆盖。"
+                "\n当前状态会先再备份一份。确定执行高风险还原吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            allow_legacy = True
+        else:
+            confirm = QMessageBox.question(
+                self,
+                "按字段还原",
+                "将只撤销本程序管理、且当前值仍等于本程序最后写入值的字段。\n"
+                "你后来修改过的字段会保留，并在结果里报告冲突。继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
         try:
-            messages = manager.restore(entries)
+            messages = backup_ops.restore_original(
+                self.settings, allow_legacy_full_restore=allow_legacy
+            )
         except OSError as exc:
             logger.error("还原失败：%s", exc)
             QMessageBox.warning(self, "还原结果", f"还原失败：{exc}")
@@ -376,10 +622,14 @@ class SettingsDialog(QDialog):
             f"· 自动同步：{'开' if defaults.auto_sync_enabled else '关'}，"
             f"间隔 {defaults.sync_interval_minutes} 分钟，"
             f"启动时立即同步：{'开' if defaults.sync_on_start else '关'}\n"
-            f"· 统一所有 profile 到 madmodel："
-            f"{'勾选' if defaults.unify_all_profiles else '不勾选'}\n"
+            f"· 自动登录：{'开' if defaults.auto_login_enabled else '关'}；"
+            f"DSH 凭据 / Provider：{'开' if defaults.enable_dsh_credentials else '关'} / "
+            f"{'开' if defaults.enable_dsh_provider else '关'}\n"
+            "· CC Switch 卡片 / 当前路由："
+            f"{'开' if defaults.enable_ccswitch_card else '关'} / "
+            f"{'开' if defaults.enable_ccswitch_activate else '关'}\n"
             f"· 同步前预检：{'开' if defaults.preflight_enabled else '关'}；"
-            "CC Switch 运行中：不弹提醒、直接改\n"
+            "CC Switch 运行中：先提示\n"
             f"· 备份保留 {defaults.backup_keep} 份；静默取 Token 超时 "
             f"{defaults.silent_capture_timeout_seconds} 秒；日志级别 {defaults.log_level}；"
             f"关窗{'最小化到托盘' if defaults.close_to_tray else '直接退出'}\n\n"
@@ -388,31 +638,31 @@ class SettingsDialog(QDialog):
         ) != QMessageBox.StandardButton.Yes:
             return
 
-        settings = reset_to_defaults(self.settings)
-        try:
-            settings.save()
-        except OSError as exc:
-            logger.error("保存默认设置失败：%s", exc)
-            QMessageBox.warning(
-                self, "恢复默认设置", f"已在界面上恢复默认值，但写入磁盘失败：{exc}"
-            )
-        logger.info("设置已恢复为默认值")
-
+        reset_to_defaults(self.settings)
         self._reset_widgets_to_defaults()
-        parent = self.parent()
-        if parent is not None and hasattr(parent, "apply_settings_to_ui"):
-            parent.apply_settings_to_ui()
-        QMessageBox.information(self, "恢复默认设置", "已恢复默认设置。")
+        if not self.apply():
+            return
+        logger.info("设置已恢复为默认值")
+        QMessageBox.information(self, "恢复默认设置", "已恢复并应用默认设置。")
         self._offer_reset_private_dir()
 
     def _reset_widgets_to_defaults(self) -> None:
         """把对话框里的控件刷成当前 settings 的值（恢复默认后立刻能看到）。"""
 
         settings = self.settings
+        self.auto_sync_check.setChecked(settings.auto_sync_enabled)
+        self.interval_spin.setValue(settings.sync_interval_minutes)
+        self.sync_on_start_check.setChecked(settings.sync_on_start)
+        self.minimize_after_check.setChecked(settings.minimize_after_sync)
+        self.startup_check.setChecked(settings.launch_at_startup)
         self.dsh_enabled.setChecked(settings.enable_dsh)
+        self.dsh_credentials_check.setChecked(settings.enable_dsh_credentials)
+        self.dsh_provider_check.setChecked(settings.enable_dsh_provider)
+        self.dsh_profile_edit.setText(settings.dsh_profile)
         self.dsh_dir_edit.setText(settings.dsh_dir)
-        self.unify_profiles.setChecked(settings.unify_all_profiles)
         self.ccswitch_enabled.setChecked(settings.enable_ccswitch)
+        self.ccswitch_card_check.setChecked(settings.enable_ccswitch_card)
+        self.ccswitch_activate_check.setChecked(settings.enable_ccswitch_activate)
         self.ccswitch_dir_edit.setText(settings.ccswitch_dir)
         # 别忘了这个：漏掉它的话，"恢复默认设置"把配置改成 False，
         # 对话框里却还勾着，点确定时又会写回 True，等于没恢复。
@@ -422,6 +672,8 @@ class SettingsDialog(QDialog):
         else:
             self.policy_prompt.setChecked(True)
         self.keep_spin.setValue(settings.backup_keep)
+        self.auto_login_check.setChecked(settings.auto_login_enabled)
+        self.chat_verify_check.setChecked(settings.chat_verification_enabled)
         self.preflight_check.setChecked(settings.preflight_enabled)
         self.close_to_tray_check.setChecked(settings.close_to_tray)
         self.silent_timeout_spin.setValue(settings.silent_capture_timeout_seconds)
@@ -543,16 +795,27 @@ class SettingsDialog(QDialog):
     # —— 结果 ——
 
     def apply_to(self, settings: AppSettings) -> None:
+        settings.sync_interval_minutes = self.interval_spin.value()
+        settings.auto_sync_enabled = self.auto_sync_check.isChecked()
+        settings.sync_on_start = self.sync_on_start_check.isChecked()
+        settings.minimize_after_sync = self.minimize_after_check.isChecked()
+        settings.launch_at_startup = self.startup_check.isChecked()
         settings.enable_dsh = self.dsh_enabled.isChecked()
+        settings.enable_dsh_credentials = self.dsh_credentials_check.isChecked()
+        settings.enable_dsh_provider = self.dsh_provider_check.isChecked()
+        settings.dsh_profile = self.dsh_profile_edit.text().strip()
         settings.enable_ccswitch = self.ccswitch_enabled.isChecked()
+        settings.enable_ccswitch_card = self.ccswitch_card_check.isChecked()
+        settings.enable_ccswitch_activate = self.ccswitch_activate_check.isChecked()
         settings.dsh_dir = self.dsh_dir_edit.text().strip()
         settings.ccswitch_dir = self.ccswitch_dir_edit.text().strip()
-        settings.unify_all_profiles = self.unify_profiles.isChecked()
         settings.ccswitch_refresh_sibling_cards = self.refresh_siblings_check.isChecked()
         settings.ccswitch_running_policy = (
             CCSWITCH_POLICY_DIRECT if self.policy_direct.isChecked() else CCSWITCH_POLICY_PROMPT
         )
         settings.backup_keep = self.keep_spin.value()
+        settings.auto_login_enabled = self.auto_login_check.isChecked()
+        settings.chat_verification_enabled = self.chat_verify_check.isChecked()
         settings.preflight_enabled = self.preflight_check.isChecked()
         settings.close_to_tray = self.close_to_tray_check.isChecked()
         settings.silent_capture_timeout_seconds = self.silent_timeout_spin.value()

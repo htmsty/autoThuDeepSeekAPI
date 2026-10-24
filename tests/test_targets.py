@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from auto_thu_deepseek_api import crypto  # noqa: E402
 from auto_thu_deepseek_api.backup import BackupManager  # noqa: E402
 from auto_thu_deepseek_api.paths import TargetPaths  # noqa: E402
 from auto_thu_deepseek_api.targets.ccswitch import CcSwitchTarget  # noqa: E402
@@ -149,20 +150,22 @@ refs:
             "坏文件要先留底",
         )
 
-    def test_unify_writes_every_profile(self) -> None:
+    def test_managed_profile_is_updated_without_copying_to_other_profiles(self) -> None:
         target = DshTarget(
             TargetPaths(
                 base_dir=self.sandbox.dsh_dir,
                 credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
                 profiles_dir=self.sandbox.dsh_dir / "profiles",
             ),
-            unify_all_profiles=True,
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
         web = (self.sandbox.dsh_dir / "profiles" / "web" / "cordis.patch.yml").read_text(encoding="utf-8")
-        self.assertIn("madmodel", web)
-        self.assertIn("provider: madmodel", web)
+        self.assertNotIn("madmodel", web)
+        desktop = (
+            self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("madmodel", desktop)
 
     def test_unify_points_default_model_at_our_own_provider(self) -> None:
         """统一模式只把默认模型指向**我们自己的** provider；别人的本地转发一个字节都不动。"""
@@ -193,7 +196,6 @@ refs:
                 credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
                 profiles_dir=self.sandbox.dsh_dir / "profiles",
             ),
-            unify_all_profiles=True,
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
@@ -382,11 +384,9 @@ refs:
         self.assertIn(provider.get("reasoning"), common, "provider 级 reasoning 必须所有模型都支持")
 
         config = entries["agent-default-model"]["config"]
-        chosen = next(model for model in provider["models"] if model["id"] == config["model"])
-        self.assertIn(
+        self.assertIsNone(
             config.get("reasoningEffort"),
-            {str(level) for level in chosen["reasoningEfforts"].keys()},
-            "默认模型必须显式写一个它支持的思考档",
+            "用户原本没写默认思考档时，同步不能替他新增",
         )
 
     def test_dsh_keeps_valid_user_reasoning(self) -> None:
@@ -529,7 +529,7 @@ refs:
                 credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
                 profiles_dir=self.sandbox.dsh_dir / "profiles",
             ),
-            unify_all_profiles=True,
+            profile="web",
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
@@ -569,11 +569,11 @@ refs:
         self.assertIn("本目标不做网络校验", note)
         self.assertIn("指纹", note)
 
-    def test_dsh_leaves_ambiguous_local_forward_alone(self) -> None:
-        """键名不是 madmodel、地址也不是清华站的本地转发：哪怕带着我们的 apiKeyEnv 也不认领。
+    def test_dsh_creates_next_to_ambiguous_local_forward_without_claiming_it(self) -> None:
+        """本地转发不能被认领；没有受管 profile 时只新建一份 madmodel。
 
         旧版本就是凭这个标记把它误认成自己的（`isearcher` / `ollama` 那种悲剧）；
-        现在只提醒、不动手，文件一个字节都不改。
+        现在会新建独立 provider，但 thu-local 的原文一个字节都不改。
         """
 
         profile = self.sandbox.dsh_dir / "profiles" / "desktop" / "cordis.patch.yml"
@@ -608,11 +608,20 @@ refs:
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
-        # 不勾统一时，这种 profile 不在范围内（正文里既没有清华域名，也没有 madmodel: 键）
-        self.assertTrue(
-            any("没有 profile 已配置 madmodel" in note for note in result.messages), result.messages
+        after = profile.read_text(encoding="utf-8")
+        self.assertIn("madmodel:", after)
+        self.assertIn(
+            """      thu-local:
+        displayName: 我的中转
+        apiKeyEnv: MADMODEL_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/v1
+        models:
+          - id: old-model
+            name: 老模型""",
+            after,
+            "别人的 provider 原文不能被改",
         )
-        self.assertEqual(profile.read_text(encoding="utf-8"), original, "文件应当原封不动")
 
     def test_dsh_only_warns_about_provider_leftover_from_old_versions(self) -> None:
         """被旧版本误写过标记的别人的 provider（isearcher 那种）：只提醒，绝不改它。"""
@@ -701,6 +710,7 @@ refs:
                 live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
             ),
             refresh_sibling_cards=True,  # 这个开关默认是关的；这里专门测"打开后会刷新旧卡片"
+            activate=True,
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
@@ -760,7 +770,8 @@ refs:
                 db_file=self.sandbox.ccswitch_dir / "cc-switch.db",
                 settings_file=settings_path,
                 live_state_file=self.sandbox.ccswitch_dir / "live-state.json",
-            )
+            ),
+            activate=True,
         )
         result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
@@ -801,13 +812,90 @@ refs:
             FAKE_OLD_TOKEN,
             "默认不该动同站点旧卡片的令牌（那是别人的卡片）",
         )
-        # 我们自己那张卡片照常更新
         connection = sqlite3.connect(db)
         mine = connection.execute(
             "SELECT settings_config FROM providers WHERE id='deepseek-thu' AND app_type='codex'"
         ).fetchone()
         connection.close()
         self.assertEqual(json.loads(mine[0])["auth"]["OPENAI_API_KEY"], FAKE_NEW_TOKEN)
+
+    def test_ccswitch_card_update_does_not_activate_or_rewrite_routes(self) -> None:
+        settings_path = self.sandbox.ccswitch_dir / "settings.json"
+        live_path = self.sandbox.ccswitch_dir / "live-state.json"
+        before_settings = settings_path.read_bytes()
+        before_live = live_path.read_bytes()
+        db_path = self.sandbox.ccswitch_dir / "cc-switch.db"
+        connection = sqlite3.connect(db_path)
+        current_before = connection.execute(
+            "SELECT id, is_current FROM providers WHERE app_type='codex' AND is_current=1"
+        ).fetchall()
+        connection.close()
+        target = CcSwitchTarget(
+            TargetPaths(
+                base_dir=self.sandbox.ccswitch_dir,
+                db_file=db_path,
+                settings_file=settings_path,
+                live_state_file=live_path,
+            )
+        )
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(settings_path.read_bytes(), before_settings)
+        self.assertEqual(live_path.read_bytes(), before_live)
+
+        connection = sqlite3.connect(db_path)
+        current = connection.execute(
+            "SELECT id, is_current FROM providers WHERE app_type='codex' AND is_current=1"
+        ).fetchall()
+        connection.close()
+        self.assertEqual(current, current_before)
+
+    def test_ccswitch_route_failure_rolls_back_database_and_settings(self) -> None:
+        db = self.sandbox.ccswitch_dir / "cc-switch.db"
+        settings_path = self.sandbox.ccswitch_dir / "settings.json"
+        live_path = self.sandbox.ccswitch_dir / "live-state.json"
+        before_settings = settings_path.read_bytes()
+        connection = sqlite3.connect(db)
+        before_token = json.loads(
+            connection.execute(
+                "SELECT settings_config FROM providers WHERE id='deepseek-thu'"
+            ).fetchone()[0]
+        )["auth"]["OPENAI_API_KEY"]
+        before_current = connection.execute(
+            "SELECT id FROM providers WHERE app_type='codex' AND is_current=1"
+        ).fetchall()
+        connection.close()
+        target = CcSwitchTarget(
+            TargetPaths(
+                base_dir=self.sandbox.ccswitch_dir,
+                db_file=db,
+                settings_file=settings_path,
+                live_state_file=live_path,
+            ),
+            activate=True,
+        )
+        original_write_json = target._write_json
+
+        def fail_live(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if path == live_path:
+                raise OSError("模拟 live-state 写入失败")
+            return original_write_json(path, *args, **kwargs)
+
+        target._write_json = fail_live  # type: ignore[assignment]
+        result = target.apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        self.assertFalse(result.ok)
+        self.assertEqual(settings_path.read_bytes(), before_settings)
+
+        connection = sqlite3.connect(db)
+        token = connection.execute(
+            "SELECT settings_config FROM providers WHERE id='deepseek-thu'"
+        ).fetchone()[0]
+        current = connection.execute(
+            "SELECT id FROM providers WHERE app_type='codex' AND is_current=1"
+        ).fetchall()
+        connection.close()
+        self.assertEqual(json.loads(token)["auth"]["OPENAI_API_KEY"], before_token)
+        self.assertEqual(current, before_current)
 
     def test_ccswitch_only_refreshes_token_fields_in_old_cards(self) -> None:
         """刷新同站点旧卡片时只换 Token 字段，卡片里别的模型的 key 一个字都不动。"""
@@ -1001,13 +1089,13 @@ refs:
         return profile
 
     def _dsh_target(self, *, unify: bool = False) -> DshTarget:
+        _ = unify
         return DshTarget(
             TargetPaths(
                 base_dir=self.sandbox.dsh_dir,
                 credentials_file=self.sandbox.dsh_dir / ".credentials.yaml",
                 profiles_dir=self.sandbox.dsh_dir / "profiles",
             ),
-            unify_all_profiles=unify,
         )
 
     @staticmethod
@@ -1086,8 +1174,8 @@ refs:
         # 我们自己的那段该更新就更新
         self.assertIn("qwen3.8-27b", after)
 
-        # 再跑一次统一模式：会新建/改写 agent-default-model，但别人那段原文仍然不许动
-        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        # 再跑一次：已存在的 provider 只更新自己的字段，不额外替他创建默认模型条目
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
         after_unify = profile.read_text(encoding="utf-8")
         self.assertEqual(
@@ -1095,10 +1183,10 @@ refs:
             foreign_block(before),
             "统一模式下别人的 provider 原文被改写了",
         )
-        self.assertIn("agent-default-model", after_unify)
+        self.assertNotIn("agent-default-model", after_unify)
 
-    def test_dsh_does_not_claim_other_local_provider(self) -> None:
-        """只有 ollama（127.0.0.1）而没有我们的 provider 时，绝不能认领 ollama。"""
+    def test_dsh_creates_own_provider_without_claiming_ollama(self) -> None:
+        """只有 ollama 时新建独立 madmodel，但绝不认领或改写 ollama。"""
 
         profile = self._write_profile(
             """- id: llm-pi-ai
@@ -1124,31 +1212,7 @@ refs:
         after = self._parse_entries(profile)
         providers = after["llm-pi-ai"]["config"]["providers"]
         self.assertEqual(providers["ollama"], before_ollama, "别人的本地 provider 被改动了")
-        # 没勾"统一所有 profile"时，这种"本来没有 madmodel"的 profile 直接跳过
-        self.assertNotIn("madmodel", providers, "不勾统一时不该往别人的 profile 里塞 provider")
-
-        # 勾上"统一所有 profile"时才会新建我们自己的 provider —— 但 ollama 仍然一个字节都不动
-        profile.write_text(
-            """- id: llm-pi-ai
-  name: "@deepseek-ai/dsh-llm-pi-ai"
-  config:
-    providers:
-      ollama:
-        displayName: Ollama
-        apiKeyEnv: OLLAMA_API_KEY
-        api: openai-completions
-        baseURL: http://127.0.0.1:11434/v1
-        models:
-          - id: deepseek-r1:1.5b
-            name: deepseek-r1:1.5b
-""",
-            encoding="utf-8",
-        )
-        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
-        self.assertTrue(result.ok, result.errors)
-        providers = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]
-        self.assertEqual(providers["ollama"], before_ollama, "统一模式也不许动别人的 provider")
-        self.assertIn("madmodel", providers, "统一模式应当新建我们自己的 provider")
+        self.assertIn("madmodel", providers, "没有受管 provider 时应自动新建一份")
         self.assertEqual(providers["madmodel"]["apiKeyEnv"], "MADMODEL_API_KEY")
         self.assertEqual(providers["madmodel"]["baseURL"], "https://madmodel.cs.tsinghua.edu.cn/v1")
 
@@ -1176,12 +1240,8 @@ refs:
 
     # —— 备份与还原 ——
 
-    def test_claimed_provider_with_wrong_base_url_is_fixed(self) -> None:
-        """只有一条 tsinghua provider、地址写成 .../v1/chat/completions 时：
-        认领它（域名就是清华站点）并把地址纠正回 /v1 —— 否则模型发现必然 404。
-
-        这是真机上出现过的写法：把对话接口地址当成了 API 根地址。
-        """
+    def test_non_madmodel_provider_with_wrong_url_is_not_claimed(self) -> None:
+        """非 madmodel 键只提醒、绝不动；需要时另建一份 madmodel。"""
 
         text = """- id: llm-pi-ai
   name: "@deepseek-ai/dsh-llm-pi-ai"
@@ -1196,19 +1256,19 @@ refs:
             name: "1"
 """
         profile = self._write_profile(text)
-        result = self._dsh_target(unify=True).apply(FAKE_NEW_TOKEN, MODELS, self.backup)
+        result = self._dsh_target().apply(FAKE_NEW_TOKEN, MODELS, self.backup)
         self.assertTrue(result.ok, result.errors)
 
         providers = self._parse_entries(profile)["llm-pi-ai"]["config"]["providers"]
         self.assertIn("tsinghua", providers)
         self.assertEqual(
             providers["tsinghua"]["baseURL"],
-            "https://madmodel.cs.tsinghua.edu.cn/v1",
-            "坏地址应当被纠正成标准根地址",
+            "https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions",
+            "不是 madmodel 的 provider 必须保持原样",
         )
-        self.assertEqual(providers["tsinghua"]["apiKeyEnv"], "MADMODEL_API_KEY")
-        model_ids = [model["id"] for model in providers["tsinghua"]["models"]]
-        self.assertIn("DeepSeek-V4.1-Flash", model_ids, "模型列表应当被换成站点清单")
+        self.assertNotIn("apiKeyEnv", providers["tsinghua"])
+        self.assertIn("madmodel", providers)
+        self.assertEqual(providers["madmodel"]["baseURL"], "https://madmodel.cs.tsinghua.edu.cn/v1")
 
     def test_foreign_provider_with_wrong_base_url_is_warned_not_touched(self) -> None:
         """madmodel 已经在场时，旁边那条地址写歪的 tsinghua 一个字节都不许动，
@@ -1373,8 +1433,8 @@ refs:
         self.assertEqual(len(entries), 5, "原始备份 1 份 + 普通备份 keep-1 份")
         oldest = min(entries, key=lambda item: Path(item.backup).parent.name)
         self.assertEqual(
-            Path(oldest.backup).read_text(encoding="utf-8"),
-            credentials.read_text(encoding="utf-8"),
+            crypto.unprotect_bytes(Path(oldest.backup).read_bytes()).decode("utf-8"),
+            credentials.read_bytes().decode("utf-8"),
             "最早那份必须始终保留",
         )
 
@@ -1382,7 +1442,7 @@ refs:
         """首份（original）备份是"第一次修改前"的状态，备份再多也不能被清掉。"""
 
         credentials = self.sandbox.dsh_dir / ".credentials.yaml"
-        original_text = credentials.read_text(encoding="utf-8")
+        original_text = credentials.read_bytes().decode("utf-8")
         first = self.backup.backup_file(credentials, "original-first-run")
         self.assertIsNotNone(first)
         for _ in range(10):
@@ -1392,12 +1452,15 @@ refs:
         entries = self.backup.entries()
         originals = [entry for entry in entries if entry.is_original]
         self.assertEqual(len(originals), 1, entries)
-        self.assertEqual(Path(originals[0].backup).read_text(encoding="utf-8"), original_text)
+        self.assertEqual(
+            crypto.unprotect_bytes(Path(originals[0].backup).read_bytes()).decode("utf-8"),
+            original_text,
+        )
 
         # 一键还原必须回到最初那份，而不是最近一份
         messages = BackupManager(self.sandbox.backups_dir, keep=5).restore()
         self.assertTrue(any("credentials" in message for message in messages), messages)
-        self.assertEqual(credentials.read_text(encoding="utf-8"), original_text)
+        self.assertEqual(credentials.read_bytes().decode("utf-8"), original_text)
 
 
 if __name__ == "__main__":

@@ -10,8 +10,9 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-from .. import constants
+from .. import constants, paths as app_paths
 from ..backup import BackupManager
+from ..change_journal import ChangeJournal
 from ..paths import TargetPaths
 from ..token.jwt_utils import looks_like_jwt
 from .base import ApplyResult, RenderedFile, TargetStatus, emit, write_with_rollback
@@ -45,17 +46,37 @@ def _load_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _plain(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 class CcSwitchTarget:
     key = "ccswitch"
     label = "CC Switch"
 
-    def __init__(self, paths: TargetPaths, *, refresh_sibling_cards: bool = False) -> None:
+    def __init__(
+        self,
+        paths: TargetPaths,
+        *,
+        enable_card: bool = True,
+        activate: bool = False,
+        refresh_sibling_cards: bool = False,
+    ) -> None:
         self.paths = paths
+        self.enable_card = bool(enable_card)
+        self.activate = bool(activate)
         # 刷新"同站点旧卡片"会改动别的卡片，默认关（要的用户在设置里显式打开）
         self.refresh_sibling_cards = bool(refresh_sibling_cards)
         # 干跑：只渲染将要写入的内容，不备份、不写库（预检用）
         self.dry_run = False
         self.rendered: list[RenderedFile] = []
+        self._journal_records: list[Path] = []
 
     def _write_json(
         self,
@@ -340,28 +361,47 @@ class CcSwitchTarget:
 
     def apply(self, token: str, models: list[dict], backup: BackupManager) -> ApplyResult:
         result = ApplyResult(self.key, self.label)
+        self._journal_records.clear()
         db = self.paths.db_file
         if not db or not db.exists():
             result.note(f"未找到数据库，跳过：{db}")
             return result
+        if not self.enable_card and not self.activate:
+            result.note("供应商卡片和当前路由都已在设置中关闭")
+            return result
 
-        try:
-            self._write_database(db, token, models, backup, result)
-        except sqlite3.OperationalError as exc:
-            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
-                result.fail("数据库被占用：请先完全退出 CC Switch 再重试（或把策略改为「直接改」）")
-            else:
+        if self.enable_card or self.activate:
+            try:
+                self._write_database(db, token, models, backup, result)
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    result.fail("数据库被占用：请先完全退出 CC Switch 再重试（或把策略改为「直接改」）")
+                else:
+                    result.fail(f"数据库写入失败：{exc}")
+                return result
+            except Exception as exc:  # noqa: BLE001
                 result.fail(f"数据库写入失败：{exc}")
-            return result
-        except Exception as exc:  # noqa: BLE001
-            result.fail(f"数据库写入失败：{exc}")
-            return result
+                return result
 
-        try:
-            self._write_routing(backup, result)
-        except Exception as exc:  # noqa: BLE001
-            result.fail(f"当前路由写入失败：{exc}")
+        if self.activate:
+            try:
+                self._write_routing(backup, result)
+            except Exception as exc:  # noqa: BLE001
+                self._rollback_current_operation()
+                result.fail(f"当前路由写入失败：{exc}")
+        else:
+            result.note("当前路由激活已关闭，未改 settings.json / live-state.json")
         return result
+
+    def _rollback_current_operation(self) -> None:
+        for record_path in reversed(self._journal_records):
+            record = ChangeJournal.read(record_path)
+            if record is not None:
+                try:
+                    restore_journal_record(record)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("CC Switch 跨文件回滚失败：%s", exc)
+        self._journal_records.clear()
 
     # —— 数据库 ——
 
@@ -389,41 +429,54 @@ class CcSwitchTarget:
             # 先把"要写什么"算清楚，确实有变化再去备份和写库：
             # CC Switch 运行中时，能不碰它的数据库就不碰。
             if row is None:
+                if not self.enable_card:
+                    result.fail("要激活的 DeepSeek (THU) 卡片不存在")
+                    return
                 settings_config = self._new_settings_config(token, models)
                 meta = self._new_meta()
                 card_needs_write = True
+                is_current = 0
             else:
                 raw_settings, raw_meta, name, is_current = row
                 settings_config = self._json_object(raw_settings)
                 meta = self._json_object(raw_meta)
-                changed = self._update_settings_config(settings_config, token, models)
-                changed = self._update_meta(meta) or changed
-                if name != constants.PROVIDER_DISPLAY_NAME:
-                    changed = True
-                if has_current and is_current != 1:
-                    changed = True
-                card_needs_write = changed
+                if self.enable_card:
+                    changed_settings = self._update_settings_config(settings_config, token, models)
+                    changed_meta = self._update_meta(meta)
+                    card_needs_write = (
+                        changed_settings
+                        or changed_meta
+                        or name != constants.PROVIDER_DISPLAY_NAME
+                    )
+                else:
+                    card_needs_write = False
 
-            current_fix = bool(has_current and self._other_current_cards(connection))
-            refresh_targets = self._refresh_targets(connection, token)
+            other_current = self._other_current_cards(connection) if has_current else []
+            activation_needs_write = bool(
+                self.activate
+                and has_current
+                and (row is None or is_current != 1 or other_current)
+            )
+            refresh_targets = self._refresh_targets(connection, token) if self.enable_card else []
 
             if self.dry_run:
-                # 预检：只把"将要写进卡片的内容"渲染出来，别碰数据库
-                payload = json.dumps(
-                    {
-                        "name": constants.PROVIDER_DISPLAY_NAME,
-                        "settings_config": settings_config,
-                        "meta": meta,
-                        "is_current": bool(has_current),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                emit(self, db, payload, "ccswitch-card", "sqlite-json")
-                result.note("（预检）已渲染 CC Switch 卡片内容（未写库）")
+                if self.enable_card:
+                    payload = json.dumps(
+                        {
+                            "name": constants.PROVIDER_DISPLAY_NAME,
+                            "settings_config": settings_config,
+                            "meta": meta,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    emit(self, db, payload, "ccswitch-card", "sqlite-json")
+                    result.note("（预检）已渲染 CC Switch 卡片内容（未写库）")
+                if self.activate:
+                    result.note("（预检）将在写库时激活 DeepSeek (THU)（未写库）")
                 return
 
-            if not card_needs_write and not current_fix and not refresh_targets:
+            if not card_needs_write and not activation_needs_write and not refresh_targets:
                 result.note("卡片已是最新，未改动 CC Switch 数据库")
                 return
 
@@ -436,28 +489,74 @@ class CcSwitchTarget:
                     (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
                 ).fetchone()
                 insert_mode = fresh is None
+                before_exists = fresh is not None
+                if fresh is not None:
+                    raw_before_settings, raw_before_meta, before_name, before_is_current = fresh
+                    before_settings = self._json_object(raw_before_settings)
+                    before_meta = self._json_object(raw_before_meta)
+                else:
+                    before_settings = {}
+                    before_meta = {}
+                    before_name = ""
+                    before_is_current = False
                 if insert_mode:
+                    if not self.enable_card:
+                        raise RuntimeError("DeepSeek (THU) 卡片在加锁后消失")
+                    settings_config = self._new_settings_config(token, models)
+                    meta = self._new_meta()
                     card_needs_write = True
+                    is_current = 0
                 else:
                     raw_settings, raw_meta, name, is_current = fresh
                     settings_config = self._json_object(raw_settings)
                     meta = self._json_object(raw_meta)
                     # 注意：这里必须分开调用，不能写成 a() or b() ——
                     # 短路会让 b() 根本不执行，meta（apiFormat）就会一直漏写。
-                    changed_settings = self._update_settings_config(settings_config, token, models)
-                    changed_meta = self._update_meta(meta)
-                    card_needs_write = (
-                        changed_settings
-                        or changed_meta
-                        or name != constants.PROVIDER_DISPLAY_NAME
-                        or (has_current and is_current != 1)
-                    )
-                current_fix = bool(has_current and self._other_current_cards(connection))
-                refresh_targets = self._refresh_targets(connection, token)
-                if not card_needs_write and not current_fix and not refresh_targets:
+                    if self.enable_card:
+                        changed_settings = self._update_settings_config(settings_config, token, models)
+                        changed_meta = self._update_meta(meta)
+                        card_needs_write = (
+                            changed_settings
+                            or changed_meta
+                            or name != constants.PROVIDER_DISPLAY_NAME
+                        )
+                    else:
+                        card_needs_write = False
+                other_current = self._other_current_cards(connection) if has_current else []
+                activation_needs_write = bool(
+                    self.activate
+                    and has_current
+                    and (insert_mode or is_current != 1 or other_current)
+                )
+                refresh_targets = self._refresh_targets(connection, token) if self.enable_card else []
+                if not card_needs_write and not activation_needs_write and not refresh_targets:
                     connection.rollback()
                     result.note("加锁后发现已经是最新，未改动 CC Switch 数据库")
                     return
+
+                current_state_before = []
+                sibling_changes: list[dict] = []
+                if has_current:
+                    current_state_before = [
+                        {"id": str(item[0]), "current": bool(item[1])}
+                        for item in connection.execute(
+                            "SELECT id, is_current FROM providers WHERE app_type = ?",
+                            (constants.CCSWITCH_APP_TYPE,),
+                        ).fetchall()
+                    ]
+                for payload, provider_id, app_type in refresh_targets:
+                    old_row = connection.execute(
+                        "SELECT settings_config FROM providers WHERE id = ? AND app_type = ?",
+                        (provider_id, app_type),
+                    ).fetchone()
+                    sibling_changes.append(
+                        {
+                            "id": str(provider_id),
+                            "app_type": str(app_type),
+                            "before": self._json_object(old_row[0]) if old_row else {},
+                            "after": self._json_object(payload),
+                        }
+                    )
 
                 if insert_mode:
                     insert_columns = [
@@ -483,9 +582,9 @@ class CcSwitchTarget:
                     ]
                     placeholders = ["?", "?", "?", "?", "?", "?", "strftime('%s','now')*1000", "?", "?"]
                     if has_current:
-                        # 旧版 CC Switch 没有 is_current 这一列，有才写
                         insert_columns.append("is_current")
-                        placeholders.append("1")
+                        placeholders.append("?")
+                        insert_values.append(1 if self.activate else 0)
                     connection.execute(
                         f"INSERT INTO providers ({', '.join(insert_columns)})"
                         f" VALUES ({', '.join(placeholders)})",
@@ -499,15 +598,17 @@ class CcSwitchTarget:
                         json.dumps(meta, ensure_ascii=False),
                         constants.PROVIDER_DISPLAY_NAME,
                     ]
-                    if has_current:
-                        assignments.append("is_current = 1")
                     connection.execute(
                         f"UPDATE providers SET {', '.join(assignments)} WHERE id = ? AND app_type = ?",
                         (*values, constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
                     )
                     result.note("已更新供应商卡片 DeepSeek (THU)")
 
-                if current_fix:
+                if activation_needs_write and has_current:
+                    connection.execute(
+                        "UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = ?",
+                        (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
+                    )
                     connection.execute(
                         "UPDATE providers SET is_current = 0 WHERE app_type = ? AND id <> ?",
                         (constants.CCSWITCH_APP_TYPE, constants.CCSWITCH_PROVIDER_ID),
@@ -528,15 +629,16 @@ class CcSwitchTarget:
                 ).fetchone()
                 if check is None:
                     raise RuntimeError("写入后读不到 DeepSeek (THU) 卡片")
-                check_settings = self._json_object(check[0])
-                check_auth = check_settings.get("auth")
-                check_key = (
-                    check_auth.get("OPENAI_API_KEY") if isinstance(check_auth, dict) else None
-                )
-                if check_key != token:
-                    raise RuntimeError("写入后卡片里的 Token 与预期不一致，已回滚")
-                if self._json_object(check[1]).get("apiFormat") != constants.CCSWITCH_API_FORMAT:
-                    raise RuntimeError("写入后卡片的 apiFormat 与预期不一致，已回滚")
+                if self.enable_card:
+                    check_settings = self._json_object(check[0])
+                    check_auth = check_settings.get("auth")
+                    check_key = (
+                        check_auth.get("OPENAI_API_KEY") if isinstance(check_auth, dict) else None
+                    )
+                    if check_key != token:
+                        raise RuntimeError("写入后卡片里的 Token 与预期不一致，已回滚")
+                    if self._json_object(check[1]).get("apiFormat") != constants.CCSWITCH_API_FORMAT:
+                        raise RuntimeError("写入后卡片的 apiFormat 与预期不一致，已回滚")
 
                 connection.commit()
             except Exception:
@@ -544,6 +646,36 @@ class CcSwitchTarget:
                 raise
 
             result.changed = True
+            current_state_after = current_state_before
+            after_current = self.activate
+            if has_current:
+                current_state_after = [
+                    {"id": str(item[0]), "current": bool(item[1])}
+                    for item in connection.execute(
+                        "SELECT id, is_current FROM providers WHERE app_type = ?",
+                        (constants.CCSWITCH_APP_TYPE,),
+                    ).fetchall()
+                ]
+            journal_path = ChangeJournal.for_backup(backup).record(
+                "ccswitch_card",
+                path=str(db),
+                before_exists=before_exists,
+                before_settings=_plain(before_settings),
+                before_meta=_plain(before_meta),
+                before_name=before_name,
+                before_is_current=bool(before_is_current),
+                after_settings=_plain(settings_config),
+                after_meta=_plain(meta),
+                after_name=constants.PROVIDER_DISPLAY_NAME,
+                after_is_current=after_current,
+                current_state_before=current_state_before,
+                current_state_after=current_state_after,
+                activation_changed=activation_needs_write,
+                card_changed=card_needs_write,
+                sibling_changes=sibling_changes,
+            )
+            if journal_path is not None:
+                self._journal_records.append(journal_path)
             if refresh_targets:
                 result.note(f"已刷新 {len(refresh_targets)} 张同站点旧卡片的令牌")
         finally:
@@ -724,6 +856,7 @@ class CcSwitchTarget:
             data = _load_json(settings_path)
             key = f"currentProvider{constants.CCSWITCH_APP_TYPE.capitalize()}"
             previous = data.get(key)
+            previous_present = key in data
             if previous != constants.CCSWITCH_PROVIDER_ID:
                 data[key] = constants.CCSWITCH_PROVIDER_ID
                 if self._write_json(
@@ -736,6 +869,16 @@ class CcSwitchTarget:
                 ):
                     result.changed = True
                     result.note(f"已把 settings.json 的 {key} 指向 DeepSeek (THU)")
+                    journal_path = ChangeJournal.for_backup(backup).record(
+                        "ccswitch_routing",
+                        path=str(settings_path),
+                        json_path=[key],
+                        before_present=previous_present,
+                        before_value=previous,
+                        after_value=constants.CCSWITCH_PROVIDER_ID,
+                    )
+                    if journal_path is not None:
+                        self._journal_records.append(journal_path)
             else:
                 result.note("settings.json 的当前供应商已指向 DeepSeek (THU)")
         else:
@@ -754,6 +897,7 @@ class CcSwitchTarget:
                 apps[constants.CCSWITCH_APP_TYPE] = app_state
             if app_state.get("proxy_route") != constants.CCSWITCH_PROVIDER_ID:
                 previous_route = app_state.get("proxy_route")
+                previous_route_present = "proxy_route" in app_state
                 app_state["proxy_route"] = constants.CCSWITCH_PROVIDER_ID
                 if self._write_json(
                     live_path,
@@ -769,10 +913,315 @@ class CcSwitchTarget:
                 ):
                     result.changed = True
                     result.note("已把 live-state.json 的代理路由指向 DeepSeek (THU)")
+                    journal_path = ChangeJournal.for_backup(backup).record(
+                        "ccswitch_routing",
+                        path=str(live_path),
+                        json_path=["apps", constants.CCSWITCH_APP_TYPE, "proxy_route"],
+                        before_present=previous_route_present,
+                        before_value=previous_route,
+                        after_value=constants.CCSWITCH_PROVIDER_ID,
+                    )
+                    if journal_path is not None:
+                        self._journal_records.append(journal_path)
                 if "contract" in app_state:
                     result.note("注：live-state.json 里的 contract 未改动，CC Switch 下次启动会自行校准")
             else:
                 result.note("live-state.json 的代理路由已指向 DeepSeek (THU)")
         else:
             result.note(f"未找到 live-state.json，跳过：{live_path}")
+
+
+def _get_nested(data: object, keys: list[str]) -> tuple[bool, object]:
+    current: object = data
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return False, None
+        current = current[key]
+    return True, current
+
+
+def _set_nested(data: dict, keys: list[str], present: bool, value: object) -> bool:
+    if not keys:
+        return False
+    current: object = data
+    for key in keys[:-1]:
+        if not isinstance(current, dict):
+            return False
+        child = current.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            current[key] = child
+        current = child
+    if not isinstance(current, dict):
+        return False
+    if present:
+        if current.get(keys[-1]) == value:
+            return False
+        current[keys[-1]] = value
+    else:
+        if keys[-1] not in current:
+            return False
+        current.pop(keys[-1], None)
+    return True
+
+
+def _restore_routing_record(record: dict) -> list[str]:
+    path = Path(str(record.get("path") or ""))
+    keys = [str(item) for item in record.get("json_path") or []]
+    after_value = record.get("after_value")
+    if not path.is_file() or not keys:
+        return [f"CC Switch 路由文件不存在，跳过：{path}"]
+    data = _load_json(path)
+    present, current_value = _get_nested(data, keys)
+    if not present or current_value != after_value:
+        return [f"CC Switch 路由还原冲突：{path.name} 的 {'.'.join(keys)} 已被修改"]
+    changed = _set_nested(
+        data,
+        keys,
+        bool(record.get("before_present")),
+        record.get("before_value"),
+    )
+    if not changed:
+        return [f"CC Switch 路由无需还原：{path}"]
+    backup = BackupManager(app_paths.backups_dir(), keep=10)
+    ok, message = write_with_rollback(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        backup,
+        "pre-field-restore",
+    )
+    if not ok:
+        return [f"CC Switch 路由还原失败：{message}"]
+    return [f"已按字段还原 CC Switch 路由：{path}"]
+
+
+def _restore_token_fields(current: object, before: object, after: object) -> bool:
+    changed = False
+    if isinstance(current, dict) and isinstance(before, dict) and isinstance(after, dict):
+        for key, value in list(current.items()):
+            if key not in after:
+                continue
+            after_value = after[key]
+            if isinstance(value, str) and isinstance(after_value, str):
+                if (
+                    CcSwitchTarget._is_token_value(str(key), value)
+                    and value == after_value
+                    and before.get(key) != value
+                ):
+                    if key in before:
+                        current[key] = before[key]
+                    else:
+                        current.pop(key, None)
+                    changed = True
+            elif key in before and _restore_token_fields(value, before[key], after_value):
+                changed = True
+    elif isinstance(current, list) and isinstance(before, list) and isinstance(after, list):
+        for index, value in enumerate(list(current)):
+            if index >= len(after):
+                continue
+            if isinstance(value, str) and isinstance(after[index], str):
+                if (
+                    looks_like_jwt(value)
+                    and value == after[index]
+                    and (index >= len(before) or before[index] != value)
+                ):
+                    if index < len(before):
+                        current[index] = before[index]
+                    else:
+                        current.pop(index)
+                    changed = True
+            elif index < len(before) and _restore_token_fields(
+                value, before[index], after[index]
+            ):
+                changed = True
+    return changed
+
+
+def _restore_card_record(record: dict) -> list[str]:
+    path = Path(str(record.get("path") or ""))
+    if not path.is_file():
+        return [f"CC Switch 数据库不存在，跳过：{path}"]
+    after_settings = record.get("after_settings")
+    after_meta = record.get("after_meta")
+    before_settings = record.get("before_settings")
+    before_meta = record.get("before_meta")
+    if not isinstance(after_settings, dict) or not isinstance(after_meta, dict):
+        return ["CC Switch 卡片还原失败：变更日志结构不完整"]
+    before_settings = before_settings if isinstance(before_settings, dict) else {}
+    before_meta = before_meta if isinstance(before_meta, dict) else {}
+
+    connection = sqlite3.connect(str(path), timeout=15)
+    messages: list[str] = []
+    try:
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(providers)")]
+        has_current = "is_current" in columns
+        current_expr = "is_current" if has_current else "0 AS is_current"
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                f"SELECT settings_config, meta, name, {current_expr} "
+                "FROM providers WHERE id = ? AND app_type = ?",
+                (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return ["CC Switch 卡片已不存在，无需还原"]
+            raw_settings, raw_meta, name, _is_current = row
+            settings = CcSwitchTarget._json_object(raw_settings)
+            meta = CcSwitchTarget._json_object(raw_meta)
+            changed = False
+            deleted_own_card = False
+
+            if not bool(record.get("before_exists")):
+                if (
+                    settings == after_settings
+                    and meta == after_meta
+                    and name == str(record.get("after_name") or constants.PROVIDER_DISPLAY_NAME)
+                ):
+                    connection.execute(
+                        "DELETE FROM providers WHERE id = ? AND app_type = ?",
+                        (constants.CCSWITCH_PROVIDER_ID, constants.CCSWITCH_APP_TYPE),
+                    )
+                    changed = True
+                    deleted_own_card = True
+                    messages.append("已删除本程序自动创建的 CC Switch 卡片")
+                    row = None
+            if row is not None:
+                auth = settings.get("auth")
+                before_auth = before_settings.get("auth")
+                before_auth = before_auth if isinstance(before_auth, dict) else {}
+                if isinstance(auth, dict):
+                    after_auth = after_settings.get("auth")
+                    after_key = (
+                        after_auth.get("OPENAI_API_KEY")
+                        if isinstance(after_auth, dict)
+                        else None
+                    )
+                    if (
+                        after_key is not None
+                        and auth.get("OPENAI_API_KEY") == after_key
+                        and before_auth.get("OPENAI_API_KEY") != after_key
+                    ):
+                        if "OPENAI_API_KEY" in before_auth:
+                            auth["OPENAI_API_KEY"] = before_auth["OPENAI_API_KEY"]
+                        else:
+                            auth.pop("OPENAI_API_KEY", None)
+                        changed = True
+                    elif after_key is not None and auth.get("OPENAI_API_KEY") != after_key:
+                        messages.append("CC Switch 卡片 Token 已被其他程序修改，保留当前值")
+                after_catalog = after_settings.get("modelCatalog")
+                if "modelCatalog" in settings and settings.get("modelCatalog") == after_catalog:
+                    if "modelCatalog" in before_settings:
+                        settings["modelCatalog"] = before_settings["modelCatalog"]
+                    else:
+                        settings.pop("modelCatalog", None)
+                    changed = True
+                for key in ("apiFormat", "commonConfigEnabled", "endpointAutoSelect"):
+                    if key in after_meta and meta.get(key) == after_meta[key]:
+                        if key in before_meta:
+                            meta[key] = before_meta[key]
+                        else:
+                            meta.pop(key, None)
+                        changed = True
+                if name == str(record.get("after_name") or constants.PROVIDER_DISPLAY_NAME):
+                    before_name = str(record.get("before_name") or "")
+                    if before_name and name != before_name:
+                        name = before_name
+                        changed = True
+                if changed:
+                    connection.execute(
+                        "UPDATE providers SET settings_config = ?, meta = ?, name = ? "
+                        "WHERE id = ? AND app_type = ?",
+                        (
+                            json.dumps(settings, ensure_ascii=False),
+                            json.dumps(meta, ensure_ascii=False),
+                            name,
+                            constants.CCSWITCH_PROVIDER_ID,
+                            constants.CCSWITCH_APP_TYPE,
+                        ),
+                    )
+
+            if bool(record.get("activation_changed")) and has_current:
+                current_state = [
+                    {"id": str(item[0]), "current": bool(item[1])}
+                    for item in connection.execute(
+                        "SELECT id, is_current FROM providers WHERE app_type = ?",
+                        (constants.CCSWITCH_APP_TYPE,),
+                    ).fetchall()
+                ]
+                current_map = {
+                    str(item.get("id") or ""): bool(item.get("current"))
+                    for item in current_state
+                }
+                after_map = {
+                    str(item.get("id") or ""): bool(item.get("current"))
+                    for item in record.get("current_state_after") or []
+                    if isinstance(item, dict)
+                }
+                if deleted_own_card:
+                    after_map[constants.CCSWITCH_PROVIDER_ID] = False
+                state_matches = all(
+                    current_map.get(provider_id, False)
+                    == after_map.get(provider_id, False)
+                    for provider_id in set(current_map) | set(after_map)
+                )
+                if state_matches:
+                    for item in record.get("current_state_before") or []:
+                        connection.execute(
+                            "UPDATE providers SET is_current = ? WHERE id = ? AND app_type = ?",
+                            (
+                                1 if item.get("current") else 0,
+                                str(item.get("id") or ""),
+                                constants.CCSWITCH_APP_TYPE,
+                            ),
+                        )
+                    changed = True
+                else:
+                    messages.append("CC Switch 当前供应商选择已被修改，未还原激活状态")
+
+            for sibling in record.get("sibling_changes") or []:
+                if not isinstance(sibling, dict):
+                    continue
+                sibling_row = connection.execute(
+                    "SELECT settings_config FROM providers WHERE id = ? AND app_type = ?",
+                    (sibling.get("id"), sibling.get("app_type")),
+                ).fetchone()
+                if sibling_row is None:
+                    continue
+                current = CcSwitchTarget._json_object(sibling_row[0])
+                if _restore_token_fields(current, sibling.get("before"), sibling.get("after")):
+                    connection.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                        (
+                            json.dumps(current, ensure_ascii=False),
+                            sibling.get("id"),
+                            sibling.get("app_type"),
+                        ),
+                    )
+                    changed = True
+
+            if changed:
+                BackupManager(app_paths.backups_dir(), keep=10).backup_sqlite(
+                    path, "pre-field-restore"
+                )
+                connection.commit()
+                messages.append("已按字段还原 CC Switch 卡片")
+            else:
+                connection.rollback()
+                messages.append("CC Switch 卡片无需还原或存在冲突")
+            return messages
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+
+
+def restore_journal_record(record: dict) -> list[str]:
+    kind = str(record.get("kind") or "")
+    if kind == "ccswitch_card":
+        return _restore_card_record(record)
+    if kind == "ccswitch_routing":
+        return _restore_routing_record(record)
+    return [f"不支持的 CC Switch 变更类型：{kind}"]
 

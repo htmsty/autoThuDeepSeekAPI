@@ -45,7 +45,9 @@ class BackupOpsTest(unittest.TestCase):
         credentials.write_text("broken\n", encoding="utf-8")
         profile.write_text("# gone\n", encoding="utf-8")
 
-        messages = backup_ops.restore_original(self.settings)
+        messages = backup_ops.restore_original(
+            self.settings, allow_legacy_full_restore=True
+        )
         self.assertTrue(messages, "应当有还原结果")
         self.assertEqual(credentials.read_text(encoding="utf-8"), original_credentials)
         self.assertEqual(profile.read_text(encoding="utf-8"), original_profile)
@@ -75,7 +77,9 @@ class BackupOpsTest(unittest.TestCase):
         # 改坏之后一键还原，要回到"第一次动它之前"
         credentials.write_text("broken\n", encoding="utf-8")
         profile.write_text("# gone\n", encoding="utf-8")
-        messages = backup_ops.restore_original(self.settings)
+        messages = backup_ops.restore_original(
+            self.settings, allow_legacy_full_restore=True
+        )
         self.assertTrue(messages)
         self.assertEqual(credentials.read_text(encoding="utf-8"), original_credentials)
         self.assertEqual(profile.read_text(encoding="utf-8"), original_profile)

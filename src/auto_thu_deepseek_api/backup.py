@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import paths
+from . import crypto, paths
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ class BackupEntry:
     # 是否是"原始"备份（程序第一次动这个文件之前的状态）。老索引里没有这个字段，
     # 默认 False，靠快照目录名里的 original 标记也能识别。
     is_original: bool = False
+    encrypted: bool = False
 
 
 def is_original_label(label: str) -> bool:
@@ -60,6 +61,7 @@ class BackupManager:
         self._session_label = ""
         # 只有 begin_snapshot() 显式开的会话才会被复用；普通的一次备份各占一个目录
         self._session_explicit = False
+        self._migration_checked = False
 
     # —— 索引 ——
 
@@ -111,6 +113,7 @@ class BackupManager:
                             created=created,
                             sha256=_sha256(payload),
                             size=stat.st_size,
+                            encrypted=crypto.is_encrypted(payload.read_bytes()[:64]),
                         )
                     )
                 )
@@ -127,6 +130,7 @@ class BackupManager:
         paths.write_text_atomic(self.index_path, json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
 
     def entries(self) -> list[BackupEntry]:
+        self._migrate_legacy_backups()
         result: list[BackupEntry] = []
         raw = self._load_index()
         if not raw:
@@ -138,6 +142,46 @@ class BackupManager:
             except TypeError:
                 continue
         return result
+
+    def _migrate_legacy_backups(self) -> None:
+        """Encrypt old plaintext backup payloads in place.
+
+        The file path stays stable so existing indexes remain valid. Encryption
+        happens on the same file, without making another plaintext copy.
+        """
+
+        if self._migration_checked:
+            return
+        self._migration_checked = True
+        entries = self._load_index()
+        if not entries:
+            return
+        changed = False
+        for item in entries:
+            try:
+                payload = Path(item.get("backup", ""))
+                if not payload.is_file():
+                    continue
+                data = payload.read_bytes()
+                if crypto.is_encrypted(data):
+                    item["encrypted"] = True
+                    continue
+                encrypted = crypto.protect_bytes(data)
+                paths.write_bytes_atomic(payload, encrypted)
+                item.update(
+                    sha256=_sha256(payload),
+                    size=len(encrypted),
+                    encrypted=True,
+                )
+                changed = True
+                logger.info("已把旧备份迁移为 DPAPI 密文：%s", payload)
+            except (OSError, ValueError) as exc:
+                logger.warning("旧备份加密迁移失败：%s（%s）", item.get("backup", ""), exc)
+        if changed:
+            try:
+                self._save_index(entries)
+            except OSError as exc:  # pragma: no cover
+                logger.warning("保存加密备份索引失败：%s", exc)
 
     def _record(self, entry: BackupEntry) -> None:
         entries = self._load_index()
@@ -212,7 +256,12 @@ class BackupManager:
             return None
         snapshot = self._new_snapshot_dir(label)
         target = self._snapshot_target(snapshot, source.name)
-        shutil.copy2(source, target)
+        encrypted = crypto.protect_bytes(source.read_bytes())
+        paths.write_bytes_atomic(target, encrypted)
+        try:
+            shutil.copystat(source, target)
+        except OSError:
+            pass
         self._write_source_marker(snapshot, source)
         self._record(
             BackupEntry(
@@ -221,8 +270,9 @@ class BackupManager:
                 backup=str(target),
                 created=datetime.now().isoformat(timespec="milliseconds"),
                 sha256=_sha256(target),
-                size=target.stat().st_size,
+                size=len(encrypted),
                 is_original=is_original_label(label),
+                encrypted=True,
             )
         )
         logger.info("已备份 %s → %s", source, target)
@@ -250,10 +300,21 @@ class BackupManager:
                 src.close()
         except sqlite3.Error as exc:
             logger.warning("SQLite 备份接口失败（%s），改用文件复制", exc)
-            for suffix in ("", "-wal", "-shm"):
-                part = Path(str(source) + suffix)
-                if part.exists():
-                    shutil.copy2(part, snapshot / part.name)
+            paths.write_bytes_atomic(target, source.read_bytes())
+        try:
+            encrypted = crypto.protect_bytes(target.read_bytes())
+        except (OSError, ValueError) as exc:
+            # SQLite's backup API must first create a plaintext file. If DPAPI
+            # fails, do not leave that plaintext behind in the backup folder.
+            try:
+                paths.write_bytes_atomic(target, b"")
+            except OSError:
+                pass
+            removed, detail = paths.delete_path(target)
+            if not removed:
+                logger.error("加密失败后无法清理明文数据库备份：%s（%s）", target, detail)
+            raise OSError(f"SQLite 备份加密失败：{exc}") from exc
+        paths.write_bytes_atomic(target, encrypted)
         self._record(
             BackupEntry(
                 label=label,
@@ -263,6 +324,7 @@ class BackupManager:
                 sha256=_sha256(target),
                 size=target.stat().st_size if target.exists() else 0,
                 is_original=is_original_label(label),
+                encrypted=True,
             )
         )
         logger.info("已备份数据库 %s → %s", source, target)
@@ -385,7 +447,24 @@ class BackupManager:
                     continue
             try:
                 source.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(backup, source)
+                payload = crypto.unprotect_bytes(backup.read_bytes())
+                if payload.startswith(b"SQLite format 3\x00"):
+                    sidecar_failed = False
+                    for suffix in ("-wal", "-shm"):
+                        sidecar = Path(str(source) + suffix)
+                        if not sidecar.exists():
+                            continue
+                        removed, detail = paths.delete_path(sidecar)
+                        if not removed:
+                            messages.append(
+                                f"跳过 {source}：无法清理 {sidecar.name}（{detail}），"
+                                "继续还原可能损坏数据库"
+                            )
+                            sidecar_failed = True
+                            break
+                    if sidecar_failed:
+                        continue
+                paths.write_bytes_atomic(source, payload)
             except OSError as exc:
                 messages.append(f"还原失败 {source}：{exc}")
                 continue

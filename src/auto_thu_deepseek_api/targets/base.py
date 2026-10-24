@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..paths import write_text_atomic
+from .. import crypto
+from ..paths import write_bytes_atomic
 
 
 @dataclass
@@ -34,20 +35,33 @@ def write_with_rollback(path: Path, text: str, backup, label: str) -> tuple[bool
     返回 (是否成功, 说明)。BS 是 BackupManager，这里不写死类型注解以免和 backup 模块绕环。
     """
 
+    try:
+        original_bytes = path.read_bytes() if path.exists() else b""
+    except OSError as exc:
+        return False, f"读取原文件失败，未写入：{exc}"
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    crlf_count = original_bytes.count(b"\r\n")
+    lf_count = original_bytes.count(b"\n")
+    if crlf_count and crlf_count == lf_count:
+        payload = normalized.replace("\n", "\r\n").encode("utf-8")
+    else:
+        payload = normalized.encode("utf-8")
+
     backup_path: Path | None = None
     try:
         backup_path = backup.backup_file(path, label)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return False, f"备份失败，未写入：{exc}"
 
     try:
-        write_text_atomic(path, text)
+        write_bytes_atomic(path, payload)
     except OSError as exc:
         if backup_path and Path(backup_path).exists():
             try:
-                path.write_text(Path(backup_path).read_text(encoding="utf-8"), encoding="utf-8")
+                original = crypto.unprotect_bytes(Path(backup_path).read_bytes())
+                write_bytes_atomic(path, original)
                 return False, f"写入失败，已回滚到备份：{exc}"
-            except OSError as restore_exc:
+            except (OSError, ValueError) as restore_exc:
                 return False, f"写入失败且回滚失败：{exc}；回滚错误：{restore_exc}"
         return False, f"写入失败：{exc}"
     return True, ""

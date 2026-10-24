@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_thu_deepseek_api import paths, procinfo, sync, uninstall  # noqa: E402
 from auto_thu_deepseek_api.settings import (  # noqa: E402
-    CCSWITCH_POLICY_DIRECT,
     CCSWITCH_POLICY_PROMPT,
     AppSettings,
     reset_to_defaults,
@@ -238,7 +237,7 @@ class PrivateLocationTest(unittest.TestCase):
         calls: list[object] = []
         original = uninstall.backup_ops.restore_original
 
-        def fake_restore(settings):  # noqa: ANN001
+        def fake_restore(settings, **_kwargs):  # noqa: ANN001
             calls.append(settings)
             return ["已还原 DSH 凭据"]
 
@@ -257,26 +256,49 @@ class ResetDefaultsTest(unittest.TestCase):
         settings = AppSettings(
             sync_interval_minutes=45,
             auto_sync_enabled=False,
-            unify_all_profiles=False,
             ccswitch_running_policy=CCSWITCH_POLICY_PROMPT,
             launch_at_startup=True,
             last_sync_at="2026-01-01T00:00:00",
             last_sync_summary="上次同步的摘要",
         )
         reset_to_defaults(settings)
-        self.assertEqual(settings.sync_interval_minutes, 180)
+        self.assertEqual(settings.sync_interval_minutes, 60)
         self.assertTrue(settings.auto_sync_enabled)
-        self.assertTrue(settings.unify_all_profiles)
         self.assertEqual(
             settings.ccswitch_running_policy,
-            CCSWITCH_POLICY_DIRECT,
-            "CC Switch 运行策略要回到默认值（不提示、直接改）",
+            CCSWITCH_POLICY_PROMPT,
+            "CC Switch 运行策略要回到默认值（先提示）",
         )
         self.assertTrue(settings.launch_at_startup, "开机启动项不该被恢复默认动到")
         self.assertEqual(settings.last_sync_summary, "上次同步的摘要")
 
 
 class TargetTraceTest(unittest.TestCase):
+    def test_resolve_targets_uses_discovered_config_directories(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user = root / "user"
+            appdata = root / "appdata"
+            dsh = user / ".dsh"
+            cc = appdata / "CC Switch"
+            dsh.mkdir(parents=True)
+            cc.mkdir(parents=True)
+            (dsh / ".credentials.yaml").write_text("version: 1\n", encoding="utf-8")
+            (cc / "cc-switch.db").write_bytes(b"db")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USERPROFILE": str(user),
+                    "APPDATA": str(appdata),
+                    "LOCALAPPDATA": str(root / "local"),
+                },
+                clear=False,
+            ), mock.patch.object(paths, "_registered_install_dirs", return_value=()):
+                self.assertEqual(paths.resolve_dsh_paths("").base_dir, dsh)
+                self.assertEqual(paths.resolve_ccswitch_paths("").base_dir, cc)
+
     def test_both_missing_when_nothing_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

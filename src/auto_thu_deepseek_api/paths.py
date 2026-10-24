@@ -14,10 +14,12 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from . import constants
@@ -39,6 +41,7 @@ MANAGED_ENTRIES: tuple[str, ...] = (
     "app.lock",
     "logs",
     "backups",
+    "changes",
     "browser-profile",
 )
 
@@ -156,14 +159,13 @@ def write_private_override(path: Path, migrated_from: Path | None = None) -> Non
 def clear_private_override() -> bool:
     """把位置指针删掉（恢复默认位置 / 干净卸载时用）。返回是否删干净（本来就没有也算）。"""
 
-    deleted = True
+    pointer = private_pointer_file()
     try:
-        private_pointer_file().unlink()
-    except FileNotFoundError:
-        pass
+        deleted, detail = delete_path(pointer)
     except OSError as exc:  # pragma: no cover - 删不掉不算致命
-        logger.warning("删除 private 位置指针失败：%s", exc)
-        deleted = False
+        deleted, detail = False, str(exc)
+    if not deleted:
+        logger.warning("删除 private 位置指针失败：%s（%s）", pointer, detail)
     reset_data_root_cache()
     return deleted
 
@@ -281,8 +283,7 @@ def reset_data_root_cache() -> None:
 def recycle_path(path: Path) -> tuple[bool, str]:
     """把文件/目录移到回收站（Windows Shell，可撤销）。
 
-    返回 (是否成功, 说明)。回收站不可用（网络盘、路径过长等）时返回 False，
-    由 `delete_path()` 决定要不要退化成永久删除。
+    返回 (是否成功, 说明)。回收站不可用（网络盘、路径过长等）时返回 False。
     """
 
     target = Path(path)
@@ -322,7 +323,7 @@ def recycle_path(path: Path) -> tuple[bool, str]:
 
 
 def delete_path(path: Path) -> tuple[bool, str]:
-    """删除文件/目录：**优先移到回收站**，回收站不可用时才永久删除（并如实说明）。"""
+    """删除文件/目录：只移到回收站；回收站不可用时保持原样并报错。"""
 
     target = Path(path)
     if not target.exists():
@@ -330,14 +331,7 @@ def delete_path(path: Path) -> tuple[bool, str]:
     ok, message = recycle_path(target)
     if ok:
         return True, message
-    try:
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-    except OSError as exc:
-        return False, f"没删掉 {target}：{exc}"
-    return True, f"已永久删除（回收站不可用：{message}）"
+    return False, f"没删掉 {target}：回收站不可用（{message}）"
 
 
 def remove_managed_data(
@@ -491,7 +485,7 @@ def finish_pending_migration() -> None:
     write_private_override(override.path, migrated_from=None)
 
 
-def write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
+def write_bytes_atomic(path: Path, data: bytes) -> None:
     """先写 .tmp 再替换，避免写到一半崩掉把原文件弄成半截。
 
     目标被别的进程占着（Windows 上 os.replace 会报错）时退回直接写，宁可牺牲原子性也不能不写。
@@ -499,15 +493,19 @@ def write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding=encoding)
+    tmp.write_bytes(data)
     try:
         os.replace(tmp, path)
     except OSError:
-        path.write_text(text, encoding=encoding)
+        path.write_bytes(data)
         try:
             tmp.unlink()
         except OSError:
             pass
+
+
+def write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
+    write_bytes_atomic(path, text.encode(encoding))
 
 
 def logs_dir() -> Path:
@@ -533,6 +531,49 @@ def state_file() -> Path:
 def ensure_runtime_dirs() -> None:
     for path in (logs_dir(), backups_dir(), browser_profile_dir()):
         path.mkdir(parents=True, exist_ok=True)
+    changes = data_root() / "changes"
+    changes.mkdir(parents=True, exist_ok=True)
+    for path in (backups_dir(), changes, browser_profile_dir()):
+        restrict_to_current_user(path)
+
+
+def restrict_to_current_user(path: Path) -> bool:
+    """Best-effort ACL hardening for directories containing cookies or secrets.
+
+    DPAPI protects file payloads, but Qt WebEngine needs a real browser profile
+    directory and cannot operate through an encrypted virtual filesystem. The
+    browser profile therefore relies on a per-user ACL plus normal Windows
+    account isolation.
+    """
+
+    if sys.platform != "win32" or not Path(path).is_dir():
+        return False
+    username = os.environ.get("USERNAME", "").strip()
+    domain = os.environ.get("USERDOMAIN", "").strip()
+    if not username:
+        return False
+    account = f"{domain}\\{username}" if domain else username
+    try:
+        completed = subprocess.run(
+            [
+                "icacls",
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{account}:(OI)(CI)F",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("设置目录权限失败：%s（%s）", path, exc)
+        return False
+    if completed.returncode != 0:
+        logger.warning("设置目录权限失败：%s（%s）", path, completed.stderr.strip())
+        return False
+    return True
 
 
 def assets_dir() -> Path:
@@ -572,8 +613,111 @@ def default_ccswitch_dir() -> Path:
     return home_dir() / constants.CCSWITCH_DIR_NAME
 
 
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name, "").strip()
+    return Path(os.path.expandvars(value)).expanduser() if value else None
+
+
+@lru_cache(maxsize=4)
+def _registered_install_dirs(keywords: tuple[str, ...]) -> tuple[Path, ...]:
+    """Read installed-app locations without scanning drives."""
+
+    if sys.platform != "win32":
+        return ()
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover
+        return ()
+    roots = (
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+    )
+    result: list[Path] = []
+    seen: set[str] = set()
+    for root, key_name in roots:
+        try:
+            parent = winreg.OpenKey(root, key_name)
+        except OSError:
+            continue
+        try:
+            count = winreg.QueryInfoKey(parent)[0]
+            for index in range(count):
+                try:
+                    child = winreg.OpenKey(parent, winreg.EnumKey(parent, index))
+                except OSError:
+                    continue
+                try:
+                    values: dict[str, str] = {}
+                    for value_name in ("DisplayName", "InstallLocation"):
+                        try:
+                            value, _ = winreg.QueryValueEx(child, value_name)
+                        except OSError:
+                            continue
+                        values[value_name] = str(value)
+                    display = values.get("DisplayName", "").lower()
+                    location = values.get("InstallLocation", "").strip()
+                    if not location or not any(word in display for word in keywords):
+                        continue
+                    path = Path(os.path.expandvars(location)).expanduser()
+                    key_path = str(path).lower()
+                    if path.is_dir() and key_path not in seen:
+                        seen.add(key_path)
+                        result.append(path)
+                finally:
+                    child.Close()
+        finally:
+            parent.Close()
+    return tuple(result)
+
+
+def _first_existing_target(primary: Path, candidates: list[Path], marker_name: str) -> Path:
+    """Pick the first candidate that contains a real target marker file."""
+
+    ordered = [primary, *candidates]
+    seen: set[str] = set()
+    for candidate in ordered:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if (candidate / marker_name).exists():
+                return candidate
+        except OSError:
+            continue
+    return primary
+
+
 def resolve_dsh_paths(custom_dir: str | None) -> TargetPaths:
-    base = Path(custom_dir).expanduser() if custom_dir else default_dsh_dir()
+    if custom_dir:
+        base = Path(os.path.expandvars(custom_dir)).expanduser()
+    else:
+        candidates: list[Path] = []
+        for variable in ("DSH_HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            value = _env_path(variable)
+            if value is None:
+                continue
+            candidates.extend(
+                [
+                    value if variable == "DSH_HOME" else value / ".dsh",
+                    value / "DeepSeek Harness" / ".dsh",
+                    value / "dsh",
+                ]
+            )
+        for install in _registered_install_dirs(
+            ("deepseek harness", "deepseek dsh", "dsh")
+        ):
+            candidates.extend((install, install / ".dsh"))
+        candidates.append(app_dir() / ".dsh")
+        base = _first_existing_target(
+            default_dsh_dir(),
+            candidates,
+            constants.DSH_CREDENTIAL_FILE,
+        )
     return TargetPaths(
         base_dir=base,
         credentials_file=base / constants.DSH_CREDENTIAL_FILE,
@@ -582,7 +726,30 @@ def resolve_dsh_paths(custom_dir: str | None) -> TargetPaths:
 
 
 def resolve_ccswitch_paths(custom_dir: str | None) -> TargetPaths:
-    base = Path(custom_dir).expanduser() if custom_dir else default_ccswitch_dir()
+    if custom_dir:
+        base = Path(os.path.expandvars(custom_dir)).expanduser()
+    else:
+        candidates: list[Path] = []
+        for variable in ("USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            value = _env_path(variable)
+            if value is None:
+                continue
+            candidates.extend(
+                [
+                    value / ".cc-switch",
+                    value / "CC Switch",
+                    value / "cc-switch",
+                    value / "Programs" / "CC Switch",
+                ]
+            )
+        for install in _registered_install_dirs(("cc switch", "cc-switch", "ccswitch")):
+            candidates.extend((install, install / ".cc-switch"))
+        candidates.append(app_dir() / ".cc-switch")
+        base = _first_existing_target(
+            default_ccswitch_dir(),
+            candidates,
+            constants.CCSWITCH_DB_FILE,
+        )
     return TargetPaths(
         base_dir=base,
         db_file=base / constants.CCSWITCH_DB_FILE,

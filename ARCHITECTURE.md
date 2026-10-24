@@ -17,11 +17,11 @@ main 启动
 
 ```
 用户点「立即获取并同步」
-  → TokenCaptureWindow 打开内置浏览器（站点登录页）
-  → 页面脚本捕获 Token → 自动关窗
-  → verifier 校验 Token（向站点发一次最小请求）
+  → TokenCaptureWindow 打开内置浏览器（可选自动登录）
+  → 页面脚本收集多个 JWT 候选；置信度足够才采用 → 自动关窗
+  → verifier 先走不消耗额度的会话接口；最小对话兜底默认关闭
   → SyncOrchestrator：
-       逐个目标 detect() → backup() → apply()
+       逐个目标 detect() → backup() → apply() → 记录字段级变更
   → 写入结果汇总 → 界面状态 / 托盘通知 / 日志
 ```
 
@@ -55,9 +55,13 @@ private 的位置**可以改**（2.5 起）：
 - `switch_private_root()`：把 `MANAGED_ENTRIES` 复制到新位置 → 写指针 → 尽力清掉旧位置，
   用户自己的文件不动、目录不整个删；`finish_pending_migration()` 在下次启动时补删残留。
 - `MANAGED_ENTRIES` 是"程序自己的东西"的唯一定义：设置、状态、模型缓存、锁、日志、备份、
-  浏览器会话。换位置与卸载都按它来。
-- **删除一律先走回收站**：`recycle_path()`（Windows Shell `SHFileOperation` + `FOF_ALLOWUNDO`）
-  优先，回收站不可用时才永久删除（`delete_path()` 会说明用的是哪种）。
+  字段变更日志、浏览器会话。换位置与卸载都按它来。
+- **删除只走回收站**：`recycle_path()`（Windows Shell `SHFileOperation` + `FOF_ALLOWUNDO`）；
+  回收站不可用时 `delete_path()` 保持原样并报告，不再退化成永久删除。
+- `resolve_*_paths()` 在默认目录、环境变量、常见配置目录与注册表卸载项之间只做有界探测；
+  用户显式填写的目录优先，不做全盘扫描。
+- `ensure_runtime_dirs()` 为备份、变更日志和浏览器档案设置当前用户 ACL。DPAPI 保护文件内容，
+  但 Qt WebEngine 必须直接访问浏览器档案，因此只能依赖当前 Windows 账户隔离。
   旧目录清空到只剩程序自己时，连目录一起删；还剩用户文件就保留。
 - `defer_creation()`：启动早期只判断不落盘，避免"桌面提醒还没弹，private 已经在桌面上"。
   `finish_pending_migration()` 只有在旧位置真的清空了才清掉 `migrated_from`，
@@ -73,16 +77,18 @@ private 位置与桌面提醒的共用流程（启动早期主窗口还不存在
 `desktop_notice()`。三个按钮是「选择 private 位置…」「仍然继续」「退出程序去换本程序位置」。
 
 ### `settings.py`
-用户设置（JSON）：同步间隔、自动同步、开机启动、启动即同步、同步后最小化、
-DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Switch 运行中策略与提示开关、
-备份保留份数、静默取 Token 超时、日志级别、关窗行为、预检开关、DSH 默认模型。
+用户设置（JSON）：同步间隔/随机浮动、自动同步、开机启动、启动即同步、同步后最小化、
+DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路径与受管 profile、
+自动登录、最小对话校验、CC Switch 运行中策略、备份保留份数、日志级别等。
 
 设置文件带 `settings_version`，读到旧版本时**一次性**迁移并写回（`AppSettings.load`）：
 
 | 版本 | 迁移内容 |
 | --- | --- |
-| v2 | 「统一所有 profile 到 madmodel」默认勾选 |
-| v3 | 默认开启自动同步、间隔默认 180 分钟、默认不弹「CC Switch 正在运行」提醒 |
+| v2 | 历史版本；v5 起移除“统一所有 profile”字段 |
+| v3 | 默认开启自动同步；v5 把旧默认 180 分钟迁移为 60 分钟 |
+| v4 | CC Switch 运行中策略合并 |
+| v5 | 默认 60±10 分钟、DSH/CC Switch 写入拆成独立开关、路由激活默认关 |
 
 迁移只发生一次：之后用户手动取消勾选、自己填的间隔都不会被默认值打回。
 
@@ -92,18 +98,20 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   给出到期时刻（`TOKEN_LIFETIME_HOURS`）。`is_expired()` 返回 `None` 表示"看不出来"，
   这种情况按"仍可用、交给站点校验"处理，不能当成已过期。
 - `capture.py`：QtWebEngine 内置窗口。页面脚本在 `DocumentCreation` 注入，
-  只做三件事：扫 `localStorage` / `sessionStorage`、钩 `fetch` 与 `XHR` 的响应体、
-  扫一次页面文本；命中 JWT 即写入 `window.__atdToken`，Python 侧轮询取走。
-  **不做任何模拟点击。** 拿到 Token 后窗口自动关闭；静默续期时不显示窗口。
+  收集 `localStorage` / `sessionStorage`、Cookie、`fetch` / `XHR` 响应和页面文本中的多个
+  JWT 候选；`choose_jwt()` 按来源、域名、字段名、有效期评分，证据接近时宁可等待也不乱选。
+  默认不模拟登录。用户显式启用自动登录后，仅在清华域名下填充/提交，检测到验证码、二次验证、
+  MFA 时打开窗口并发出人工接管信号。拿到 Token 后窗口自动关闭；静默续期时不显示窗口。
 - `verifier.py`：先用站点的会话接口 `GET /model-api/auth-login`（带 `Authorization: Bearer`）
   判断 Token —— 快、不消耗模型额度；401/403 或 `success:false` 判无效，200+`success:true` 判有效。
-  只有它给不出结论（非 200、不是预期 JSON）时才兜底发一次最小对话请求；连不上站点就直接
-  记"未知"，不再白等一次模型请求。`fetch_models()` 尝试读模型列表，读不到就回退内置名单。
+  只有它给不出结论且设置里允许时才兜底发一次最小对话请求；默认不消耗模型额度。
+  `fetch_models()` 尝试读模型列表，读不到就回退内置名单。
 - `site_models.py`：**模型列表跟着站点走**。站点没有模型列表接口（`/v1/models` 会落回 SPA），
-  于是按 thu-tok-auto 的做法读站点自己的前端包：首页 → `assets/js/*.js` → 解析
+  于是按 thu-tok-auto 的做法读站点自己的前端包：首页 → 最多尝试 4 个 `assets/js/*.js` → 解析
   `modelList:[{label,value,supportImage,effortOptions}…]` → 转成 provider 的 models 形状
   （`contextWindow` 统一 1000000；排除 `DeepSeek-V4-Flash-Vision-Exp` 与 `DeepSeek-R1-W8A8`；
-  思考档只保留 pi-ai 认得的等级）。结果缓存 6 小时，读不到才退回 `/v1/models` 与内置名单。
+  思考档只保留 pi-ai 认得的等级）。解析支持属性引号与空白差异；缓存会重新校验结构，
+  缓存坏了就丢弃。结果缓存 6 小时，读不到才退回 `/v1/models` 与内置名单。
 
 ### `targets/dsh.py`
 - 凭据：`<.dsh>/.credentials.yaml` 的 `refs.MADMODEL_API_KEY`。用 ruamel.yaml 往返模式读写，
@@ -112,10 +120,9 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   `大写键: 值` 形式的引用（`DEEPSEEK_API_KEY` 这类；不会把 `kind`/`secret`/`id` 混进去），
   重写成 `version: 1` + `refs` 的合法结构；一个键都捞不回来就如实报错，不改文件。
 - 供应商：`<.dsh>/profiles/<profile>/cordis.patch.yml` 里 `llm-pi-ai` 的 `config.providers`。
-  认领规则（2.5.6 起**只认两个信号**，其它一律不碰）：
-  1. `baseURL` 的域名就是 `madmodel.cs.tsinghua.edu.cn`（认得出就是我家的服务）；
-  2. provider 键名就叫 `madmodel`，且它确实像我们的（站点地址 / 我们的 `apiKeyEnv` /
-     键名为 madmodel 的本地转发）。
+  认领规则（2.7 起）：**只认键名正好是 `madmodel`，且它确实像本程序的**
+  （站点地址 / 我们的 `apiKeyEnv` / 该键下的本地转发）。其它键名即使地址是清华站点，
+  也只提醒、不认领。
   **"光有 `apiKeyEnv: MADMODEL_API_KEY`"不再作为认领依据**：老版本曾用"本地转发就算我们的"
   这条宽规则误改过 `ollama` / `isearcher` 这类别人的本地 provider，并把我们的 `apiKeyEnv`
   写在它们身上；再用这个标记去认领，就会一次又一次继续改人家（用户报的
@@ -123,40 +130,44 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
   写之前还有一道硬护栏：如果该 provider 的 `apiKeyEnv` 另有其人且域名不是清华站，直接报错退出、
   一个字节都不写。扫到"带着我们的标记、地址却不是清华站、键名也不是 madmodel"的 provider 时，
   只提醒用户去检查/从备份还原，程序不动它。
-  不勾"统一所有 profile"时，profile 是否归我们管只看正文里有没有清华域名或 `madmodel:` 键
-  （不再看"出现过 MADMODEL_API_KEY"，避免被残留标记带偏）。找不到我们的 provider 时，
-  `madmodel` 键空着才新建；键被别的配置占用则**报错并保持文件原样，不覆盖**。
+  profile 是否归本程序由 YAML 解析结果决定，不再搜索正文。没有受管 profile 时，只在一个
+  默认 profile（优先 `desktop`）自动创建 `madmodel`；`madmodel` 键被别的配置占用则报错。
+  “统一所有 profile”已移除，不会再批量写入或强制切换所有 profile 的默认模型。
 - 只合并我们负责的字段：`apiKeyEnv` 与 `models`；`displayName` 只在空、或被填成模型 id 时纠正，
   `baseURL` / `api` / `reasoning` 只在缺失时补上，用户自己改过的值不动。
 - **思考档（2.5.3 起的规则）**：provider 级 `reasoning` **只在"用户设的值有模型不支持"时**才改成
   公共档位（否则 DSH 会直接报 `UNSUPPORTED_REASONING_EFFORT`）；合法的用户值一个字都不改，
   原本没有这个字段也不替用户加（只有程序新建 provider 时才写一个公共兜底档）。
-  `agent-default-model.reasoningEffort` 同理：合法保留、非法或缺失才补。
-- 模型 id 被写串（例如显示名被填进 id、或默认模型指向别的 provider 的模型）时自动修回；
-  勾选"统一所有 profile 到 madmodel"后处理全部 profile，并把 `agent-default-model` 指到
-  `madmodel`，同时保证它的 `model` 是 madmodel 下真实存在的 id。
+  `agent-default-model.reasoningEffort` 同理：合法保留，已有但非法才修；原本缺失不新增，
+  只有程序刚创建默认模型时才写兜底。
+- 模型 id 被写串时只修本程序 provider；默认模型已指向 `madmodel` 时才修复其模型 id，
+  用户选择别的 provider 时不动。
 
 ### `targets/ccswitch.py`
 - 数据库 `cc-switch.db`：
   - `providers` 行 `(id=deepseek-thu, app_type=codex)`：更新 `settings_config.auth.OPENAI_API_KEY`，
     保留 `config`（Codex TOML）与其它字段；
   - `providers.meta`：写入 `apiFormat = "openai_chat"`（本地路由据此把 Responses 转成 Chat）；
-  - `is_current = 1`，并把其它 codex 供应商置 0；
+  - 只有开启“激活当前路由”时才设置 `is_current = 1`，并把其它 codex 供应商置 0；
   - 刷新**同站点旧卡片**（`settings_config` 里出现 madmodel 域名的其它供应商）的 Token。
-- `settings.json`：`currentProviderCodex = "deepseek-thu"`。
-- `live-state.json`：`apps.codex.proxy_route = "deepseek-thu"`（`mode` 保持原样）。
+- `settings.json` / `live-state.json` 同样只在开启“激活当前路由”时写。
 - 写库前用 SQLite 备份接口做一致性备份；`database is locked` 时提示关闭 CC Switch。
 - 先算清楚"要写什么"：卡片、`is_current`、同站点旧卡片都无需改动时**不备份也不写库**
   （CC Switch 正在运行时尤其重要）。
 - 刷新"同站点旧卡片"的令牌时只替换**值是 JWT**、或字段名**正好**是
   `OPENAI_API_KEY` / `api_key` / `token` 之类的位置（2.5.5 起），
   不再按"名字里含 token 就算"的宽规则乱换 —— 同一张卡片里别的模型的 key 必须原样保留。
+- 数据库成功后若路由写入失败，按本次加密变更日志回滚卡片和已经写成功的 JSON；
+  这一步有专门的故障注入测试。
 
 ### `backup.py`
 每次写入前把原文件复制到 `private/backups/<时间戳>-<标签>/`，并写入
-`private/backups/index.json`（源路径、备份路径、时间、sha256、是否原始备份）。SQLite 用
-`Connection.backup()` 保证一致性。"还原"按钮恢复每个源文件**最早**的那份备份
-（即首次修改前的状态），还原前会先把当前状态也备份一份。
+`private/backups/index.json`（源路径、备份路径、时间、sha256、是否原始备份）。文件内容用
+Windows DPAPI 加密；旧明文备份会在索引读取时原地迁移。SQLite 用 `Connection.backup()`
+保证一致性后再加密。
+
+新版“还原”优先读取 `private/changes/` 的字段级加密日志并逆向撤销；只有没有字段日志的旧备份
+才允许在显式高风险确认后做整文件恢复。整文件恢复 SQLite 前会先清理 WAL/SHM，避免旧日志覆盖。
 
 - `begin_snapshot(label)`：让同一次操作的多份文件共用一个快照目录。
 - `_snapshot_target()`：同一目录里重名（多个 profile 都叫 `cordis.patch.yml`）时自动
@@ -167,6 +178,11 @@ DSH / CC Switch 各自开关、自定义路径、统一 profile 选项、CC Swit
 ### `backup_ops.py`
 给界面用的封装：手动备份、一键还原、以及 `auto_backup_on_first_run()`——
 程序第一次运行时给每个目标文件留一份带 `original` 标记的原始备份，重复调用不会重复记账。
+
+### `change_journal.py`
+每次成功写入记录一条 DPAPI 加密的字段级操作。记录内容包括 DSH 凭据行、DSH provider/default
+字段的前后值、CC Switch 自己卡片字段、路由键和可选激活状态。还原时从新到旧处理；只有当前值
+仍等于本程序最后写入值时才改，冲突字段保留并报告。CC Switch 跨文件失败回滚也复用这些记录。
 
 ### `uninstall.py`
 「干净卸载」：可选先还原 DSH / CC Switch 到第一次备份，再按 `paths.MANAGED_ENTRIES`
@@ -193,9 +209,14 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 `launch_command()` 供"重启程序"用。
 
 ### `state_store.py`
-`state.json`（在 private 里）：最近 Token、时间戳、上次同步摘要，以及两条启动提醒的
+`state.json`（在 private 里）：最近 Token 的 DPAPI 密文、时间戳、上次同步摘要，以及两条启动提醒的
 "已处理"标记（`desktop_note_ack` / `targets_note_ack`）——按需求写在 private，
 所以它们也会随"换位置"一起搬走、被"干净卸载"一起清掉。
+
+### `crypto.py` / `credentials.py`
+`crypto.py` 直接调用 Windows DPAPI（`CryptProtectData` / `CryptUnprotectData`），用于 Token、
+备份和变更日志；密文只能由同一 Windows 用户解密。`credentials.py` 通过 Windows Credential
+Manager 保存可选的自动登录账号密码，密码不进入 settings/state/log。
 
 ### `sync.py`
 编排：校验 Token → 逐个目标探测 → 备份 → 写入 → 汇总报告。不依赖 Qt，可单独测试。
@@ -214,8 +235,8 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
   只有真的两边都没有才提醒"先安装"。
 
 ### `ui/`
-- `main_window.py`：状态区 + 操作按钮（含「创建桌面快捷方式」）+ 设置项 + 日志视图 + 托盘。
-  托盘图标左键开窗、右键菜单；关闭窗口即隐藏到托盘。
+- `main_window.py`：精简状态区 + 立即同步/设置/退出 + 下次同步时间 + 托盘。
+  日志、预检、备份、还原、数据目录、快捷方式和关于全部移入设置。托盘固定五项。
   启动流程（2.5 起）：`startup_then_sync()` → 先 `_check_desktop_private()`（程序在桌面根目录
   时提醒一次，三个选择），再 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
   都通过才跑"启动时立即同步"。两条提醒的"已处理"状态写在 private 的 `state.json` 里。
@@ -223,7 +244,8 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
   2.5.1 起，桌面提醒其实由 `app.py` 在**创建任何目录之前**调 `data_location.desktop_notice()`
   完成（`MainWindow` 里那条只是兜底）；搬家/卸载前会先 `_prepare_for_data_move()` /
   `prepare_for_uninstall()` 放开浏览器档案、日志句柄与单实例锁，否则那些文件删不掉。
-- `settings_dialog.py`：**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
+- `settings_dialog.py`：五页分类设置 + 底部「应用/确定/取消」。使用草稿副本；
+  应用调用父窗口立即保存，取消不会把控件值写回。**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
   千万不要再造第二个 `QVBoxLayout(self)`：后建的会把先挂的布局顶掉，对话框会变成空窗口
   （2.4 踩过一次，`test_settings_dialog_is_actually_openable` 是这条的回归用例）。
   2.5 起多了「运行数据与维护」一块：private 位置（+ 更改位置）、恢复默认设置、干净卸载。
@@ -261,16 +283,16 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 | 文件 | 只写什么 | 保证方式 |
 | --- | --- | --- |
 | `.dsh/.credentials.yaml` | `refs.MADMODEL_API_KEY` 这一行 | **行级替换**：别的地方（其它工具的 key、`records`、注释、单引号风格）一个字节都不动；只有文件坏掉需要重建时才整份重写（先留底、日志说明） |
-| `.dsh/profiles/*/cordis.patch.yml` | ① 我们自己的 provider 块（`apiKeyEnv` / `models` / 缺失字段）；② 真要改时的 `agent-default-model` 条目 | **块级替换**：把新文本里这两块贴回原文件，其余部分（别人的 provider、其它条目、注释、引号、流式列表写法）原文照抄；**新增 provider 时只往我们这个条目（`llm-pi-ai`）的 `providers:` 块末尾插入**（同一文件别的条目也可能有 providers，插入范围限定在本条目内）；同一文件里还有别的 provider 时**禁止整份重写**，块/条目定位不到就报错、这次不写；条目定位按"整块文本匹配 id/name"（引号、字段顺序都能认），数据层说条目已存在而文本层定位不到时绝不追加；认领只认"域名是清华站点"或"键名就叫 madmodel"，不再靠 `apiKeyEnv` 这种可能被旧版本污染的标记；写前还有"不是我们的就报错退出"的硬护栏 |
-| `.cc-switch/cc-switch.db` | `(deepseek-thu, codex)` 这张卡片的 token / meta / name / is_current | 其它卡片的内容不动；`is_current` 的置位只作用于 codex 应用（"当前供应商"这个语义本身）；**默认不再刷新别人的卡片**（想刷要在设置里显式打开 `顺带刷新同站点旧卡片的令牌`，且只替换 Token 字段） |
-| `.cc-switch/settings.json` | `currentProviderCodex` 这一行 | **行级替换** + 替换后 `json.loads` 校验等于目标数据；值没变就连排版都不写；键还不存在时**只往对象末尾最小插入一行**（别处字节不动），同名键不唯一 / 结构不认识才退回整份重排（仍只改值） |
-| `.cc-switch/live-state.json` | `apps.codex.proxy_route` 这一行 | 同上；缺 `apps.codex` 这类中间层时整块补出缺的部分，别的应用（例如 claude）的紧凑写法一字不动（`contract` 等其它字段保持原样） |
-| `private/**` | 我们自己的设置 / 状态 / 日志 / 备份 / 浏览器会话 / 模型缓存 | 都是本程序的数据，换位置与卸载只按 `paths.MANAGED_ENTRIES` 处理 |
+| `.dsh/profiles/<受管 profile>/cordis.patch.yml` | 键名正好为 `madmodel` 的本程序 provider 字段；自动创建时的 `agent-default-model` | **块级替换**；新增 provider 只插入 `llm-pi-ai` 自己的 `providers:`；同一文件有其它 provider 时禁止整份重写；profile 范围由 YAML 解析决定且最多自动创建一份；任何其它键名都不认领 |
+| `.cc-switch/cc-switch.db` | `(deepseek-thu, codex)` 卡片的 token / meta / name；可选 `is_current` | 其它卡片内容不动；`is_current` 仅在“激活当前路由”显式开启时改；默认不刷新别人的卡片 |
+| `.cc-switch/settings.json` | 可选 `currentProviderCodex` | 仅在“激活当前路由”开启时写；行级替换，值没变不写 |
+| `.cc-switch/live-state.json` | 可选 `apps.codex.proxy_route` | 仅在“激活当前路由”开启时写；其它应用与字段原样保留 |
+| `private/**` | 设置 / DPAPI 状态 / 日志 / 加密备份 / 字段日志 / 浏览器会话 / 模型缓存 | 换位置与卸载只按 `paths.MANAGED_ENTRIES` 处理；删除只进回收站 |
 | 桌面快捷方式、开机启动注册表项 | 只在用户点按钮 / 勾选时写 | 不做后台自动写入 |
 
 另外：
 
-- 「一键还原」/「干净卸载」会写回 DSH / CC Switch 的文件 —— 那是用户**明确点的操作**，
-  界面上有二次确认与风险说明。
+- 「还原」/「干净卸载」会写回 DSH / CC Switch 的字段 —— 那是用户**明确点的操作**；
+  新版优先字段级撤销，旧备份才要求额外高风险确认。
 - 写入前一律先备份；写失败有回滚；写坏的目标不会被留在那儿。
 

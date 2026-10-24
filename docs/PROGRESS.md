@@ -24,18 +24,39 @@
 | 2.5.9 | 发布前全量体检：DSH 新增 provider 不再整份重写、CC Switch JSON 最小插入、预检全局失败阻塞写入、坏 JSON 不再崩启动、搬家失败回滚、死逻辑/死参数归零 | ✅ 已完成（留档 `releases/2.5.9/`） |
 | 2.6.0 | 正式版打磨：Qt 中文标准按钮、CC Switch 运行策略合并（设置 v3→v4 迁移）、恢复默认同步所有控件、关于对话框、预检后台化、桌面提醒不重复、新增使用手册 | ✅ 已完成（留档 `releases/2.6.0/`） |
 | 2.6.1 | 真机三条反馈：DSH 坏 baseURL 纠正（认领时）、开机自动更新整链路加固（延后/预检/重试/静默失败弹窗/日志兜底）、CC Switch 提交前读回校验 | ✅ 已完成（留档 `releases/2.6.1/`） |
+| 2.7.0 | 问题清单 10 组逐项处理：DPAPI、可选自动登录、60±10 分钟、JWT 候选、DSH/CC Switch 写入拆分、字段级还原、界面重整、版本信息 | ✅ 已完成，待最终打包与发布 |
 
-两个版本的**单文件程序**都要留档在 `releases/<版本>/`（不进 Git：单文件 180 MB 超过 GitHub
-单文件 100 MB 上限，改用 `releases/<版本>/SHA256.txt` 记录校验和）。
+两个版本的**单文件程序**都要留档在 `releases/<版本>/`（产物不进 Git，使用
+`releases/<版本>/SHA256.txt` 记录校验和；GitHub Release 资产本身支持更大的附件）。
 
 ## 环境与约定
 
 - 开发环境：`D:\2\program\codex\autoThuDeepSeekAPI\autoThuDeepSeekAPI`，`.venv` 里装
   PySide6 6.12 / PyYAML / ruamel.yaml / PyInstaller 6.22。
-- 测试：`python -m unittest discover -s tests -t .`（当前 41 项）。
+- 测试：`python -m unittest discover -s tests -t .`（当前 168 项）。
 - 打包：`powershell -File build\build_app.ps1`（同时出文件夹版与单文件版）。
 - 自检：`autoThuDeepSeekAPI.exe --selftest`（起本地网页写假 Token，验证捕获链路）。
 - 运行数据全部在程序目录的 `private/`，不进 Git；`dist/`、`releases/` 也不进 Git。
+
+## 2.7 阶段
+
+### 已完成
+
+1. 安全：Token、备份、变更日志改 DPAPI；浏览器档案当前用户 ACL；自动登录凭据进
+   Windows Credential Manager。
+2. 自动同步默认 60 分钟并随机 ±10；JWT 多候选评分；最小对话校验默认关闭。
+3. DSH 移除全 profile 统一，只认键名 `madmodel`；没有受管 profile 时只自动创建一份；
+   凭据与 Provider 分开关；默认思考档缺失时不擅自补。
+4. CC Switch 卡片与路由激活分开关，路由默认关；路由失败跨文件回滚。
+5. 字段级变更日志与冲突保护；旧备份整文件还原需额外高风险确认。
+6. 主窗口、设置五页分类、托盘五项、应用/确定/取消；路径探测增加环境变量和注册表安装位置。
+7. EXE 文件版本资源；测试 148 → 168 项全绿。
+
+### 待最终验收
+
+- 打包文件夹版与单文件版，分别跑 `--selftest`；
+- 用真实 DSH / CC Switch 做一次只读预检和真实设备体检（不自动修改）；
+- 留档 `releases/2.7.0/`、更新 SHA256、提交并打 tag。
 
 ## 2.0 阶段（本轮）
 
@@ -473,8 +494,8 @@ HTTP handler 的 `do_GET` / `log_message` 是框架回调，保留。
 
 - 站点前端结构与接口可能变化，模型列表与校验逻辑要跟着改。
 - DSH 自己也会写 profile 文件；同步后建议重启 DSH，避免它用内存里的旧配置覆盖回去。
-- CC Switch 正在运行时改它的数据库有被覆盖的风险。程序现在默认**不弹提示、直接改**；
-  想更稳妥就先手动退出 CC Switch 再同步，或在设置里把提醒打开。
+- CC Switch 正在运行时改数据库有被覆盖的风险。2.7 起默认**先提示**，且路由激活默认关闭。
+- DPAPI 密文只能由同一 Windows 账户解密；浏览器档案受当前用户 ACL 保护，不额外加密。
 - 单文件版启动比文件夹版慢（每次都要解包到临时目录），日常建议用文件夹版。
 
 ## 怎么回退

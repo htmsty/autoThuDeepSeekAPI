@@ -117,7 +117,13 @@ def _chat_verdict(token: str, model_id: str | None, timeout: int) -> VerifyResul
     return VerifyResult(None, f"站点返回 HTTP {status}：{snippet or '（无内容）'}", status)
 
 
-def verify_token(token: str, model_id: str | None = None, timeout: int | None = None) -> VerifyResult:
+def verify_token(
+    token: str,
+    model_id: str | None = None,
+    timeout: int | None = None,
+    *,
+    allow_chat_fallback: bool = False,
+) -> VerifyResult:
     """先走站点的会话校验（快、不花额度），给不出结论时再发一次最小对话请求。"""
 
     light = _light_verdict(token, timeout or LIGHT_TIMEOUT)
@@ -130,6 +136,12 @@ def verify_token(token: str, model_id: str | None = None, timeout: int | None = 
     # 站点回的是网页（SPA / 登录页）时，再发一次对话请求也是白等 30 秒。
     if light.looks_like_html:
         return light
+    if not allow_chat_fallback:
+        return VerifyResult(
+            None,
+            light.detail + "；为避免消耗额度，没有发送最小对话校验",
+            light.status,
+        )
 
     logger.info("会话校验未给出结论（%s），改用最小对话请求核对", light.detail)
     return _chat_verdict(token, model_id, timeout or CHAT_TIMEOUT)

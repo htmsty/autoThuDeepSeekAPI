@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from ..constants import TOKEN_LIFETIME_HOURS
@@ -23,6 +24,83 @@ def find_jwt(text: str | None) -> str | None:
         return None
     match = JWT_PATTERN.search(text)
     return match.group(0) if match else None
+
+
+@dataclass(frozen=True)
+class JwtCandidate:
+    token: str
+    source: str = ""
+    key: str = ""
+    url: str = ""
+
+
+def _candidate_score(candidate: JwtCandidate) -> int:
+    """Rank candidates without assuming a fixed storage key.
+
+    Network responses and cookies from the MadModel origin are strongest. A
+    plain JWT in unrelated page text is intentionally weak so an error page or
+    documentation example cannot win by appearing first.
+    """
+
+    token = candidate.token
+    source = candidate.source.lower()
+    key = candidate.key.lower()
+    url = candidate.url.lower()
+    score = 0
+    if source == "network":
+        score += 60
+    elif source == "cookie":
+        score += 50
+    elif source in {"localstorage", "sessionstorage"}:
+        score += 30
+    elif source == "text":
+        score += 5
+    if "madmodel.cs.tsinghua.edu.cn" in url:
+        score += 25
+    if any(word in key for word in ("token", "auth", "jwt", "access", "credential")):
+        score += 20
+    payload = decode_payload(token)
+    if "exp" in payload:
+        score += 15
+    if any(word in payload for word in ("sub", "user", "uid", "username")):
+        score += 8
+    expired_value = is_expired(token)
+    if expired_value is True:
+        score -= 100
+    elif expired_value is False:
+        score += 20
+    return score
+
+
+def choose_jwt(candidates: list[JwtCandidate]) -> str | None:
+    """Choose a high-confidence JWT or return None when the result is ambiguous."""
+
+    unique: dict[str, JwtCandidate] = {}
+    best_scores: dict[str, int] = {}
+    for candidate in candidates:
+        token = find_jwt(candidate.token)
+        if not token:
+            continue
+        normalized = JwtCandidate(token, candidate.source, candidate.key, candidate.url)
+        score = _candidate_score(normalized)
+        if token not in unique or score > best_scores[token]:
+            unique[token] = normalized
+            best_scores[token] = score
+    if not unique:
+        return None
+    ranked = sorted(
+        ((best_scores[token], token) for token in unique),
+        reverse=True,
+    )
+    if len(ranked) == 1:
+        return ranked[0][1]
+    best_score, best_token = ranked[0]
+    second_score, second_token = ranked[1]
+    if best_token != second_token and best_score > second_score:
+        # A tie or a one-point accident is not enough evidence. Prefer waiting
+        # for a network response instead of silently writing a wrong token.
+        return best_token if best_score - second_score >= 10 else None
+    return None
 
 
 def _b64url_decode(segment: str) -> bytes:

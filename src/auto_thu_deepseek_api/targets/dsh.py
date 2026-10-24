@@ -10,8 +10,9 @@ from urllib.parse import urlsplit
 
 from ruamel.yaml import YAML
 
-from .. import constants
+from .. import constants, paths
 from ..backup import BackupManager
+from ..change_journal import ChangeJournal
 from ..paths import TargetPaths
 from ..token.jwt_utils import fingerprint
 from .base import ApplyResult, RenderedFile, TargetStatus, emit, write_with_rollback
@@ -21,6 +22,27 @@ logger = logging.getLogger(__name__)
 # 站点的模型 id 长这样：DeepSeek-V4.1-Flash、qwen3.8-27b。
 # 出现空格、括号、逗号这类字符多半是字段被填串了（显示名填进了 id），要修掉。
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,63}$")
+MANAGED_PROVIDER_FIELDS = (
+    "displayName",
+    "api",
+    "baseURL",
+    "apiKeyEnv",
+    "models",
+    "reasoning",
+)
+MANAGED_DEFAULT_FIELDS = ("provider", "model", "reasoningEffort")
+
+
+def _plain(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    if isinstance(value, tuple):
+        return [_plain(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _yaml(style_from: str | None = None) -> YAML:
@@ -47,11 +69,16 @@ class DshTarget:
     def __init__(
         self,
         paths: TargetPaths,
-        unify_all_profiles: bool = False,
+        *,
+        enable_credentials: bool = True,
+        enable_provider: bool = True,
+        profile: str = "",
         default_model_id: str = "",
     ) -> None:
         self.paths = paths
-        self.unify_all_profiles = unify_all_profiles
+        self.enable_credentials = enable_credentials
+        self.enable_provider = enable_provider
+        self.profile = (profile or "").strip()
         self.default_model_id = (default_model_id or "").strip()
         # 干跑：只把"将要写入的内容"渲染出来，不备份也不落盘（预检用）
         self.dry_run = False
@@ -78,7 +105,9 @@ class DshTarget:
     def apply(self, token: str, models: list[dict], backup: BackupManager) -> ApplyResult:
         result = ApplyResult(self.key, self.label)
         credentials = self.paths.credentials_file
-        if credentials and credentials.exists():
+        if not self.enable_credentials:
+            result.note("凭据写入已在设置中关闭")
+        elif credentials and credentials.exists():
             try:
                 changed = self._write_credentials(credentials, token, backup, result)
                 result.changed = result.changed or changed
@@ -87,7 +116,10 @@ class DshTarget:
         else:
             result.note(f"未找到凭据文件，跳过：{credentials}")
 
-        self._write_profiles(models, backup, result)
+        if self.enable_provider:
+            self._write_profiles(models, backup, result)
+        else:
+            result.note("Provider 写入已在设置中关闭")
         return result
 
     def _write_credentials(
@@ -130,6 +162,8 @@ class DshTarget:
             )
             return False
 
+        before_present = constants.DSH_CREDENTIAL_KEY in refs
+        before_value = refs.get(constants.DSH_CREDENTIAL_KEY)
         label = "dsh-credentials-broken" if rebuilt else "dsh-credentials"
         refs[constants.DSH_CREDENTIAL_KEY] = token
 
@@ -167,6 +201,17 @@ class DshTarget:
             return False
         result.note(f"已更新凭据 {path}")
         logger.info("DSH 凭据已更新：%s", path)
+        if not rebuilt:
+            ChangeJournal.for_backup(backup).record(
+                "dsh_credentials",
+                path=str(path),
+                key=constants.DSH_CREDENTIAL_KEY,
+                before_present=before_present,
+                before_value=str(before_value) if before_present else "",
+                after_value=token,
+            )
+        else:
+            result.note("凭据文件本次是从损坏内容重建的，字段级还原只能跳过；整份旧文件仍在备份里")
         return True
 
     @staticmethod
@@ -197,20 +242,22 @@ class DshTarget:
         return [path for path in files if path.is_file()]
 
     def _in_scope(self, path: Path) -> bool:
-        if self.unify_all_profiles:
-            return True
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return False
-        # 只有"明确就是我们"的 profile 才在范围内：正文里有清华站点域名，或有 madmodel 这个 provider 键。
-        # 早先还看"正文里有没有 MADMODEL_API_KEY"——可这个标记可能是旧版本误写到别人的 provider
-        # （例如 isearcher / ollama）身上的，于是会把别人的 profile 也拉进来处理，必须去掉。
-        # 另外 "madmodel:" 必须出现在**键的位置**（行首缩进后），注释里提到它不算。
-        key_line = re.compile(
-            rf"(?m)^\s*['\"]?{re.escape(constants.DSH_PROVIDER_KEY)}['\"]?\s*:"
-        )
-        return constants.MADMODEL_HOST in text or key_line.search(text) is not None
+        try:
+            data = _yaml(text).load(text)
+        except Exception:  # noqa: BLE001 - 坏文件不认领，避免误写别的 profile
+            return False
+        if not isinstance(data, list):
+            return False
+        entry = self._find_entry(data, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME)
+        config = entry.get("config") if isinstance(entry, dict) else None
+        providers = config.get("providers") if isinstance(config, dict) else None
+        if not isinstance(providers, dict):
+            return False
+        return self._find_provider(providers) is not None
 
     def _write_profiles(
         self,
@@ -223,14 +270,33 @@ class DshTarget:
             result.note("没有找到 profile 补丁文件，跳过供应商写入")
             return
 
-        candidates = [path for path in files if path.parent.name != "" and path.parent.name not in {"node_modules"}]
-        scoped = [path for path in candidates if self._in_scope(path)]
+        candidates = [
+            path
+            for path in files
+            if path.parent.name and path.parent.name not in {"node_modules"}
+        ]
+        if self.profile:
+            scoped = [path for path in candidates if path.parent.name == self.profile]
+            if not scoped:
+                result.fail(f"指定的 DSH profile 不存在：{self.profile}")
+                return
+        else:
+            scoped = [path for path in candidates if self._in_scope(path)]
         if not scoped:
-            result.note(
-                "没有 profile 已配置 madmodel（默认只写这类 profile；"
-                "需要全部统一请在设置里勾选「统一所有 profile 到 madmodel」）"
-            )
-            return
+            # 用户确认过需要自动创建。只选一个明确的默认托管 profile，
+            # 绝不批量复制到所有 profile。
+            preferred = [
+                path
+                for name in ("desktop", "web")
+                for path in candidates
+                if path.parent.name == name
+            ]
+            selected = preferred[0] if preferred else (candidates[0] if candidates else None)
+            if selected is None:
+                result.fail("没有可用的 profile 补丁文件，无法自动创建 madmodel")
+                return
+            scoped = [selected]
+            result.note(f"没有现成的受管 profile，将在 {selected.parent.name} 中自动创建 madmodel")
 
         for path in scoped:
             try:
@@ -252,7 +318,18 @@ class DshTarget:
         if not isinstance(data, list):
             raise ValueError("补丁文件顶层不是数组")
 
+        default_entry_before_snapshot = self._find_entry(
+            data,
+            constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+            constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+        )
+        default_entry_before = (
+            copy.deepcopy(default_entry_before_snapshot)
+            if default_entry_before_snapshot is not None
+            else None
+        )
         entry = self._find_entry(data, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME)
+        llm_entry_existed_before = entry is not None
         if entry is None:
             entry = {"id": constants.DSH_LLM_ENTRY_ID, "name": constants.DSH_LLM_ENTRY_NAME, "config": {}}
             data.append(entry)
@@ -273,6 +350,9 @@ class DshTarget:
         found = self._find_provider(providers)
         name = path.parent.name
         created_here = False
+        provider_before_original: dict | None = (
+            copy.deepcopy(found[1]) if found is not None else None
+        )
         self._warn_about_suspicious_providers(
             providers, ours_key=found[0] if found else "", profile_name=name, result=result
         )
@@ -407,7 +487,7 @@ class DshTarget:
             )
             is not None
         )
-        if self.unify_all_profiles:
+        if created_here:
             entry_changed = self._point_default_model(data, merged, provider_key, result)
         else:
             entry_changed = self._repair_default_model(data, merged, provider_key)
@@ -460,6 +540,27 @@ class DshTarget:
             return False
         result.note(f"已更新供应商配置 {path}")
         logger.info("DSH profile 已更新：%s", path)
+        default_entry_after = self._find_entry(
+            data,
+            constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+            constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+        )
+        ChangeJournal.for_backup(backup).record(
+            "dsh_profile",
+            path=str(path),
+            profile=path.parent.name,
+            provider_key=provider_key,
+            provider_created=created_here,
+            llm_entry_created=not llm_entry_existed_before,
+            provider_before=_plain(provider_before_original),
+            provider_after=_plain(provider),
+            managed_provider_fields=list(MANAGED_PROVIDER_FIELDS),
+            default_changed=bool(entry_changed),
+            default_created=bool(entry_changed and not entry_existed_before),
+            default_before=_plain(default_entry_before),
+            default_after=_plain(default_entry_after),
+            managed_default_fields=list(MANAGED_DEFAULT_FIELDS),
+        )
         return True
 
     @staticmethod
@@ -553,10 +654,8 @@ class DshTarget:
     def _find_provider(cls, providers: dict) -> tuple[str, dict] | None:
         """只认**看得出来的**我们自己，其它一律不碰（宁可新建也不猜）。
 
-        只有两种情况算我们的 provider：
-        1. `baseURL` 的域名就是清华站点（`madmodel.cs.tsinghua.edu.cn`）——认得出就是它；
-        2. provider 的键名就叫 `madmodel`——这个名字是我们约定的，且 `apiKeyEnv` 要么空、
-           要么就是我们的标记（键被别人的配置占着时会走"被占用"的报错分支，不覆盖）。
+        只认键名正好是 `madmodel`、且 apiKeyEnv / baseURL 看起来属于本程序的 provider。
+        其它键名即便带有旧版留下的标记，也只提醒、不认领。
 
         以前还有一条"只要是本地转发 `127.0.0.1:*/v1` 就算我们的"：这会误伤用户自己的
         `ollama`、`isearcher` 这类本地 provider（改掉它们的 `apiKeyEnv`、模型列表，
@@ -578,11 +677,8 @@ class DshTarget:
             if looks_ours:
                 return str(constants.DSH_PROVIDER_KEY), named
 
-        for key, entry in providers.items():
-            if not isinstance(entry, dict) or str(key) == constants.DSH_PROVIDER_KEY:
-                continue
-            if cls._is_madmodel_url(str(entry.get("baseURL") or "")):
-                return str(key), entry
+        # 其它键名即使地址像清华、或带着旧版误写的 apiKeyEnv，也只提醒、不认领。
+        # 这是“绝不改用户其它模型配置”的硬边界；需要时会在 madmodel 键下新建一份。
         return None
 
     # —— 只换我们自己的那两块文本，其余原文照抄 ——
@@ -735,7 +831,10 @@ class DshTarget:
         provider_changed: bool,
         entry_changed: bool,
         provider_created: bool = False,
+        provider_removed: bool = False,
+        llm_entry_removed: bool = False,
         entry_existed: bool = True,
+        entry_removed: bool = False,
         allow_full_rewrite: bool = True,
     ) -> str:
         """把新文本里"我们改动的那几块"贴回原文件，别的地方一个字节都不动。
@@ -764,7 +863,20 @@ class DshTarget:
         edits: list[tuple[int, int, list[str]]] = []
         appends: list[str] = []
 
-        if provider_changed:
+        if llm_entry_removed:
+            orig_span = cls._entry_span(
+                orig_lines, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME
+            )
+            if orig_span is None:
+                return cannot_locate("原文里定位不到要删除的 llm-pi-ai 条目")
+            edits.append((orig_span[0], orig_span[1], []))
+
+        if provider_removed:
+            orig_span = cls._provider_span(orig_lines, provider_key)
+            if orig_span is None:
+                return cannot_locate(f"原文里定位不到要删除的 provider {provider_key}")
+            edits.append((orig_span[0], orig_span[1], []))
+        elif provider_changed:
             new_span = cls._provider_span(new_lines, provider_key)
             if new_span is None:
                 return cannot_locate(f"新文本里定位不到 provider {provider_key} 的块")
@@ -792,7 +904,16 @@ class DshTarget:
                 # 宁可报错也不整份重写，否则会连带重排同一文件里别人的 provider
                 return cannot_locate(f"原文里定位不到 provider {provider_key} 的文本块")
 
-        if entry_changed:
+        if entry_removed:
+            orig_span = cls._entry_span(
+                orig_lines,
+                constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+                constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+            )
+            if orig_span is None:
+                return cannot_locate("原文里定位不到要删除的 agent-default-model 条目")
+            edits.append((orig_span[0], orig_span[1], []))
+        elif entry_changed:
             new_span = cls._entry_span(
                 new_lines,
                 constants.DSH_DEFAULT_MODEL_ENTRY_ID,
@@ -917,7 +1038,7 @@ class DshTarget:
         before = copy.deepcopy(config)
         if model_ids and config.get("model") not in model_ids:
             config["model"] = self._preferred_model_id(model_ids)
-        self._ensure_default_effort(config, models)
+        self._ensure_default_effort(config, models, add_if_missing=False)
         return config != before
 
     # —— 思考档（reasoning effort）——
@@ -969,7 +1090,9 @@ class DshTarget:
             return True
         return all(level in item for item in declared)
 
-    def _ensure_default_effort(self, config: dict, models: list[dict]) -> None:
+    def _ensure_default_effort(
+        self, config: dict, models: list[dict], *, add_if_missing: bool
+    ) -> None:
         """默认模型的思考档必须是该模型支持的——不支持就换一个支持的。
 
         这正是"第一次运行就报 doesn't support reasoning effort medium"的根因：
@@ -981,6 +1104,8 @@ class DshTarget:
         supported = self._supported_efforts(model)
         if not supported:
             return  # 该模型没有思考档，别硬写
+        if "reasoningEffort" not in config and not add_if_missing:
+            return
         if config.get("reasoningEffort") in supported:
             return
         config["reasoningEffort"] = self._pick_effort(supported)
@@ -1015,15 +1140,207 @@ class DshTarget:
         previous = config.get("provider")
         config["provider"] = provider_key
         if previous and previous != provider_key:
-            # 这是"统一所有 profile"这个开关的语义，写清楚点免得用户以为是 bug
             result.note(
-                f"按「统一所有 profile 到 madmodel」把默认模型从 {previous} 切到 {provider_key}"
-                "（不想要就在设置里取消勾选）"
+                f"自动创建 provider 时，把默认模型从 {previous} 切到 {provider_key}"
             )
         model_ids = [str(item["id"]) for item in models if item.get("id")]
         if model_ids and config.get("model") not in model_ids:
             # 换 provider 时必须一起换 model，否则会留下"指着 madmodel 却填别的模型 id"的组合
             config["model"] = self._preferred_model_id(model_ids)
-        self._ensure_default_effort(config, models)
+        self._ensure_default_effort(config, models, add_if_missing=True)
         return config != before
+
+
+def _restore_credentials_record(record: dict) -> list[str]:
+    path = Path(str(record.get("path") or ""))
+    key = str(record.get("key") or constants.DSH_CREDENTIAL_KEY)
+    after = str(record.get("after_value") or "")
+    before = str(record.get("before_value") or "")
+    before_present = bool(record.get("before_present"))
+    if not path.is_file():
+        return [f"DSH 凭据已不存在，跳过：{path}"]
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    matched = False
+    for index, line in enumerate(lines):
+        if not re.match(rf"^\s*{re.escape(key)}\s*:", line):
+            continue
+        if after not in line:
+            return [f"DSH 凭据还原冲突：{key} 已被其他程序修改，保留当前值"]
+        matched = True
+        if before_present:
+            replaced = DshTarget._replace_ref_line(text, key, before)
+            if replaced is None:
+                return [f"DSH 凭据还原失败：无法只替换 {key} 这一行"]
+            text = replaced
+        else:
+            del lines[index]
+            text = "".join(lines)
+        break
+    if not matched:
+        return [f"DSH 凭据无需还原或字段已不存在：{path}"]
+    backup = BackupManager(paths.backups_dir(), keep=10)
+    ok, message = write_with_rollback(path, text, backup, "pre-field-restore")
+    if not ok:
+        return [f"DSH 凭据还原失败：{message}"]
+    return [f"已按字段还原 DSH 凭据 {key}：{path}"]
+
+
+def _restore_simple_fields(
+    current: dict,
+    before: dict | None,
+    after: dict | None,
+    fields: list[str],
+) -> tuple[bool, list[str]]:
+    changed = False
+    conflicts: list[str] = []
+    after = after if isinstance(after, dict) else {}
+    before = before if isinstance(before, dict) else {}
+    for field in fields:
+        if field not in after and field not in before:
+            continue
+        current_value = current.get(field)
+        after_value = after.get(field)
+        if current_value != after_value:
+            conflicts.append(field)
+            continue
+        if field in before:
+            if current.get(field) != before[field]:
+                current[field] = copy.deepcopy(before[field])
+                changed = True
+        elif field in current:
+            current.pop(field, None)
+            changed = True
+    return changed, conflicts
+
+
+def _restore_profile_record(record: dict) -> list[str]:
+    path = Path(str(record.get("path") or ""))
+    if not path.is_file():
+        return [f"DSH profile 已不存在，跳过：{path}"]
+    original = path.read_text(encoding="utf-8")
+    data = _yaml(original).load(original)
+    if not isinstance(data, list):
+        return [f"DSH profile 还原失败：{path} 顶层不是数组"]
+
+    messages: list[str] = []
+    provider_key = str(record.get("provider_key") or constants.DSH_PROVIDER_KEY)
+    llm_entry = DshTarget._find_entry(
+        data, constants.DSH_LLM_ENTRY_ID, constants.DSH_LLM_ENTRY_NAME
+    )
+    config = llm_entry.get("config") if isinstance(llm_entry, dict) else None
+    providers = config.get("providers") if isinstance(config, dict) else None
+    provider = providers.get(provider_key) if isinstance(providers, dict) else None
+
+    provider_changed = False
+    provider_removed = False
+    llm_entry_removed = False
+    if isinstance(provider, dict):
+        provider_changed, conflicts = _restore_simple_fields(
+            provider,
+            record.get("provider_before"),
+            record.get("provider_after"),
+            [str(field) for field in record.get("managed_provider_fields") or []],
+        )
+        if conflicts:
+            messages.append(
+                f"DSH profile {path.parent.name} 冲突：provider {provider_key} 的 "
+                + "、".join(conflicts)
+                + " 已被其他程序修改，这些字段保持现状"
+            )
+        if provider_changed and not provider:
+            providers.pop(provider_key, None)
+            provider_removed = True
+            if (
+                bool(record.get("llm_entry_created"))
+                and providers == {}
+                and set(llm_entry.keys()) <= {"id", "name", "config"}
+            ):
+                data.remove(llm_entry)
+                llm_entry_removed = True
+
+    entry_changed = False
+    entry_removed = False
+    default_entry = DshTarget._find_entry(
+        data,
+        constants.DSH_DEFAULT_MODEL_ENTRY_ID,
+        constants.DSH_DEFAULT_MODEL_ENTRY_NAME,
+    )
+    if bool(record.get("default_changed")) and isinstance(default_entry, dict):
+        default_config = default_entry.get("config")
+        if isinstance(default_config, dict):
+            entry_changed, conflicts = _restore_simple_fields(
+                default_config,
+                (record.get("default_before") or {}).get("config")
+                if isinstance(record.get("default_before"), dict)
+                else None,
+                (record.get("default_after") or {}).get("config")
+                if isinstance(record.get("default_after"), dict)
+                else None,
+                [str(field) for field in record.get("managed_default_fields") or []],
+            )
+            if conflicts:
+                messages.append(
+                    f"DSH profile {path.parent.name} 冲突：默认模型的 "
+                    + "、".join(conflicts)
+                    + " 已被其他程序修改，这些字段保持现状"
+                )
+            if (
+                entry_changed
+                and bool(record.get("default_created"))
+                and not default_config
+                and set(default_entry.keys()) <= {"id", "name", "config"}
+            ):
+                data.remove(default_entry)
+                entry_removed = True
+
+    if not provider_changed and not entry_changed and not llm_entry_removed:
+        return messages + [f"DSH profile 无需还原或已存在冲突：{path}"]
+
+    import io
+
+    stream = io.StringIO()
+    _yaml(original).dump(data, stream)
+    new_text = stream.getvalue()
+    foreign = False
+    for item in data:
+        item_config = item.get("config") if isinstance(item, dict) else None
+        item_providers = item_config.get("providers") if isinstance(item_config, dict) else None
+        if not isinstance(item_providers, dict):
+            continue
+        for key in item_providers:
+            if item is not llm_entry and str(key) == provider_key:
+                foreign = True
+            elif item is not llm_entry:
+                foreign = True
+    new_text = DshTarget._keep_other_blocks_verbatim(
+        original,
+        new_text,
+        provider_key=provider_key,
+        provider_changed=provider_changed and not provider_removed and not llm_entry_removed,
+        provider_removed=provider_removed and not llm_entry_removed,
+        llm_entry_removed=llm_entry_removed,
+        entry_changed=entry_changed and not entry_removed,
+        entry_removed=entry_removed,
+        allow_full_rewrite=not foreign,
+    )
+    yaml = _yaml(new_text)
+    check = yaml.load(new_text)
+    if not isinstance(check, list):
+        return messages + [f"DSH profile 还原失败：回读不是数组 {path}"]
+    backup = BackupManager(paths.backups_dir(), keep=10)
+    ok, message = write_with_rollback(path, new_text, backup, "pre-field-restore")
+    if not ok:
+        return messages + [f"DSH profile 还原失败：{message}"]
+    messages.append(f"已按字段还原 DSH profile：{path}")
+    return messages
+
+
+def restore_journal_record(record: dict) -> list[str]:
+    kind = str(record.get("kind") or "")
+    if kind == "dsh_credentials":
+        return _restore_credentials_record(record)
+    if kind == "dsh_profile":
+        return _restore_profile_record(record)
+    return [f"不支持的 DSH 变更类型：{kind}"]
 

@@ -578,7 +578,6 @@ class LogHandleTest(unittest.TestCase):
             finally:
                 logging_setup.close_file_handlers()
                 paths.data_root = original  # type: ignore[assignment]
-                logging_setup.setup_logging()
 
     def test_closing_file_handlers_unlocks_log_for_deletion(self) -> None:
         """用户遇到的 WinError 32：日志文件被占着删不掉。关掉句柄后必须能删/能搬。"""
@@ -603,7 +602,6 @@ class LogHandleTest(unittest.TestCase):
             finally:
                 logging_setup.close_file_handlers()
                 paths.data_root = original  # type: ignore[assignment]
-                logging_setup.setup_logging()  # 把日志恢复到正常位置，别影响后面的用例
 
 
 class NewVsOldInteractionTest(unittest.TestCase):
@@ -614,7 +612,20 @@ class NewVsOldInteractionTest(unittest.TestCase):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
 
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._old_data_root = paths.data_root
+        cls._data_root = Path(cls._tmp.name) / "private"
+        cls._data_root.mkdir(parents=True, exist_ok=True)
+        paths.data_root = lambda: cls._data_root  # type: ignore[assignment]
         cls.application = QApplication.instance() or QApplication(sys.argv[:1])
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        from auto_thu_deepseek_api.logging_setup import close_file_handlers
+
+        close_file_handlers()
+        paths.data_root = cls._old_data_root  # type: ignore[assignment]
+        cls._tmp.cleanup()
 
     def _window(self):  # noqa: ANN202
         from auto_thu_deepseek_api.state_store import AppState

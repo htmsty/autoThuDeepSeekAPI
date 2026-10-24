@@ -9,14 +9,15 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from auto_thu_deepseek_api import paths  # noqa: E402
-from auto_thu_deepseek_api.logging_setup import setup_logging  # noqa: E402
+from auto_thu_deepseek_api import paths, startup  # noqa: E402
+from auto_thu_deepseek_api.logging_setup import close_file_handlers, setup_logging  # noqa: E402
 from auto_thu_deepseek_api.settings import AppSettings  # noqa: E402
 from auto_thu_deepseek_api.state_store import AppState  # noqa: E402
 from auto_thu_deepseek_api.ui.main_window import MainWindow  # noqa: E402
@@ -28,26 +29,37 @@ def main() -> int:
     wants_settings = "--settings" in sys.argv
     default_name = "ui-screenshot-settings.png" if wants_settings else "ui-screenshot.png"
     output = Path(arguments[0]) if arguments else Path(default_name)
-    paths.ensure_runtime_dirs()
-    setup_logging()
+    with tempfile.TemporaryDirectory() as tmp:
+        original_data_root = paths.data_root
+        original_startup_enabled = startup.is_enabled
+        paths.data_root = lambda: Path(tmp) / "private"  # type: ignore[assignment]
+        # 截图不能因为开发机恰好开了开机启动就去改写注册表路径。
+        startup.is_enabled = lambda: False  # type: ignore[assignment]
+        try:
+            paths.ensure_runtime_dirs()
+            setup_logging()
 
-    application = QApplication(sys.argv[:1])
-    settings = AppSettings()
-    state = AppState()
-    window = MainWindow(settings, state)
-    if wants_settings:
-        dialog = SettingsDialog(settings, window)
-        dialog.show()
-        application.processEvents()
-        dialog.grab().save(str(output))
-        dialog.close()
-    else:
-        window.resize(900, 660)
-        window.show()
-        application.processEvents()
-        window.grab().save(str(output))
-    print(f"已截图：{output}")
-    window.quit_app()
+            application = QApplication(sys.argv[:1])
+            settings = AppSettings()
+            state = AppState()
+            window = MainWindow(settings, state)
+            if wants_settings:
+                dialog = SettingsDialog(settings, window)
+                dialog.show()
+                application.processEvents()
+                dialog.grab().save(str(output))
+                dialog.close()
+            else:
+                window.resize(900, 660)
+                window.show()
+                application.processEvents()
+                window.grab().save(str(output))
+            print(f"已截图：{output}")
+            window.quit_app()
+        finally:
+            close_file_handlers()
+            startup.is_enabled = original_startup_enabled  # type: ignore[assignment]
+            paths.data_root = original_data_root  # type: ignore[assignment]
     return 0
 
 

@@ -51,11 +51,19 @@ class UiSmokeTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory()
         cls._old_localappdata = os.environ.get("LOCALAPPDATA")
+        cls._old_data_root = paths.data_root
         os.environ["LOCALAPPDATA"] = cls._tmp.name
+        cls._data_root = Path(cls._tmp.name) / "private"
+        cls._data_root.mkdir(parents=True, exist_ok=True)
+        paths.data_root = lambda: cls._data_root  # type: ignore[assignment]
         cls.application = QApplication.instance() or QApplication(sys.argv[:1])
 
     @classmethod
     def tearDownClass(cls) -> None:
+        from auto_thu_deepseek_api.logging_setup import close_file_handlers
+
+        close_file_handlers()
+        paths.data_root = cls._old_data_root  # type: ignore[assignment]
         if cls._old_localappdata is None:
             os.environ.pop("LOCALAPPDATA", None)
         else:
@@ -470,11 +478,19 @@ class UiInteractionTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory()
         cls._old_localappdata = os.environ.get("LOCALAPPDATA")
+        cls._old_data_root = paths.data_root
         os.environ["LOCALAPPDATA"] = cls._tmp.name
+        cls._data_root = Path(cls._tmp.name) / "private"
+        cls._data_root.mkdir(parents=True, exist_ok=True)
+        paths.data_root = lambda: cls._data_root  # type: ignore[assignment]
         cls.application = QApplication.instance() or QApplication(sys.argv[:1])
 
     @classmethod
     def tearDownClass(cls) -> None:
+        from auto_thu_deepseek_api.logging_setup import close_file_handlers
+
+        close_file_handlers()
+        paths.data_root = cls._old_data_root  # type: ignore[assignment]
         if cls._old_localappdata is None:
             os.environ.pop("LOCALAPPDATA", None)
         else:

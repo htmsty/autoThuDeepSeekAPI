@@ -58,7 +58,7 @@ private 的位置**可以改**（2.5 起）：
   字段变更日志、浏览器会话。换位置与卸载都按它来。
 - **删除只走回收站**：`recycle_path()`（Windows Shell `SHFileOperation` + `FOF_ALLOWUNDO`）；
   回收站不可用时 `delete_path()` 保持原样并报告，不再退化成永久删除。
-- `resolve_*_paths()` 在默认目录、环境变量、常见配置目录与注册表卸载项之间只做有界探测；
+- `resolve_*_paths()` 在默认目录、环境变量、常见配置目录、注册表卸载项与开始菜单快捷方式之间只做有界探测；
   用户显式填写的目录优先，不做全盘扫描。
 - `ensure_runtime_dirs()` 为备份、变更日志和浏览器档案设置当前用户 ACL。DPAPI 保护文件内容，
   但 Qt WebEngine 必须直接访问浏览器档案，因此只能依赖当前 Windows 账户隔离。
@@ -142,6 +142,7 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
   只有程序刚创建默认模型时才写兜底。
 - 模型 id 被写串时只修本程序 provider；默认模型已指向 `madmodel` 时才修复其模型 id，
   用户选择别的 provider 时不动。
+- 字段级还原适配器拆到 `targets/dsh_restore.py`，避免写入逻辑与恢复逻辑继续膨胀。
 
 ### `targets/ccswitch.py`
 - 数据库 `cc-switch.db`：
@@ -159,6 +160,7 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
   不再按"名字里含 token 就算"的宽规则乱换 —— 同一张卡片里别的模型的 key 必须原样保留。
 - 数据库成功后若路由写入失败，按本次加密变更日志回滚卡片和已经写成功的 JSON；
   这一步有专门的故障注入测试。
+- 字段级还原适配器拆到 `targets/ccswitch_restore.py`。
 
 ### `backup.py`
 每次写入前把原文件复制到 `private/backups/<时间戳>-<标签>/`，并写入

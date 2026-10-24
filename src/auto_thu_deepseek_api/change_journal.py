@@ -86,8 +86,8 @@ class ChangeJournal:
 def restore_all(journal: ChangeJournal | None = None) -> list[str]:
     """Undo journaled fields newest-first, stopping at the first conflict per field."""
 
-    from .targets.ccswitch import restore_journal_record as restore_ccswitch
-    from .targets.dsh import restore_journal_record as restore_dsh
+    from .targets.ccswitch_restore import restore_journal_record as restore_ccswitch
+    from .targets.dsh_restore import restore_journal_record as restore_dsh
 
     journal = journal or ChangeJournal()
     messages: list[str] = []

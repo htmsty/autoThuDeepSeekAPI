@@ -295,7 +295,9 @@ class TargetTraceTest(unittest.TestCase):
                     "LOCALAPPDATA": str(root / "local"),
                 },
                 clear=False,
-            ), mock.patch.object(paths, "_registered_install_dirs", return_value=()):
+            ), mock.patch.object(
+                paths, "_registered_install_dirs", return_value=()
+            ), mock.patch.object(paths, "_start_menu_shortcut_targets", return_value=()):
                 self.assertEqual(paths.resolve_dsh_paths("").base_dir, dsh)
                 self.assertEqual(paths.resolve_ccswitch_paths("").base_dir, cc)
 

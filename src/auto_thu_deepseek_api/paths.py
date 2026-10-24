@@ -674,6 +674,65 @@ def _registered_install_dirs(keywords: tuple[str, ...]) -> tuple[Path, ...]:
     return tuple(result)
 
 
+@lru_cache(maxsize=1)
+def _start_menu_shortcut_targets() -> tuple[Path, ...]:
+    """Resolve target paths from user/common Start Menu shortcuts once per run."""
+
+    if sys.platform != "win32":
+        return ()
+    user = _env_path("APPDATA")
+    common = _env_path("PROGRAMDATA")
+    roots = [
+        root / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        for root in (user, common)
+        if root is not None
+    ]
+    existing = [str(path) for path in roots if path.is_dir()]
+    if not existing:
+        return ()
+    script = (
+        "$ws=New-Object -ComObject WScript.Shell;"
+        "$dirs=@($env:ATD_START_MENU_USER,$env:ATD_START_MENU_COMMON);"
+        "foreach($d in $dirs){if(Test-Path -LiteralPath $d){"
+        "Get-ChildItem -LiteralPath $d -Filter *.lnk -Recurse -ErrorAction SilentlyContinue |"
+        "ForEach-Object{$t=$ws.CreateShortcut($_.FullName).TargetPath;"
+        "if($t){Write-Output $t}}}}"
+    )
+    env = os.environ.copy()
+    env["ATD_START_MENU_USER"] = existing[0] if len(existing) > 0 else ""
+    env["ATD_START_MENU_COMMON"] = existing[1] if len(existing) > 1 else ""
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.info("读取开始菜单快捷方式失败：%s", exc)
+        return ()
+    result: list[Path] = []
+    seen: set[str] = set()
+    for line in completed.stdout.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        path = Path(os.path.expandvars(value)).expanduser()
+        key = str(path).lower()
+        if path.exists() and key not in seen:
+            seen.add(key)
+            result.append(path)
+    return tuple(result)
+
+
 def _first_existing_target(primary: Path, candidates: list[Path], marker_name: str) -> Path:
     """Pick the first candidate that contains a real target marker file."""
 
@@ -712,6 +771,10 @@ def resolve_dsh_paths(custom_dir: str | None) -> TargetPaths:
             ("deepseek harness", "deepseek dsh", "dsh")
         ):
             candidates.extend((install, install / ".dsh"))
+        for target in _start_menu_shortcut_targets():
+            lowered = str(target).lower()
+            if any(word in lowered for word in ("deepseek harness", "deepseek dsh", "dsh")):
+                candidates.extend((target.parent, target.parent / ".dsh"))
         candidates.append(app_dir() / ".dsh")
         base = _first_existing_target(
             default_dsh_dir(),
@@ -744,6 +807,10 @@ def resolve_ccswitch_paths(custom_dir: str | None) -> TargetPaths:
             )
         for install in _registered_install_dirs(("cc switch", "cc-switch", "ccswitch")):
             candidates.extend((install, install / ".cc-switch"))
+        for target in _start_menu_shortcut_targets():
+            lowered = str(target).lower()
+            if any(word in lowered for word in ("cc switch", "cc-switch", "ccswitch")):
+                candidates.extend((target.parent, target.parent / ".cc-switch"))
         candidates.append(app_dir() / ".cc-switch")
         base = _first_existing_target(
             default_ccswitch_dir(),

@@ -12,6 +12,10 @@ from .constants import DEFAULT_SYNC_INTERVAL_MINUTES
 CCSWITCH_POLICY_PROMPT = "prompt"
 CCSWITCH_POLICY_DIRECT = "direct"
 
+LOG_DISPLAY_FULL = "full"
+LOG_DISPLAY_SUMMARY = "summary"
+LOG_DISPLAY_OFF = "off"
+
 # 设置文件版本。
 #   v2：默认勾选「统一所有 profile 到 madmodel」。
 #   v3：默认开启自动同步、间隔 180 分钟，并默认不弹「CC Switch 正在运行」提醒。
@@ -57,6 +61,7 @@ class AppSettings:
     # 界面
     close_to_tray: bool = True
     log_level: str = "INFO"
+    log_display_mode: str = LOG_DISPLAY_FULL
 
     # 目标开关（检测到哪个写哪个；可分别关闭）
     enable_dsh: bool = True
@@ -184,6 +189,12 @@ class AppSettings:
 
         if self.log_level not in ("INFO", "DEBUG"):
             self.log_level = "INFO"
+        if self.log_display_mode not in (
+            LOG_DISPLAY_FULL,
+            LOG_DISPLAY_SUMMARY,
+            LOG_DISPLAY_OFF,
+        ):
+            self.log_display_mode = LOG_DISPLAY_FULL
 
         self.default_model_id = (self.default_model_id or "").strip()
         self.dsh_dir = (self.dsh_dir or "").strip()

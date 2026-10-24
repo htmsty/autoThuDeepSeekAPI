@@ -206,6 +206,9 @@ Windows DPAPI 加密；旧明文备份会在索引读取时原地迁移。SQLite
 （2.5.3 修的 WinError 32 就是这个）。模块里另外记了一份"开过的文件 handler"清单，
 `close_file_handlers()` 把当前挂着的与历史遗留的一起关掉；换 private 位置与干净卸载
 之前都会先调它。
+同一个模块里的 `log_bus` 用 Qt 信号把日志送进主窗口。后台线程产生的记录自动排队到界面线程；
+主窗口只在“完整日志”模式追加明细，“仅同步结果”模式由同步回调单独写入时间与成功/失败，
+关闭模式则隐藏日志区但文件日志照常记录。
 
 ### `startup.py`
 开机启动（HKCU 的 Run 项）与桌面快捷方式。启动时会核对注册表实际值：路径变了自动纠正，
@@ -215,9 +218,9 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 `launch_command()` 供"重启程序"用。
 
 ### `state_store.py`
-`state.json`（在 private 里）：最近 Token 的 DPAPI 密文、时间戳、上次同步摘要，以及两条启动提醒的
-"已处理"标记（`desktop_note_ack` / `targets_note_ack`）——按需求写在 private，
-所以它们也会随"换位置"一起搬走、被"干净卸载"一起清掉。
+`state.json`（在 private 里）：最近 Token 的 DPAPI 密文、时间戳、上次同步摘要、两条启动提醒的
+"已处理"标记（`desktop_note_ack` / `targets_note_ack`），以及主窗口和设置窗口尺寸——按需求写在
+private，所以它们也会随"换位置"一起搬走、被"干净卸载"一起清掉。
 
 ### `crypto.py` / `credentials.py`
 `crypto.py` 直接调用 Windows DPAPI（`CryptProtectData` / `CryptUnprotectData`），用于 Token、
@@ -241,8 +244,9 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
   只有真的两边都没有才提醒"先安装"。
 
 ### `ui/`
-- `main_window.py`：精简状态区 + 立即同步/设置/退出 + 下次同步时间 + 托盘。
-  日志、预检、备份、还原、数据目录、快捷方式和关于全部移入设置。托盘固定五项。
+- `main_window.py`：状态区 + 立即同步/设置/退出 + 下次同步时间 + 底部运行日志 + 托盘。
+  `log_bus` 的日志只在完整模式直接追加；简化模式仅显示同步结果与时间，关闭模式隐藏日志区。
+  预检、备份、还原、数据目录、快捷方式和关于都在对应设置页。托盘固定五项。
   主窗口与设置窗口尺寸写入 `private/state.json`，恢复时按当前屏幕可用区域限制。
   启动流程（2.5 起）：`startup_then_sync()` → 先 `_check_desktop_private()`（程序在桌面根目录
   时提醒一次，三个选择），再 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
@@ -251,12 +255,15 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
   2.5.1 起，桌面提醒其实由 `app.py` 在**创建任何目录之前**调 `data_location.desktop_notice()`
   完成（`MainWindow` 里那条只是兜底）；搬家/卸载前会先 `_prepare_for_data_move()` /
   `prepare_for_uninstall()` 放开浏览器档案、日志句柄与单实例锁，否则那些文件删不掉。
-- `settings_dialog.py`：五页分类设置 + 底部「应用/确定/取消」。使用草稿副本；
+- `settings_dialog.py`：五页分类为「同步与启动 / 写入目标 / 登录与 Token /
+  备份、日志与维护 / 应用与工具」，底部「应用/确定/取消」。使用草稿副本；
   应用调用父窗口立即保存，取消不会把控件值写回。**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
   千万不要再造第二个 `QVBoxLayout(self)`：后建的会把先挂的布局顶掉，对话框会变成空窗口
   （2.4 踩过一次，`test_settings_dialog_is_actually_openable` 是这条的回归用例）。
   设置窗口默认 `700×540`、最小 `640×480`，尺寸同样会被记住。
-  2.5 起多了「运行数据与维护」一块：private 位置（+ 更改位置）、恢复默认设置、干净卸载。
+  「校验写入内容」把当前草稿设置交给后台 `PreflightWorker`，结果框优先挂在仍然可见的
+  设置窗口上；按钮在运行时显示进度，成功后信息框、失败后警告框。
+  「备份、日志与维护」包含 private 位置、恢复默认设置和干净卸载。
 - `workers.py`：把同步放到 `QThread`，避免界面卡死。
   `request_cancel()` 只是给同步流程一个"请停下"的信号（协作式取消，见 `sync.py`）。
 

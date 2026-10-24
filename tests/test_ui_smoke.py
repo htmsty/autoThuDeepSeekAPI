@@ -19,6 +19,9 @@ from auto_thu_deepseek_api import paths  # noqa: E402
 from auto_thu_deepseek_api.settings import (  # noqa: E402
     CCSWITCH_POLICY_DIRECT,
     CCSWITCH_POLICY_PROMPT,
+    LOG_DISPLAY_FULL,
+    LOG_DISPLAY_OFF,
+    LOG_DISPLAY_SUMMARY,
     AppSettings,
 )
 from auto_thu_deepseek_api.state_store import AppState  # noqa: E402
@@ -79,6 +82,29 @@ class UiSmokeTest(unittest.TestCase):
         window._quitting = True
         window.close()
 
+    def test_main_window_log_panel_supports_full_summary_and_off(self) -> None:
+        from auto_thu_deepseek_api.logging_setup import log_bus
+
+        window = MainWindow(AppSettings(log_display_mode=LOG_DISPLAY_FULL), AppState())
+        try:
+            log_bus.message.emit("完整日志测试")
+            self.assertIn("完整日志测试", window.log_view.toPlainText())
+            self.assertFalse(window.log_box.isHidden())
+
+            window.settings.log_display_mode = LOG_DISPLAY_SUMMARY
+            window._apply_log_display_mode()
+            log_bus.message.emit("简化模式不应显示这句")
+            self.assertNotIn("简化模式不应显示这句", window.log_view.toPlainText())
+            window._append_sync_result(True)
+            self.assertIn("同步成功", window.log_view.toPlainText())
+
+            window.settings.log_display_mode = LOG_DISPLAY_OFF
+            window._apply_log_display_mode()
+            self.assertTrue(window.log_box.isHidden())
+        finally:
+            window._quitting = True
+            window.close()
+
     def test_tray_menu_has_exact_five_actions(self) -> None:
         window = MainWindow(AppSettings(), AppState())
         labels = [
@@ -111,6 +137,9 @@ class UiSmokeTest(unittest.TestCase):
         dialog.close_to_tray_check.setChecked(False)
         dialog.silent_timeout_spin.setValue(75)
         dialog.log_level_combo.setCurrentText("DEBUG")
+        dialog.log_display_combo.setCurrentIndex(
+            dialog.log_display_combo.findData(LOG_DISPLAY_SUMMARY)
+        )
         dialog.default_model_combo.setCurrentText("qwen3.8-27b")
         dialog.apply_to(settings)
 
@@ -129,6 +158,7 @@ class UiSmokeTest(unittest.TestCase):
         self.assertFalse(settings.close_to_tray)
         self.assertEqual(settings.silent_capture_timeout_seconds, 75)
         self.assertEqual(settings.log_level, "DEBUG")
+        self.assertEqual(settings.log_display_mode, LOG_DISPLAY_SUMMARY)
         self.assertEqual(settings.default_model_id, "qwen3.8-27b")
         dialog.close()
 
@@ -257,6 +287,134 @@ class UiSmokeTest(unittest.TestCase):
         self.assertTrue(hasattr(dialog, "shortcut_button"))
         dialog.close()
 
+    def test_settings_tabs_match_their_contents(self) -> None:
+        dialog = SettingsDialog(AppSettings())
+        try:
+            self.assertEqual(
+                [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())],
+                [
+                    "同步与启动",
+                    "写入目标",
+                    "登录与 Token",
+                    "备份、日志与维护",
+                    "应用与工具",
+                ],
+            )
+
+            def in_tab(widget, index: int) -> bool:  # noqa: ANN001
+                return dialog.tabs.widget(index).isAncestorOf(widget)
+
+            self.assertTrue(in_tab(dialog.startup_check, 0))
+            self.assertTrue(in_tab(dialog.preflight_check, 0))
+            self.assertTrue(in_tab(dialog.default_model_combo, 1))
+            self.assertTrue(in_tab(dialog.silent_timeout_spin, 2))
+            self.assertTrue(in_tab(dialog.paste_button, 2))
+            self.assertTrue(in_tab(dialog.preflight_button, 3))
+            self.assertTrue(in_tab(dialog.log_display_combo, 3))
+            self.assertTrue(in_tab(dialog.log_level_combo, 3))
+            self.assertTrue(in_tab(dialog.close_to_tray_check, 4))
+            self.assertTrue(in_tab(dialog.shortcut_button, 4))
+        finally:
+            dialog.close()
+
+    def test_preflight_uses_dialog_draft_and_shows_progress(self) -> None:
+        from PySide6.QtCore import QObject, Signal
+        from PySide6.QtWidgets import QWidget
+
+        class FakeWorker(QObject):
+            finished = Signal()
+
+        class FakeParent(QWidget):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[AppSettings, object, FakeWorker]] = []
+
+            def check_preflight(self, *, settings, result_parent):  # noqa: ANN001
+                worker = FakeWorker(self)
+                self.calls.append((settings, result_parent, worker))
+                return worker
+
+        parent = FakeParent()
+        dialog = SettingsDialog(AppSettings(enable_dsh=True), parent)
+        dialog.dsh_enabled.setChecked(False)
+        try:
+            dialog._run_preflight()
+            self.assertEqual(len(parent.calls), 1)
+            draft, result_parent, worker = parent.calls[0]
+            self.assertFalse(draft.enable_dsh, "必须校验对话框当前值，而不是旧设置")
+            self.assertIs(result_parent, dialog, "结果框必须优先挂在可见的设置窗口上")
+            self.assertFalse(dialog.preflight_button.isEnabled())
+            self.assertIn("正在校验", dialog.preflight_button.text())
+            worker.finished.emit()
+            self.assertTrue(dialog.preflight_button.isEnabled())
+            self.assertEqual(dialog.preflight_button.text(), "校验写入内容")
+        finally:
+            dialog.close()
+            parent.close()
+
+    def test_check_preflight_uses_draft_token_and_dialog_result_parent(self) -> None:
+        from unittest import mock
+
+        from PySide6.QtCore import QObject, Signal
+        from PySide6.QtWidgets import QMessageBox
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        class FakeWorker(QObject):
+            reportReady = Signal(object)
+            failed = Signal(str)
+            finished = Signal()
+
+            def __init__(self, settings, token, parent=None) -> None:  # noqa: ANN001
+                super().__init__(parent)
+                self.settings = settings
+                self.token = token
+
+            def start(self) -> None:
+                pass
+
+        class FakeReport:
+            ok = True
+
+            def text(self) -> str:
+                return "预检通过（当前草稿）"
+
+        state = AppState()
+        state.remember_token(_fake_token(timedelta(hours=1)))
+        window = MainWindow(AppSettings(), state)
+        dialog = SettingsDialog(window.settings, window)
+        dialog.show()
+        original_worker = main_window_module.PreflightWorker
+        main_window_module.PreflightWorker = FakeWorker  # type: ignore[assignment]
+        try:
+            draft = AppSettings(enable_dsh=False)
+            worker = window.check_preflight(settings=draft, result_parent=dialog)
+            self.assertIsInstance(worker, FakeWorker)
+            assert worker is not None
+            self.assertFalse(worker.settings.enable_dsh)
+            self.assertEqual(worker.token, state.last_token)
+            self.assertIs(window._preflight_message_parent(), dialog)
+
+            with mock.patch.object(QMessageBox, "information") as information:
+                window._on_preflight_report(FakeReport(), worker)
+            information.assert_called_once()
+            self.assertIs(information.call_args.args[0], dialog)
+
+            class FailedReport(FakeReport):
+                ok = False
+
+            with mock.patch.object(QMessageBox, "warning") as warning:
+                window._on_preflight_report(FailedReport(), worker)
+            warning.assert_called_once()
+            self.assertIs(warning.call_args.args[0], dialog)
+        finally:
+            main_window_module.PreflightWorker = original_worker  # type: ignore[assignment]
+            window._preflight_worker = None
+            window._preflight_result_parent_ref = None
+            dialog.close()
+            window._quitting = True
+            window.close()
+
     def test_settings_dialog_defaults_smaller_and_restores_saved_size(self) -> None:
         default_dialog = SettingsDialog(AppSettings())
         try:
@@ -272,10 +430,10 @@ class UiSmokeTest(unittest.TestCase):
             restored.close()
 
     def test_main_window_restores_saved_size(self) -> None:
-        state = AppState(main_window_size=[660, 460])
+        state = AppState(main_window_size=[660, 500])
         window = MainWindow(AppSettings(), state)
         try:
-            self.assertEqual((window.width(), window.height()), (660, 460))
+            self.assertEqual((window.width(), window.height()), (660, 500))
         finally:
             window._quitting = True
             window.close()
@@ -552,6 +710,7 @@ class UiInteractionTest(unittest.TestCase):
         settings = AppSettings(
             ccswitch_refresh_sibling_cards=True,
             ccswitch_running_policy=CCSWITCH_POLICY_PROMPT,
+            log_display_mode=LOG_DISPLAY_OFF,
         )
         dialog = SettingsDialog(settings)
         reset_to_defaults(dialog.settings)
@@ -563,6 +722,11 @@ class UiInteractionTest(unittest.TestCase):
             )
             self.assertTrue(dialog.policy_prompt.isChecked(), "运行策略要回到默认的「先提示」")
             self.assertEqual(dialog.keep_spin.value(), AppSettings().backup_keep)
+            self.assertEqual(
+                dialog.log_display_combo.currentData(),
+                LOG_DISPLAY_FULL,
+                "主界面日志模式也要跟着恢复默认",
+            )
         finally:
             dialog.close()
 

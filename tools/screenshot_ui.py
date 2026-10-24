@@ -4,6 +4,7 @@
     python tools/screenshot_ui.py                 # 主界面 → ui-screenshot.png
     python tools/screenshot_ui.py out.png         # 指定输出名
     python tools/screenshot_ui.py --settings      # 设置对话框 → ui-screenshot-settings.png
+    python tools/screenshot_ui.py --settings --tab=3
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from auto_thu_deepseek_api.ui.settings_dialog import SettingsDialog  # noqa: E40
 def main() -> int:
     arguments = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
     wants_settings = "--settings" in sys.argv
+    tab_argument = next((arg for arg in sys.argv if arg.startswith("--tab=")), "")
+    tab_index = int(tab_argument.split("=", 1)[1]) if tab_argument else 0
     default_name = "ui-screenshot-settings.png" if wants_settings else "ui-screenshot.png"
     output = Path(arguments[0]) if arguments else Path(default_name)
     with tempfile.TemporaryDirectory() as tmp:
@@ -45,6 +48,7 @@ def main() -> int:
             window = MainWindow(settings, state)
             if wants_settings:
                 dialog = SettingsDialog(settings, window)
+                dialog.tabs.setCurrentIndex(max(0, min(tab_index, dialog.tabs.count() - 1)))
                 dialog.show()
                 application.processEvents()
                 dialog.grab().save(str(output))

@@ -38,6 +38,9 @@ from ..constants import DEFAULT_MODELS
 from ..settings import (
     CCSWITCH_POLICY_DIRECT,
     CCSWITCH_POLICY_PROMPT,
+    LOG_DISPLAY_FULL,
+    LOG_DISPLAY_OFF,
+    LOG_DISPLAY_SUMMARY,
     AppSettings,
     reset_to_defaults,
 )
@@ -107,15 +110,15 @@ class SettingsDialog(QDialog):
         maintenance_page_layout = QVBoxLayout(maintenance_page)
         advanced_page = QWidget()
         advanced_layout = QVBoxLayout(advanced_page)
-        tabs.addTab(sync_page, "同步")
+        tabs.addTab(sync_page, "同步与启动")
         tabs.addTab(targets_page, "写入目标")
-        tabs.addTab(security_page, "登录与安全")
-        tabs.addTab(maintenance_page, "备份与维护")
-        tabs.addTab(advanced_page, "高级")
+        tabs.addTab(security_page, "登录与 Token")
+        tabs.addTab(maintenance_page, "备份、日志与维护")
+        tabs.addTab(advanced_page, "应用与工具")
         content_layout.addWidget(tabs)
 
         # —— 同步 ——
-        sync_box = QGroupBox("自动同步")
+        sync_box = QGroupBox("自动同步与启动")
         sync_form = QFormLayout(sync_box)
         self.auto_sync_check = QCheckBox("启用自动同步")
         self.auto_sync_check.setChecked(settings.auto_sync_enabled)
@@ -132,6 +135,16 @@ class SettingsDialog(QDialog):
         self.minimize_after_check = QCheckBox("同步完成后最小化到托盘")
         self.minimize_after_check.setChecked(settings.minimize_after_sync)
         sync_form.addRow(self.minimize_after_check)
+        self.startup_check = QCheckBox("开机启动（最小化到托盘）")
+        self.startup_check.setChecked(settings.launch_at_startup)
+        sync_form.addRow(self.startup_check)
+        self.preflight_check = QCheckBox("同步前先预检将要写入的内容（不通过就这次不写）")
+        self.preflight_check.setChecked(settings.preflight_enabled)
+        self.preflight_check.setToolTip(
+            "预检把要写出去的 YAML / JSON 先渲染一遍再校验：能不能解析、字段齐不齐、\n"
+            "模型 id 与站点清单是否一致、Token 是不是本次拿到的那个。只读，不改文件。"
+        )
+        sync_form.addRow(self.preflight_check)
         sync_layout.addWidget(sync_box)
         sync_layout.addStretch(1)
 
@@ -158,6 +171,18 @@ class SettingsDialog(QDialog):
         self.dsh_profile_edit = QLineEdit(settings.dsh_profile)
         self.dsh_profile_edit.setPlaceholderText("留空自动选择；找不到时只创建到 desktop 或第一个 profile")
         targets_form.addRow("受管 profile", self.dsh_profile_edit)
+
+        self.default_model_combo = QComboBox()
+        self.default_model_combo.setEditable(True)
+        for model in DEFAULT_MODELS:
+            self.default_model_combo.addItem(str(model["id"]))
+        self.default_model_combo.setCurrentText(
+            settings.default_model_id or str(DEFAULT_MODELS[0]["id"])
+        )
+        self.default_model_combo.setToolTip(
+            "自动创建 provider 时，默认模型优先用哪个 id（要能在站点清单里找到；留空=用第一个）"
+        )
+        targets_form.addRow("DSH 默认模型", self.default_model_combo)
 
         self.ccswitch_enabled = QCheckBox("启用 CC Switch 写入")
         self.ccswitch_enabled.setChecked(settings.enable_ccswitch)
@@ -232,10 +257,21 @@ class SettingsDialog(QDialog):
         security_layout.addWidget(login_box)
 
         verify_box = QGroupBox("Token 校验")
-        verify_layout = QVBoxLayout(verify_box)
+        verify_layout = QFormLayout(verify_box)
+        self.silent_timeout_spin = QSpinBox()
+        self.silent_timeout_spin.setRange(10, 600)
+        self.silent_timeout_spin.setSuffix(" 秒")
+        self.silent_timeout_spin.setValue(settings.silent_capture_timeout_seconds)
+        self.silent_timeout_spin.setToolTip(
+            "自动同步时后台静默取 Token 最多等多久；超过就沿用旧 Token 并提示"
+        )
+        verify_layout.addRow("静默取 Token 超时", self.silent_timeout_spin)
         self.chat_verify_check = QCheckBox("允许发送最小对话请求做兜底校验（可能消耗少量额度）")
         self.chat_verify_check.setChecked(settings.chat_verification_enabled)
-        verify_layout.addWidget(self.chat_verify_check)
+        verify_layout.addRow(self.chat_verify_check)
+        self.paste_button = QPushButton("手动粘贴 Token…")
+        self.paste_button.clicked.connect(self._paste_token)
+        verify_layout.addRow("手动 Token", self.paste_button)
         security_layout.addWidget(verify_box)
         security_layout.addStretch(1)
 
@@ -255,26 +291,42 @@ class SettingsDialog(QDialog):
         self.manual_backup_button.clicked.connect(self._manual_backup)
         self.preflight_button = QPushButton("校验写入内容")
         self.preflight_button.clicked.connect(self._run_preflight)
-        self.log_button = QPushButton("打开日志")
-        self.log_button.clicked.connect(self._open_log)
         self.restore_button = QPushButton("还原到首次修改前")
         self.restore_button.clicked.connect(self._restore)
         for button in (
             self.manual_backup_button,
             self.preflight_button,
-            self.log_button,
             self.restore_button,
         ):
             tool_row.addWidget(button)
         tool_row.addStretch(1)
         backup_layout.addLayout(tool_row)
-        self.paste_button = QPushButton("手动粘贴 Token…")
-        self.paste_button.clicked.connect(self._paste_token)
-        token_row = QHBoxLayout()
-        token_row.addWidget(self.paste_button)
-        token_row.addStretch(1)
-        backup_layout.addLayout(token_row)
+        self.preflight_hint = QLabel("只读校验当前对话框中的设置，不会写入任何文件。")
+        self.preflight_hint.setWordWrap(True)
+        backup_layout.addWidget(self.preflight_hint)
         maintenance_page_layout.addWidget(backup_box)
+
+        log_box = QGroupBox("日志")
+        log_form = QFormLayout(log_box)
+        self.log_display_combo = QComboBox()
+        self.log_display_combo.addItem("完整日志", LOG_DISPLAY_FULL)
+        self.log_display_combo.addItem("仅同步结果与时间", LOG_DISPLAY_SUMMARY)
+        self.log_display_combo.addItem("关闭主界面日志", LOG_DISPLAY_OFF)
+        display_index = self.log_display_combo.findData(settings.log_display_mode)
+        self.log_display_combo.setCurrentIndex(display_index if display_index >= 0 else 0)
+        self.log_display_combo.setToolTip(
+            "完整：显示程序运行与同步日志；简化：只显示每次同步成功/失败和时间；关闭：隐藏主界面日志区。"
+        )
+        log_form.addRow("主界面日志", self.log_display_combo)
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(["INFO", "DEBUG"])
+        self.log_level_combo.setCurrentText(settings.log_level)
+        self.log_level_combo.setToolTip("DEBUG 会记录更多细节，排查问题时再开")
+        log_form.addRow("日志级别", self.log_level_combo)
+        self.log_button = QPushButton("打开日志目录")
+        self.log_button.clicked.connect(self._open_log)
+        log_form.addRow(self.log_button)
+        maintenance_page_layout.addWidget(log_box)
 
         # —— 运行数据与维护 ——
         maintenance_box = QGroupBox("运行数据与维护")
@@ -313,48 +365,13 @@ class SettingsDialog(QDialog):
         maintenance_page_layout.addWidget(maintenance_box)
         maintenance_page_layout.addStretch(1)
 
-        # —— 更多 ——
-        more_box = QGroupBox("更多")
+        # —— 应用与工具 ——
+        more_box = QGroupBox("窗口与工具")
         more_form = QFormLayout(more_box)
-
-        self.startup_check = QCheckBox("开机启动（最小化到托盘）")
-        self.startup_check.setChecked(settings.launch_at_startup)
-        more_form.addRow(self.startup_check)
-
-        self.preflight_check = QCheckBox("同步前先预检将要写入的内容（不通过就这次不写）")
-        self.preflight_check.setChecked(settings.preflight_enabled)
-        self.preflight_check.setToolTip(
-            "预检把要写出去的 YAML / JSON 先渲染一遍再校验：能不能解析、字段齐不齐、\n"
-            "模型 id 与站点清单是否一致、Token 是不是本次拿到的那个。只读，不改文件。"
-        )
-        more_form.addRow(self.preflight_check)
 
         self.close_to_tray_check = QCheckBox("点 × 时最小化到托盘（取消勾选则直接退出程序）")
         self.close_to_tray_check.setChecked(settings.close_to_tray)
         more_form.addRow(self.close_to_tray_check)
-
-        self.silent_timeout_spin = QSpinBox()
-        self.silent_timeout_spin.setRange(10, 600)
-        self.silent_timeout_spin.setSuffix(" 秒")
-        self.silent_timeout_spin.setValue(settings.silent_capture_timeout_seconds)
-        self.silent_timeout_spin.setToolTip("自动同步时后台静默取 Token 最多等多久；超过就沿用旧 Token 并提示")
-        more_form.addRow("静默取 Token 超时", self.silent_timeout_spin)
-
-        self.default_model_combo = QComboBox()
-        self.default_model_combo.setEditable(True)
-        for model in DEFAULT_MODELS:
-            self.default_model_combo.addItem(str(model["id"]))
-        self.default_model_combo.setCurrentText(settings.default_model_id or str(DEFAULT_MODELS[0]["id"]))
-        self.default_model_combo.setToolTip(
-            "自动创建 provider 时，默认模型优先用哪个 id（要能在站点清单里找到；留空=用第一个）"
-        )
-        more_form.addRow("DSH 默认模型", self.default_model_combo)
-
-        self.log_level_combo = QComboBox()
-        self.log_level_combo.addItems(["INFO", "DEBUG"])
-        self.log_level_combo.setCurrentText(settings.log_level)
-        self.log_level_combo.setToolTip("DEBUG 会记录更多细节，排查问题时再开")
-        more_form.addRow("日志级别", self.log_level_combo)
 
         self.shortcut_button = QPushButton("创建桌面快捷方式")
         self.shortcut_button.setToolTip("在桌面生成一个指向本程序的快捷方式，双击即可启动")
@@ -548,7 +565,40 @@ class SettingsDialog(QDialog):
         self._call_parent("manual_backup")
 
     def _run_preflight(self) -> None:
-        self._call_parent("check_preflight")
+        parent = self.parent()
+        callback = getattr(parent, "check_preflight", None) if parent is not None else None
+        if callback is None:
+            QMessageBox.information(
+                self,
+                "校验写入内容",
+                "请从主窗口打开设置后再使用这个功能。",
+            )
+            return
+
+        # 校验对话框里当前看到的值，而不是上次已保存的旧值。
+        self.apply_to(self.settings)
+        try:
+            worker = callback(
+                settings=copy.deepcopy(self.settings),
+                result_parent=self,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("启动预检失败")
+            QMessageBox.warning(self, "校验写入内容", f"预检启动失败：{exc}")
+            return
+        if worker is None:
+            return
+        self._set_preflight_busy(True)
+        worker.finished.connect(lambda: self._set_preflight_busy(False))
+
+    def _set_preflight_busy(self, busy: bool) -> None:
+        self.preflight_button.setEnabled(not busy)
+        self.preflight_button.setText("正在校验…" if busy else "校验写入内容")
+        self.preflight_hint.setText(
+            "正在校验当前设置，只读不改文件，网络较慢时可能需要几十秒…"
+            if busy
+            else "只读校验当前对话框中的设置，不会写入任何文件。"
+        )
 
     def _open_log(self) -> None:
         self._call_parent("open_log")
@@ -675,6 +725,7 @@ class SettingsDialog(QDialog):
             "CC Switch 运行中：先提示\n"
             f"· 备份保留 {defaults.backup_keep} 份；静默取 Token 超时 "
             f"{defaults.silent_capture_timeout_seconds} 秒；日志级别 {defaults.log_level}；"
+            f"主界面日志{self._log_mode_label(defaults.log_display_mode)}；"
             f"关窗{'最小化到托盘' if defaults.close_to_tray else '直接退出'}\n\n"
             "开机启动项（注册表）保持现状，不会被动。\n确定恢复吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -724,7 +775,17 @@ class SettingsDialog(QDialog):
             settings.default_model_id or str(DEFAULT_MODELS[0]["id"])
         )
         self.log_level_combo.setCurrentText(settings.log_level)
+        log_index = self.log_display_combo.findData(settings.log_display_mode)
+        self.log_display_combo.setCurrentIndex(log_index if log_index >= 0 else 0)
         self.private_path_label.setText(str(paths.data_root()))
+
+    @staticmethod
+    def _log_mode_label(mode: str) -> str:
+        return {
+            LOG_DISPLAY_FULL: "完整显示",
+            LOG_DISPLAY_SUMMARY: "仅同步结果",
+            LOG_DISPLAY_OFF: "关闭",
+        }.get(mode, "完整显示")
 
     def _offer_reset_private_dir(self) -> None:
         """恢复默认设置的联动：问一句要不要把 private 位置也还原。"""
@@ -863,6 +924,9 @@ class SettingsDialog(QDialog):
         settings.close_to_tray = self.close_to_tray_check.isChecked()
         settings.silent_capture_timeout_seconds = self.silent_timeout_spin.value()
         settings.log_level = self.log_level_combo.currentText()
+        settings.log_display_mode = str(
+            self.log_display_combo.currentData() or LOG_DISPLAY_FULL
+        )
         text = self.default_model_combo.currentText().strip()
         settings.default_model_id = "" if text == str(DEFAULT_MODELS[0]["id"]) else text
         settings.normalize()

@@ -8,6 +8,7 @@ import os
 import random
 import subprocess
 import time
+import weakref
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -31,8 +33,14 @@ from PySide6.QtWidgets import (
 )
 
 from .. import backup_ops, constants, credentials, data_location, instance, paths, startup
-from ..logging_setup import close_file_handlers, setup_logging
-from ..settings import CCSWITCH_POLICY_DIRECT, AppSettings
+from ..logging_setup import close_file_handlers, log_bus, setup_logging
+from ..settings import (
+    CCSWITCH_POLICY_DIRECT,
+    LOG_DISPLAY_FULL,
+    LOG_DISPLAY_OFF,
+    LOG_DISPLAY_SUMMARY,
+    AppSettings,
+)
 from ..state_store import AppState
 from ..sync import SyncReport, both_targets_missing, detect_targets
 from ..targets.ccswitch import is_running as ccswitch_is_running
@@ -70,6 +78,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._sync_worker: SyncWorker | None = None
         self._preflight_worker: PreflightWorker | None = None
+        self._preflight_result_parent_ref: weakref.ReferenceType[QWidget] | None = None
         self._capture: TokenCaptureSession | None = None
         self._browser_profile = None
         self._tray_hint_shown = False
@@ -110,13 +119,15 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(constants.APP_DISPLAY_NAME)
         self.setWindowIcon(app_icon())
-        self.setMinimumSize(620, 420)
-        self.resize(720, 500)
+        self.setMinimumSize(620, 480)
+        self.resize(760, 560)
 
         self._build_ui()
         self._build_tray()
         self._wire_signals()
+        log_bus.message.connect(self._on_log_message)
         self._restore_main_window_size()
+        self._apply_log_display_mode()
 
         self._auto_timer = QTimer(self)
         self._auto_timer.setSingleShot(True)
@@ -177,8 +188,19 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(self.next_sync_status)
         layout.addWidget(actions_box)
 
-        layout.addStretch(1)
-
+        log_box = QGroupBox("运行日志")
+        log_layout = QVBoxLayout(log_box)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(1200)
+        self.log_view.setMinimumHeight(120)
+        self.log_view.setPlaceholderText("同步与程序运行日志会显示在这里。")
+        self.log_view.setStyleSheet(
+            "QPlainTextEdit { font-family: Consolas, 'Microsoft YaHei UI'; font-size: 12px; }"
+        )
+        log_layout.addWidget(self.log_view)
+        self.log_box = log_box
+        layout.addWidget(log_box, 1)
         self._restore_status_hint()
 
     def _build_tray(self) -> None:
@@ -213,6 +235,37 @@ class MainWindow(QMainWindow):
         self.config_button.clicked.connect(self.open_settings)
         self.exit_button.clicked.connect(self.quit_app)
         self.tray.activated.connect(self._on_tray_activated)
+
+    # —— 主界面日志 ——
+
+    def _apply_log_display_mode(self) -> None:
+        mode = self.settings.log_display_mode
+        previous = getattr(self, "_active_log_display_mode", None)
+        if previous is not None and previous != mode:
+            self.log_view.clear()
+        self._active_log_display_mode = mode
+        self.log_box.setTitle(
+            "运行日志（仅同步结果）" if mode == LOG_DISPLAY_SUMMARY else "运行日志"
+        )
+        self.log_box.setVisible(mode != LOG_DISPLAY_OFF)
+
+    def _append_log_line(self, text: str) -> None:
+        if not text:
+            return
+        self.log_view.appendPlainText(text.rstrip())
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _on_log_message(self, message: str) -> None:
+        if self.settings.log_display_mode == LOG_DISPLAY_FULL:
+            self._append_log_line(message)
+
+    def _append_sync_result(self, ok: bool, status: str | None = None) -> None:
+        if self.settings.log_display_mode != LOG_DISPLAY_SUMMARY:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        label = status or ("成功" if ok else "失败")
+        self._append_log_line(f"{now}  同步{label}")
 
     # —— 设置项 ——
 
@@ -553,6 +606,7 @@ class MainWindow(QMainWindow):
     def apply_settings_to_ui(self) -> None:
         """Refresh the compact main window after settings are applied."""
 
+        self._apply_log_display_mode()
         self._apply_auto_timer()
         self.refresh_status()
 
@@ -594,18 +648,36 @@ class MainWindow(QMainWindow):
             return ""
         return token
 
-    def check_preflight(self) -> None:
+    def check_preflight(
+        self,
+        *,
+        settings: AppSettings | None = None,
+        result_parent: QWidget | None = None,
+    ) -> PreflightWorker | None:
+        """校验当前设置草稿；结果框显示在可见的设置窗口之上。"""
+
         token = self.current_token()
+        message_parent = result_parent or self
         if not token:
             QMessageBox.information(
-                self, "校验写入内容", "需要先获取一次 Token（点「立即获取并同步」），再回来校验。"
+                message_parent,
+                "校验写入内容",
+                "需要先获取一次 Token（点「立即获取并同步」），再回来校验。",
             )
-            return
+            return None
         if self._preflight_worker is not None:
             logger.info("上一次校验还没结束，忽略这次请求")
-            return
+            QMessageBox.information(
+                message_parent,
+                "校验写入内容",
+                "上一次校验还在进行，请等它完成。",
+            )
+            return None
+        self._preflight_result_parent_ref = (
+            weakref.ref(result_parent) if result_parent is not None else None
+        )
         self._show_status_hint("正在校验将要写入的内容…（只读，不改文件）")
-        worker = PreflightWorker(self.settings, token, self)
+        worker = PreflightWorker(settings or self.settings, token, self)
         self._preflight_worker = worker
         worker.reportReady.connect(lambda report, w=worker: self._on_preflight_report(report, w))
         worker.failed.connect(lambda message, w=worker: self._on_preflight_failed(message, w))
@@ -615,21 +687,44 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - 预检本身出问题也要如实说
             logger.exception("预检线程启动失败")
             self._preflight_worker = None
+            self._preflight_result_parent_ref = None
             self._restore_status_hint()
-            QMessageBox.warning(self, "校验写入内容", f"预检启动失败：{exc}")
+            QMessageBox.warning(message_parent, "校验写入内容", f"预检启动失败：{exc}")
+            return None
+        return worker
+
+    def _preflight_message_parent(self) -> QWidget:
+        parent_ref = self._preflight_result_parent_ref
+        parent = parent_ref() if parent_ref is not None else None
+        if parent is not None:
+            try:
+                if parent.isVisible():
+                    return parent
+            except RuntimeError:
+                pass
+        return self
 
     def _on_preflight_report(self, report, worker=None) -> None:  # noqa: ANN001
         if worker is not None and worker is not self._preflight_worker:
             return
         for line in report.text().splitlines():
             logger.info("预检 %s", line)
-        QMessageBox.information(self, "校验写入内容", report.text())
+        show_message = QMessageBox.information if report.ok else QMessageBox.warning
+        show_message(
+            self._preflight_message_parent(),
+            "校验写入内容",
+            report.text(),
+        )
 
     def _on_preflight_failed(self, message: str, worker=None) -> None:
         if worker is not None and worker is not self._preflight_worker:
             return
         logger.error("预检失败：%s", message)
-        QMessageBox.warning(self, "校验写入内容", f"预检失败：{message}")
+        QMessageBox.warning(
+            self._preflight_message_parent(),
+            "校验写入内容",
+            f"预检失败：{message}",
+        )
 
     def _on_preflight_finished(self, worker=None) -> None:
         if worker is None:
@@ -637,6 +732,7 @@ class MainWindow(QMainWindow):
         if worker is not None and worker is not self._preflight_worker:
             return
         self._preflight_worker = None
+        self._preflight_result_parent_ref = None
         self._restore_status_hint()
 
     def manual_backup(self) -> None:
@@ -1129,7 +1225,9 @@ class MainWindow(QMainWindow):
         if report.cancelled:
             # 是我们自己请它停下的，别弹"同步完成"的通知吓人
             logger.info("同步已按你的要求安全停下")
+            self._append_sync_result(False, "已取消")
             return
+        self._append_sync_result(report.ok)
         if report.ok:
             # 成功一次就把重试预算补满（下一次失败还能重试几次）
             self._auto_retry_left = AUTO_RETRY_BUDGET
@@ -1148,6 +1246,7 @@ class MainWindow(QMainWindow):
         logger.error("同步失败：%s", message)
         self._restore_status_hint()
         self.notify(f"同步失败：{message}", warning=True)
+        self._append_sync_result(False)
         if self._sync_is_auto:
             self._schedule_auto_retry("同步过程出错")
 

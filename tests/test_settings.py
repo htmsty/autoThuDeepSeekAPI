@@ -14,6 +14,9 @@ from auto_thu_deepseek_api import paths  # noqa: E402
 from auto_thu_deepseek_api.settings import (  # noqa: E402
     CCSWITCH_POLICY_DIRECT,
     CCSWITCH_POLICY_PROMPT,
+    LOG_DISPLAY_FULL,
+    LOG_DISPLAY_OFF,
+    LOG_DISPLAY_SUMMARY,
     SETTINGS_VERSION,
     AppSettings,
 )
@@ -35,8 +38,25 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.settings_version, SETTINGS_VERSION)
         self.assertFalse(settings.auto_login_enabled)
         self.assertFalse(settings.chat_verification_enabled)
+        self.assertEqual(settings.log_display_mode, LOG_DISPLAY_FULL)
         self.assertTrue(settings.enable_ccswitch_card)
         self.assertFalse(settings.enable_ccswitch_activate)
+
+    def test_log_display_mode_round_trip_and_invalid_value_falls_back(self) -> None:
+        settings = AppSettings(log_display_mode=LOG_DISPLAY_SUMMARY)
+        settings.save()
+        self.assertEqual(AppSettings.load().log_display_mode, LOG_DISPLAY_SUMMARY)
+
+        path = self.root / "settings.json"
+        path.write_text(
+            json.dumps({"log_display_mode": "unexpected"}),
+            encoding="utf-8",
+        )
+        self.assertEqual(AppSettings.load().log_display_mode, LOG_DISPLAY_FULL)
+
+        settings.log_display_mode = LOG_DISPLAY_OFF
+        settings.normalize()
+        self.assertEqual(settings.log_display_mode, LOG_DISPLAY_OFF)
 
     def test_v1_settings_are_migrated_once(self) -> None:
         settings_path = self.root / "settings.json"

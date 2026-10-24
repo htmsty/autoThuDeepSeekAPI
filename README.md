@@ -221,6 +221,7 @@ src/auto_thu_deepseek_api/
   settings.py       用户设置与版本迁移
   crypto.py         Windows DPAPI 加解密
   credentials.py    Windows Credential Manager（可选自动登录）
+  http_tls.py       HTTPS 证书上下文与 Windows 证书库回退
   sync.py           同步编排：校验 Token → 逐目标备份写入
   preflight.py      写入前预检（只读干跑）
   backup.py         加密备份、清理、旧版整文件还原
@@ -230,7 +231,7 @@ src/auto_thu_deepseek_api/
   token/            内置浏览器取 Token、JWT、站点校验、模型清单
   targets/          DSH 与 CC Switch 的探测与写入
   ui/               主窗口、托盘、设置对话框、后台线程
-tests/              单元测试（当前 181 项）
+tests/              单元测试（当前 187 项）
 tools/              图标生成、界面截图、打包诊断等小工具
 build/              PyInstaller 规格与打包脚本
 private/            运行数据（Token、日志、备份、浏览器会话），不进 Git
@@ -286,8 +287,8 @@ EXE 会嵌入 `build/version_info.txt` 中的产品名、版本和公司信息�
 .\dist\autoThuDeepSeekAPI\autoThuDeepSeekAPI.exe --selftest
 ```
 
-会起一个本地网页、把一枚假 Token 写进浏览器存储，验证“内置浏览器 + 捕获链路”随包可用，
-通过时打印 `自检通过：抓到 Token` 并以退出码 0 结束。排查启动问题时可以加上
+会起一个本地网页、把一枚假 Token 写进浏览器存储，验证“内置浏览器 + 捕获链路”与
+Python HTTPS 证书上下文随包可用，通过时以退出码 0 结束。排查启动问题时可以加上
 `ATD_CONSOLE=1` 环境变量重新打包，得到带控制台的版本。
 
 ## 说明与边界
@@ -298,6 +299,8 @@ EXE 会嵌入 `build/version_info.txt` 中的产品名、版本和公司信息�
 - Token 由站点前端签发，有效期约 5 小时（以站点实际为准）；会话过期后需要你重新登录一次。
 - Token 校验优先走站点的会话接口（`GET /model-api/auth-login`），不消耗模型额度；
   只有你显式允许时才兜底发一次最小对话请求。默认在无法判断时如实记为"未能校验"。
+- Python HTTPS 默认校验站点证书；若精简运行环境缺少默认 CA 文件，会回退到 Windows
+  证书库，仍保持证书链和主机名校验，不会关闭 TLS 验证。
 - 模型列表跟着站点走：读站点前端包里的模型清单（缓存 6 小时），`contextWindow` 统一 1000000，
   并排除站点上那两个不注册的模型；读不到才用内置名单。DSH 里**只认键名为 `madmodel`
   且标记属于本程序**的 provider（站点地址 / 我们的 `apiKeyEnv` / 该键下的本地转发）。

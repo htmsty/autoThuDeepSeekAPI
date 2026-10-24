@@ -15,6 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from .http_tls import create_verified_context
 from .token.capture import TokenCaptureSession, build_profile
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,14 @@ def _start_server() -> tuple[http.server.ThreadingHTTPServer, int]:
 
 
 def run(profile_dir: Path, timeout_seconds: int = 30) -> int:
+    try:
+        create_verified_context()
+        tls_ok = True
+        tls_detail = "HTTPS 证书上下文可用"
+    except Exception as exc:  # noqa: BLE001
+        tls_ok = False
+        tls_detail = f"HTTPS 证书上下文失败：{type(exc).__name__}: {exc}"
+
     server, port = _start_server()
     url = f"http://127.0.0.1:{port}/"
     result = {"ok": False, "detail": "超时，没有抓到 Token"}
@@ -84,8 +93,14 @@ def run(profile_dir: Path, timeout_seconds: int = 30) -> int:
     server.shutdown()
     server.server_close()
 
-    print(("自检通过：" if result["ok"] else "自检失败：") + str(result["detail"]))
-    return 0 if result["ok"] else 1
+    ok = bool(result["ok"]) and tls_ok
+    print(
+        ("自检通过：" if ok else "自检失败：")
+        + str(result["detail"])
+        + "；"
+        + tls_detail
+    )
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:

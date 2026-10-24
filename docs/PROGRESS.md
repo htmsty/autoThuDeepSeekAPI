@@ -27,6 +27,7 @@
 | 2.7.0 | 问题清单 10 组逐项处理：DPAPI、可选自动登录、60±10 分钟、JWT 候选、DSH/CC Switch 写入拆分、字段级还原、界面重整、版本信息 | ✅ 已发布（tag `v2.7.0`，留档 `releases/2.7.0/`） |
 | 2.7.1 | 真机回归：自动登录隐藏验证码误判、`<a>` 登录按钮未提交、后台登录不应弹窗；设置窗口缩小并记住主/设置窗口尺寸 | ✅ 已完成（留档 `releases/2.7.1/`） |
 | 2.7.2 | 主界面恢复日志（完整/同步结果/关闭）、修复设置内预检使用旧配置且结果被遮挡、按内容重整五个设置页 | ✅ 已完成（留档 `releases/2.7.2/`） |
+| 2.7.3 | 修复打包版 `ssl.py` 缺少 `codex-rejected-cas.pem` 导致 HTTPS 初始化异常、成功登录后同步中断 | ✅ 已完成（留档 `releases/2.7.3/`） |
 
 两个版本的**单文件程序**都要留档在 `releases/<版本>/`（产物不进 Git，使用
 `releases/<版本>/SHA256.txt` 记录校验和；GitHub Release 资产本身支持更大的附件）。
@@ -35,7 +36,7 @@
 
 - 开发环境：`D:\2\program\codex\autoThuDeepSeekAPI\autoThuDeepSeekAPI`，`.venv` 里装
   PySide6 6.12 / PyYAML / ruamel.yaml / PyInstaller 6.22。
-- 测试：`python -m unittest discover -s tests -t .`（当前 181 项）。
+- 测试：`python -m unittest discover -s tests -t .`（当前 187 项）。
 - 打包：`powershell -File build\build_app.ps1`（同时出文件夹版与单文件版）。
 - 自检：`autoThuDeepSeekAPI.exe --selftest`（起本地网页写假 Token，验证捕获链路）。
 - 运行数据全部在程序目录的 `private/`，不进 Git；`dist/`、`releases/` 也不进 Git。
@@ -81,6 +82,19 @@
 3. **设置分页重整**：内容按实际用途归入「同步与启动 / 写入目标 / 登录与 Token /
    备份、日志与维护 / 应用与工具」，并加回归测试断言控件归属。
 4. 验证：全量 181 项测试全绿；主界面、设置首页、维护页截图核对；两版打包与自检。
+
+## 2.7.3 阶段
+
+1. **根因**：构建运行时定制的 `ssl.py` 创建 `SSLContext` 时固定读取
+   `codex-rejected-cas.pem`；PyInstaller 未自动包含该数据文件，于是模型列表请求在 TLS
+   初始化阶段抛出 `FileNotFoundError`。
+2. **打包修复**：把证书文件放到 `_MEIPASS` 根目录，同时保留在 `assets/`。
+3. **运行时兜底**：新增 `http_tls.py`，默认 CA 初始化失败时从 Windows `CA` / `ROOT`
+   证书库加载根证书，仍保持证书链与主机名校验。模型下载、Token 校验、站点探测全部使用该入口。
+4. **防崩**：TLS 初始化异常会被转换为“本次模型读取失败 / Token 暂无法校验”，
+   同步会回退内置模型继续，不再整次失败。
+5. 验证：全量 187 项测试全绿；强制模拟缺 CA 后实际连接 MadModel 返回 HTTP 200；
+   两版打包、包内证书文件、`--selftest` 与文件版本核对通过。
 
 ## 2.0 阶段（本轮）
 

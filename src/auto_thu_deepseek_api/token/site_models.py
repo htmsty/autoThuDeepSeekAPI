@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import ssl
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from .. import constants, paths
+from ..http_tls import create_verified_context
 from .verifier import fetch_models
 
 logger = logging.getLogger(__name__)
@@ -224,8 +224,8 @@ def _get_text(url: str, max_bytes: int, timeout: int = REQUEST_TIMEOUT) -> str |
     request = urllib.request.Request(url, method="GET")
     request.add_header("User-Agent", USER_AGENT)
     request.add_header("Accept", "text/html,application/javascript,*/*")
-    context = ssl.create_default_context()
     try:
+        context = create_verified_context()
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             if response.status != 200:
                 return None

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
 from ..constants import MADMODEL_API_BASE, MADMODEL_AUTH_LOGIN_PATH, MADMODEL_ORIGIN
+from ..http_tls import create_verified_context
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +43,8 @@ def _request(
     if data:
         request.add_header("Content-Type", "application/json")
 
-    context = ssl.create_default_context()
     try:
+        context = create_verified_context()
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             return response.status, response.read(), ""
     except urllib.error.HTTPError as exc:
@@ -181,8 +181,8 @@ def site_reachable(timeout: int = 5) -> bool:
 
     request = urllib.request.Request(f"{MADMODEL_ORIGIN}/", method="HEAD")
     request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) autoThuDeepSeekAPI")
-    context = ssl.create_default_context()
     try:
+        context = create_verified_context()
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             return response.status < 500
     except urllib.error.HTTPError as exc:

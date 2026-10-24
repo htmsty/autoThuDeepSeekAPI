@@ -217,6 +217,13 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 并隐藏子进程窗口。`is_app_on_desktop()` 判断程序是不是**直接**在桌面根目录（子文件夹不算），
 `launch_command()` 供"重启程序"用。
 
+### `http_tls.py`
+所有 Python HTTPS 请求共用的证书上下文。正常路径调用 `ssl.create_default_context()`；
+精简 Python / PyInstaller 缺少 `ssl.py` 预期 CA 文件时，绕过损坏的自定义构造器，
+创建完整的 `ssl.SSLContext` 子类，并从 Windows `CA` / `ROOT` 证书库加载服务器认证根证书。
+回退路径仍保持 `CERT_REQUIRED` 和主机名校验，绝不以关闭证书验证来“修网络”。
+`build/atd.spec` 同时把 `assets/codex-rejected-cas.pem` 放到 `_MEIPASS` 根目录，正常路径优先。
+
 ### `state_store.py`
 `state.json`（在 private 里）：最近 Token 的 DPAPI 密文、时间戳、上次同步摘要、两条启动提醒的
 "已处理"标记（`desktop_note_ack` / `targets_note_ack`），以及主窗口和设置窗口尺寸——按需求写在
@@ -282,7 +289,9 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
 
 打包注意：`build/atd.spec` 会过滤两类 DLL —— Codex 运行库自带的旧 `api-ms-win-*`
 转发 DLL，以及外部工具链（Poppler）里的 ICU。它们会盖住 Qt 需要的系统版本，
-导致打包后导入 QtCore 时报 WinError 127。`--selftest` 用来确认打包版能真的抓到 Token。
+导致打包后导入 QtCore 时报 WinError 127。spec 还会把定制 `ssl.py` 需要的
+`codex-rejected-cas.pem` 放到包根目录。`--selftest` 同时确认浏览器捕获链路与 HTTPS
+证书上下文可用。
 
 ## 约定
 

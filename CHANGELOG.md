@@ -1,5 +1,33 @@
 # 更新记录
 
+## 2.7.3 — 修复打包版 HTTPS 证书初始化导致同步中断
+
+### 根因
+
+构建环境里的定制 `ssl.py` 每次创建 SSL 上下文时都会读取
+`codex-rejected-cas.pem`，但 PyInstaller 没有自动带上这个纯数据文件。
+登录本身走 QtWebEngine，仍然能成功；随后读取站点模型列表使用 Python HTTPS，
+在 `ssl.create_default_context()` 阶段就抛出 `FileNotFoundError`，整次同步因此中止。
+
+### 修复
+
+- 将证书文件同时打进 `_MEIPASS` 根目录和 `assets/`，满足定制 `ssl.py` 的查找路径；
+- 新增统一的 `http_tls.py`：默认仍使用标准 `create_default_context()`；
+- 如果发行环境仍缺 CA 文件，则回退到 Windows `CA` / `ROOT` 证书库，
+  保持 `CERT_REQUIRED` 与主机名校验，不关闭 HTTPS 证书验证；
+- 站点模型下载、`/v1/models` 回退、会话 Token 校验、最小对话校验和站点可达性探测
+  全部统一走这套 TLS 逻辑；
+- TLS 初始化失败不再向外抛异常：模型读取会继续回退内置名单，Token 校验会记为“未能判定”，
+  不会再出现“登录成功但整次同步直接报错退出”；
+- `--selftest` 增加 HTTPS 证书上下文检查。
+
+### 验证
+
+- 单元测试增至 **187 项**，新增默认上下文优先、CA 缺失回退、Windows 证书库校验模式、
+  模型下载和 Token 请求兜底等回归用例；
+- 强制模拟 CA 文件缺失后，Windows 证书库回退实际连接 MadModel，返回 HTTP 200；
+- 文件夹版与单文件版 `--selftest`、发行包 CA 文件与文件版本核对见发布记录。
+
 ## 2.7.2 — 主界面日志、预检修复与设置分页重整
 
 ### 1. 主界面恢复运行日志

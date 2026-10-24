@@ -81,7 +81,12 @@ analysis = Analysis(
     [str(ROOT / "run_dev.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
-    datas=[(str(ROOT / "assets"), "assets")],
+    datas=[
+        (str(ROOT / "assets"), "assets"),
+        # 当前构建运行时的 ssl.py 会从自身目录加载这张“拒绝 CA”证书。
+        # PyInstaller 不会自动带上这个纯数据文件，必须放到 _MEIPASS 根目录。
+        (str(ROOT / "assets" / "codex-rejected-cas.pem"), "."),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

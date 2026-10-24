@@ -34,7 +34,9 @@
    不会整文件覆盖你后来的其它修改。
 6. 资源长期占用有上限：取 Token 完成后会释放内置浏览器的页面与 Chromium 进程，浏览器 HTTP
    缓存最多 32 MiB；日志按 2 MiB × 3 轮转并默认只保留 7 天。登录 Cookie 仍保存在浏览器档案里，
-   不会因为释放内存而退出登录。
+   不会因为释放内存而退出登录。Qt WebEngine 改为**第一次真正取 Token 时才加载**，单纯启动
+   主界面或托盘常驻时不会提前载入 Chromium；首次备份、目标探测和目录权限收紧也都放到窗口
+   显示后的后台线程，启动同步会等这些检查完成后再开始。
 
 ## 首次运行的自动备份
 
@@ -60,6 +62,8 @@
 - 开机启动（`--minimized`）时，第一次同步会先等 90 秒再开始（刚开机网络与磁盘可能还没就绪）；
   自动同步失败后每 5 分钟重试一次、最多 3 次（成功一次就把次数补满）。
   如果静默取 Token 失败（多半是登录会话过期），程序会自动打开登录窗口并在托盘提示。
+- 开机启动项只按**当前这份程序**判断是否启用。把另一份便携副本拿来运行时，不会静默把原启动
+  路径改成这份副本；需要换路径时，在设置里显式取消再重新勾选「开机启动」。
 - 点击 `×` 最小化到系统托盘并从任务栏消失；托盘图标左键单击打开主界面，右键单击弹出菜单。
 
 ### 设置里的主要入口
@@ -239,7 +243,7 @@ src/auto_thu_deepseek_api/
   token/            内置浏览器取 Token、JWT、站点校验、模型清单
   targets/          DSH 与 CC Switch 的探测与写入
   ui/               主窗口、托盘、设置对话框、后台线程
-tests/              单元测试（当前 190 项）
+tests/              单元测试（当前 198 项）
 tools/              图标生成、界面截图、打包诊断等小工具
 build/              PyInstaller 规格与打包脚本
 private/            运行数据（Token、日志、备份、浏览器会话），不进 Git
@@ -271,8 +275,15 @@ python -m venv .venv
 .\build\build_app.ps1
 ```
 
-会同时产出文件夹版（`dist/autoThuDeepSeekAPI/`，推荐日常使用）与单文件版
-（`dist/autoThuDeepSeekAPI.exe`）。
+会同时产出：
+
+- `dist/autoThuDeepSeekAPI-2.9.0-portable.zip`：**正式推荐**，Release 主资产；
+- `dist/autoThuDeepSeekAPI/`：已展开的多文件目录，方便本机直接测试；
+- `dist/autoThuDeepSeekAPI-2.9.0.exe`：版本化单文件兼容版；
+- `dist/autoThuDeepSeekAPI.exe`：沿用旧名字的单文件兼容版。
+
+ZIP 内已经带顶层 `autoThuDeepSeekAPI\` 文件夹。使用时必须**完整解压整个目录**，不要只把
+里面的 `autoThuDeepSeekAPI.exe` 单独拖出来，否则会缺少 `_internal` 依赖。
 
 打包中间产物落在 `build/_work/`，两个版本最后再拷进 `dist/`；这样 `dist/` 里不会出现
 “没有 `_internal` 的启动器 exe”那种一点就失败的半成品。
@@ -283,12 +294,16 @@ python -m venv .venv
 
 EXE 会嵌入 `build/version_info.txt` 中的产品名、版本和公司信息。当前没有 Authenticode
 代码签名证书，因此 Windows 仍可能显示“未知发布者”；代码签名需要额外证书，不是打包脚本能
-凭空生成的。2.8.0 单文件 EXE 约 164 MiB，可直接作为 GitHub Release 附件（Release assets 的限额
+凭空生成的。2.9.0 多文件 ZIP 约 165.39 MiB，单文件 EXE 约 164.30 MiB，均可作为 GitHub
+Release 附件（Release assets 的限额
 高于普通 Git 仓库单文件 100 MiB 限制）。
 
 体积主要来自 Qt WebEngine。程序不会为了压缩而移除登录所需的 Chromium 组件；浏览器档案只在
 取 Token 时启动，流程结束会关闭窗口并释放浏览器 profile，不再在托盘里常驻 Chromium；
-文件夹版 2.8.0 约 429 MiB、2,838 个文件，启动更快，日常使用推荐。
+2.9.0 展开后的多文件版约 429.32 MiB、2,838 个文件。隔离测试中，系统完成文件扫描后，
+多文件版到启动完成约 1.0–1.1 秒；程序内部从进入 Python 到启动日志约 0.6 秒。全新构建的
+前几次启动可能被 Windows Defender 扫描拖慢（本次复测约 6–13 秒，随后回落）；单文件版每次
+都要解包，约 6.65 秒。因此正式下载使用多文件 ZIP，单文件只作兼容备用。
 
 ### 打包后自检
 

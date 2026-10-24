@@ -7,10 +7,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_thu_deepseek_api import paths, startup  # noqa: E402
+from auto_thu_deepseek_api import paths, procinfo, startup  # noqa: E402
 from auto_thu_deepseek_api.sync import SyncReport  # noqa: E402
 from auto_thu_deepseek_api.targets.base import ApplyResult  # noqa: E402
 from auto_thu_deepseek_api.token.verifier import VerifyResult  # noqa: E402
@@ -37,6 +38,24 @@ class DataRootTest(unittest.TestCase):
         self.assertTrue(paths.data_root().is_dir(), "重置之后仍应拿到一个可用目录")
 
 
+class RuntimeDirectoryTest(unittest.TestCase):
+    def test_startup_can_defer_acl_hardening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private"
+            with (
+                mock.patch.object(paths, "data_root", return_value=root),
+                mock.patch.object(paths, "restrict_to_current_user") as restrict,
+            ):
+                paths.ensure_runtime_dirs(secure=False)
+                self.assertTrue((root / "logs").is_dir())
+                self.assertTrue((root / "backups").is_dir())
+                self.assertTrue((root / "browser-profile").is_dir())
+                restrict.assert_not_called()
+
+                paths.harden_runtime_dirs()
+                self.assertEqual(restrict.call_count, 3)
+
+
 class SyncReportTest(unittest.TestCase):
     def test_rejected_token_is_not_ok(self) -> None:
         report = SyncReport(verified=VerifyResult(False, "站点拒绝该 Token"))
@@ -59,6 +78,65 @@ class SyncReportTest(unittest.TestCase):
         self.assertFalse(report.ok)
 
 
+class StartupProbeWorkerTest(unittest.TestCase):
+    def test_hardening_and_backup_finish_before_target_probe(self) -> None:
+        from auto_thu_deepseek_api.settings import AppSettings
+        from auto_thu_deepseek_api.ui import workers
+
+        order: list[str] = []
+        results = []
+
+        def step(name: str, value=0):  # noqa: ANN001, ANN202
+            def run(*_args, **_kwargs):  # noqa: ANN002, ANN003
+                order.append(name)
+                return value
+
+            return run
+
+        with (
+            mock.patch.object(workers.paths, "harden_runtime_dirs", side_effect=step("acl")),
+            mock.patch.object(
+                workers,
+                "auto_backup_on_first_run",
+                side_effect=step("backup", 2),
+            ),
+            mock.patch.object(workers, "detect_targets", side_effect=step("statuses", [])),
+            mock.patch.object(
+                workers,
+                "both_targets_missing",
+                side_effect=step("missing", (False, {})),
+            ),
+        ):
+            worker = workers.StartupProbeWorker(AppSettings())
+            worker.ready.connect(results.append)
+            worker.run()
+
+        self.assertEqual(order, ["acl", "backup", "statuses", "missing"])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].backups_done, 2)
+        self.assertFalse(results[0].targets_missing)
+
+
+class ProcessProbeTest(unittest.TestCase):
+    def test_ccswitch_refresh_sees_a_process_started_after_cache(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("Windows Toolhelp snapshot only")
+        original = procinfo._CACHE
+        try:
+            procinfo._CACHE = {"old.exe"}
+            with mock.patch.object(
+                procinfo,
+                "_windows_process_names",
+                return_value={"cc-switch.exe"},
+            ):
+                self.assertEqual(
+                    procinfo.any_running("cc-switch", refresh=True),
+                    "cc-switch.exe",
+                )
+        finally:
+            procinfo._CACHE = original
+
+
 class StartupCommandTest(unittest.TestCase):
     def test_source_mode_points_at_existing_run_dev(self) -> None:
         if paths.is_frozen():
@@ -68,6 +146,20 @@ class StartupCommandTest(unittest.TestCase):
         self.assertIsNotNone(match, f"命令里找不到 run_dev.py：{command}")
         assert match is not None
         self.assertTrue(Path(match.group(1)).is_file(), f"开机启动指向的脚本不存在：{match.group(1)}")
+
+    def test_only_exact_current_command_counts_as_enabled(self) -> None:
+        current = startup._command()
+        with mock.patch.object(startup, "current_command", return_value=current):
+            self.assertTrue(startup.enabled_for_current_app())
+        with mock.patch.object(
+            startup,
+            "current_command",
+            return_value='"D:\\other\\autoThuDeepSeekAPI.exe" --minimized',
+        ):
+            self.assertFalse(
+                startup.enabled_for_current_app(),
+                "另一份便携副本的启动项不属于当前程序，不能自动认领",
+            )
 
     def test_desktop_shortcut_is_created_in_target_dir(self) -> None:
         """真的走一遍 WScript.Shell，但桌面目录换成临时目录，不碰用户桌面。"""

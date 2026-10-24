@@ -96,7 +96,11 @@ analysis = Analysis(
         # PyInstaller 不会自动带上这个纯数据文件，必须放到 _MEIPASS 根目录。
         (str(ROOT / "assets" / "codex-rejected-cas.pem"), "."),
     ],
-    hiddenimports=[],
+    # capture 在首次取 Token 时才导入；PyInstaller 必须把这条运行期路径显式保留。
+    hiddenimports=[
+        "auto_thu_deepseek_api.selftest",
+        "auto_thu_deepseek_api.token.capture",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -618,6 +618,14 @@ class SettingsDialog(QDialog):
         self._call_parent("show_about")
 
     def _restore(self) -> None:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_busy") and parent._busy():
+            QMessageBox.warning(
+                self,
+                "还原",
+                "正在做启动检查、同步或取 Token，等它结束再还原。",
+            )
+            return
         manager = BackupManager(paths.backups_dir(), keep=self.settings.backup_keep)
         entries = manager.original_entries()
         field_records = backup_ops.has_field_records()
@@ -807,7 +815,7 @@ class SettingsDialog(QDialog):
             QMessageBox.information(
                 self,
                 "恢复默认设置",
-                "设置已经恢复默认值了；正在同步或正在取 Token，private 位置等它结束再改。",
+                "设置已经恢复默认值了；正在完成启动检查、同步或取 Token，private 位置等它结束再改。",
             )
             return
         current = paths.data_root()
@@ -852,7 +860,9 @@ class SettingsDialog(QDialog):
         parent = self.parent()
         if parent is not None and hasattr(parent, "_busy") and parent._busy():
             QMessageBox.warning(
-                self, "干净卸载", "正在同步或正在取 Token，等它结束（或强行终止）再卸载。"
+                self,
+                "干净卸载",
+                "正在完成启动检查、同步或取 Token，等它结束再卸载。",
             )
             return
         if QMessageBox.warning(

@@ -5,14 +5,79 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal
 
+from .. import paths
+from ..backup_ops import auto_backup_on_first_run
 from ..preflight import run_preflight
 from ..settings import AppSettings
-from ..sync import SyncReport, run_sync
+from ..sync import SyncReport, both_targets_missing, detect_targets, run_sync
+from ..targets.base import TargetStatus
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StartupProbeResult:
+    """后台启动检查的结果。"""
+
+    statuses: list[TargetStatus]
+    targets_missing: bool
+    traces: dict[str, str]
+    backups_done: int = 0
+    warnings: tuple[str, ...] = ()
+
+
+class StartupProbeWorker(QThread):
+    """窗口显示后再做首次备份、ACL 收紧与目标探测。
+
+    启动同步必须等这个线程结束：先备份原始配置再写，顺序不能为了启动速度反过来。
+    """
+
+    ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, settings: AppSettings, parent=None) -> None:
+        super().__init__(parent)
+        self._settings = copy.deepcopy(settings)
+
+    def run(self) -> None:  # noqa: D102
+        warnings: list[str] = []
+
+        try:
+            paths.harden_runtime_dirs()
+        except Exception as exc:  # noqa: BLE001 - ACL 是 best-effort
+            message = f"收紧运行数据目录权限失败：{exc}"
+            logger.warning(message)
+            warnings.append(message)
+
+        backups_done = 0
+        try:
+            backups_done = auto_backup_on_first_run(self._settings)
+        except Exception as exc:  # noqa: BLE001 - 首次备份失败按旧逻辑继续
+            message = f"首次运行自动备份失败：{exc}"
+            logger.warning(message)
+            warnings.append(message)
+
+        try:
+            statuses = detect_targets(self._settings)
+            missing, traces = both_targets_missing(self._settings)
+        except Exception as exc:  # noqa: BLE001 - 线程里必须兜住所有异常
+            logger.exception("启动探测失败")
+            self.failed.emit(str(exc))
+            return
+
+        self.ready.emit(
+            StartupProbeResult(
+                statuses=statuses,
+                targets_missing=missing,
+                traces=traces,
+                backups_done=backups_done,
+                warnings=tuple(warnings),
+            )
+        )
 
 
 class SyncWorker(QThread):

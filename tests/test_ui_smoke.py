@@ -564,28 +564,94 @@ class UiSmokeTest(unittest.TestCase):
             capture.QWebEngineView = original_view  # type: ignore[assignment]
 
     def test_startup_checks_run_desktop_before_missing_targets(self) -> None:
+        from PySide6.QtCore import QObject, Signal
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+        from auto_thu_deepseek_api.ui.workers import StartupProbeResult
+
+        class FakeWorker(QObject):
+            ready = Signal(object)
+            failed = Signal(str)
+            finished = Signal()
+
+            def __init__(self, settings, parent=None) -> None:  # noqa: ANN001
+                super().__init__(parent)
+                self.settings = settings
+
+            def start(self) -> None:
+                pass
+
         window = MainWindow(AppSettings(), AppState())
         order: list[str] = []
         window._check_desktop_private = lambda: (order.append("desktop"), True)[1]  # type: ignore[assignment]
-        window._check_targets_missing = lambda: (order.append("targets"), False)[1]  # type: ignore[assignment]
+        window._check_targets_missing = lambda **kwargs: (order.append("targets"), True)[1]  # type: ignore[assignment]
         window.start_sync = lambda interactive=True: order.append("sync")  # type: ignore[assignment]
+        original_worker = main_window_module.StartupProbeWorker
+        main_window_module.StartupProbeWorker = FakeWorker  # type: ignore[assignment]
         try:
             window.startup_then_sync()
-            self.assertEqual(order, ["desktop", "targets"], "顺序固定：先桌面、再都没装")
+            worker = window._startup_worker
+            self.assertIsInstance(worker, FakeWorker)
+            self.assertEqual(order, ["desktop"], "窗口显示后应先做桌面提醒，再跑后台探测")
+            assert worker is not None
+            worker.ready.emit(
+                StartupProbeResult(statuses=[], targets_missing=False, traces={})
+            )
+            worker.finished.emit()
+            self.assertEqual(
+                order,
+                ["desktop", "targets", "sync"],
+                "后台探测完成后才检查目标并开始同步",
+            )
         finally:
+            main_window_module.StartupProbeWorker = original_worker  # type: ignore[assignment]
+            window._startup_worker = None
+            window._startup_checks_pending = False
             window._quitting = True
             window.close()
 
     def test_startup_sync_skipped_when_targets_missing(self) -> None:
+        from PySide6.QtCore import QObject, Signal
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+        from auto_thu_deepseek_api.ui.workers import StartupProbeResult
+
+        class FakeWorker(QObject):
+            ready = Signal(object)
+            failed = Signal(str)
+            finished = Signal()
+
+            def __init__(self, settings, parent=None) -> None:  # noqa: ANN001
+                super().__init__(parent)
+
+            def start(self) -> None:
+                pass
+
         window = MainWindow(AppSettings(), AppState())
         order: list[str] = []
         window._check_desktop_private = lambda: True  # type: ignore[assignment]
-        window._check_targets_missing = lambda: False  # type: ignore[assignment]
+        window._check_targets_missing = lambda **kwargs: False  # type: ignore[assignment]
         window.start_sync = lambda interactive=True: order.append("sync")  # type: ignore[assignment]
+        original_worker = main_window_module.StartupProbeWorker
+        main_window_module.StartupProbeWorker = FakeWorker  # type: ignore[assignment]
         try:
             window.startup_then_sync()
+            worker = window._startup_worker
+            self.assertIsInstance(worker, FakeWorker)
+            assert worker is not None
+            worker.ready.emit(
+                StartupProbeResult(
+                    statuses=[],
+                    targets_missing=True,
+                    traces={"dsh": "", "ccswitch": ""},
+                )
+            )
+            worker.finished.emit()
             self.assertEqual(order, [], "两个目标都没检出时不该开始同步")
         finally:
+            main_window_module.StartupProbeWorker = original_worker  # type: ignore[assignment]
+            window._startup_worker = None
+            window._startup_checks_pending = False
             window._quitting = True
             window.close()
 
@@ -802,6 +868,75 @@ class UiInteractionTest(unittest.TestCase):
             main_window_module.startup.is_app_on_desktop = original_desktop  # type: ignore[assignment]
             self._close(window)
         self.assertEqual(calls, [], "同一轮启动里不该再弹一次")
+
+    def test_running_another_copy_does_not_rewrite_startup_entry(self) -> None:
+        """回归：运行一份便携副本不能认领/改写已有的开机启动路径。"""
+
+        from unittest import mock
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        other = r'"D:\Other\autoThuDeepSeekAPI.exe" --minimized'
+        with (
+            mock.patch.object(main_window_module.startup, "current_command", return_value=other),
+            mock.patch.object(main_window_module.startup, "set_enabled") as set_enabled,
+            mock.patch.object(main_window_module.startup, "restore_command") as restore_command,
+        ):
+            window = MainWindow(AppSettings(), AppState())
+            try:
+                self.assertFalse(window.settings.launch_at_startup)
+                set_enabled.assert_not_called()
+                restore_command.assert_not_called()
+            finally:
+                self._close(window)
+
+    def test_sync_waits_for_startup_probe(self) -> None:
+        """启动备份/探测没完成时，用户提前点同步不能抢跑到备份之前。"""
+
+        from unittest import mock
+
+        from PySide6.QtWidgets import QMessageBox
+
+        window = MainWindow(
+            AppSettings(),
+            AppState(),
+            startup_checks_pending=True,
+        )
+        try:
+            with mock.patch.object(QMessageBox, "information") as information:
+                window.start_sync(interactive=True)
+            self.assertTrue(information.called)
+            self.assertIsNone(window._capture)
+        finally:
+            self._close(window)
+
+    def test_backup_and_restore_wait_for_startup_probe(self) -> None:
+        """启动备份/探测期间不能再并发手动备份或还原。"""
+
+        from unittest import mock
+
+        from PySide6.QtWidgets import QMessageBox
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        window = MainWindow(
+            AppSettings(),
+            AppState(),
+            startup_checks_pending=True,
+        )
+        dialog = SettingsDialog(window.settings, window)
+        try:
+            with (
+                mock.patch.object(main_window_module.backup_ops, "manual_backup") as manual,
+                mock.patch.object(QMessageBox, "warning") as warning,
+            ):
+                window.manual_backup()
+                dialog._restore()
+            manual.assert_not_called()
+            self.assertEqual(warning.call_count, 2)
+        finally:
+            dialog.close()
+            self._close(window)
 
     def test_sync_is_refused_when_no_target_is_enabled(self) -> None:
         """两个写入目标都关着时，同步要么提示、要么跳过，不能跑到「没有任何目标被写入」。"""

@@ -42,52 +42,42 @@ def current_command() -> str | None:
         return None
 
 
-def sync_command() -> str:
-    """开机启动项存在、但指向的路径已经不是当前这份程序时，改写成当前路径。
+def command_matches_current(command: str | None) -> bool:
+    """Whether a saved startup command points at this exact program copy.
 
-    便携程序被搬到别的目录（或共享文件夹挂载点变了）以后，注册表里那条旧路径就废了，
-    这里顺手纠正，不用用户再手动开关一次。
+    Merely running another portable copy must never claim/rewrite the user's existing
+    startup entry. The settings dialog remains the explicit place to change it.
     """
 
-    existing = current_command()
-    if not existing:
-        return ""
-    wanted = _command()
-    if existing == wanted:
-        return ""
-    ok, message = set_enabled(True)
-    if ok:
-        logger.info("开机启动项已更新为新路径：%s", wanted)
-        return wanted
-    logger.warning("更新开机启动项失败：%s", message)
-    return ""
+    return bool(command and command.strip() == _command().strip())
 
 
-def is_enabled() -> bool:
-    try:
-        import winreg
+def enabled_for_current_app() -> bool:
+    """Whether the saved startup entry belongs to this exact executable copy."""
 
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, constants.STARTUP_REGISTRY_KEY) as key:
-            value, _ = winreg.QueryValueEx(key, constants.STARTUP_VALUE_NAME)
-            return bool(value)
-    except FileNotFoundError:
-        return False
-    except OSError as exc:  # pragma: no cover - 注册表不可用时忽略
-        logger.warning("读取开机启动项失败：%s", exc)
-        return False
+    return command_matches_current(current_command())
 
 
 def set_enabled(enabled: bool) -> tuple[bool, str]:
     """返回 (是否成功, 说明)。"""
 
+    if enabled:
+        command = _command()
+        ok, message = restore_command(command)
+        return ok, f"已设置开机启动：{command}" if ok else message
+    return restore_command(None)
+
+
+def restore_command(command: str | None) -> tuple[bool, str]:
+    """Restore an exact startup command, or delete it when command is None."""
+
     try:
         import winreg
 
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, constants.STARTUP_REGISTRY_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            if enabled:
-                command = _command()
+            if command:
                 winreg.SetValueEx(key, constants.STARTUP_VALUE_NAME, 0, winreg.REG_SZ, command)
-                return True, f"已设置开机启动：{command}"
+                return True, f"已恢复开机启动命令：{command}"
             try:
                 winreg.DeleteValue(key, constants.STARTUP_VALUE_NAME)
             except FileNotFoundError:

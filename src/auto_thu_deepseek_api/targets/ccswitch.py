@@ -6,11 +6,10 @@ import json
 import logging
 import re
 import sqlite3
-import subprocess
 import textwrap
 from pathlib import Path
 
-from .. import constants
+from .. import constants, procinfo
 from ..backup import BackupManager
 from ..change_journal import ChangeJournal
 from ..paths import TargetPaths
@@ -23,17 +22,9 @@ logger = logging.getLogger(__name__)
 def is_running() -> bool:
     """CC Switch 是否正在运行（Windows）。"""
 
-    try:
-        completed = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {constants.CCSWITCH_PROCESS_NAME}.exe", "/NH"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return constants.CCSWITCH_PROCESS_NAME in completed.stdout.lower()
+    return (
+        procinfo.any_running(constants.CCSWITCH_PROCESS_NAME, refresh=True) is not None
+    )
 
 
 def _load_json(path: Path) -> dict:

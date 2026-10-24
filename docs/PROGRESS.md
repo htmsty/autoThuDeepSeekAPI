@@ -29,16 +29,17 @@
 | 2.7.2 | 主界面恢复日志（完整/同步结果/关闭）、修复设置内预检使用旧配置且结果被遮挡、按内容重整五个设置页 | ✅ 已完成（留档 `releases/2.7.2/`） |
 | 2.7.3 | 修复打包版 `ssl.py` 缺少 `codex-rejected-cas.pem` 导致 HTTPS 初始化异常、成功登录后同步中断 | ✅ 已完成（留档 `releases/2.7.3/`） |
 | 2.8.0 | 资源占用优化：释放浏览器会话、限制 HTTP 缓存、日志按天清理、复用 TLS 上下文、精简打包调试资源 | ✅ 已完成（tag `v2.8.0`） |
+| 2.9.0 | 启动结构优化：WebEngine 惰性导入、首次备份/探测后台化、原生进程快照、多文件 ZIP 主发布 | ✅ 已完成（tag `v2.9.0`） |
 
-两个版本的**单文件程序**都要留档在 `releases/<版本>/`（产物不进 Git，使用
-`releases/<版本>/SHA256.txt` 记录校验和；GitHub Release 资产本身支持更大的附件）。
+多文件 ZIP 是正式主资产，单文件 EXE 作为兼容备用；两者都要留档在 `releases/<版本>/`
+（产物不进 Git，使用 `releases/<版本>/SHA256.txt` 记录校验和；GitHub Release 资产本身支持更大的附件）。
 
 ## 环境与约定
 
 - 开发环境：`D:\2\program\codex\autoThuDeepSeekAPI\autoThuDeepSeekAPI`，`.venv` 里装
   PySide6 6.12 / PyYAML / ruamel.yaml / PyInstaller 6.22。
-- 测试：`python -m unittest discover -s tests -t .`（当前 190 项）。
-- 打包：`powershell -File build\build_app.ps1`（同时出文件夹版与单文件版）。
+- 测试：`python -m unittest discover -s tests -t .`（当前 198 项）。
+- 打包：`powershell -File build\build_app.ps1`（同时出版本化多文件 ZIP、展开目录与单文件版）。
 - 自检：`autoThuDeepSeekAPI.exe --selftest`（起本地网页写假 Token，验证捕获链路）。
 - 运行数据全部在程序目录的 `private/`，不进 Git；`dist/`、`releases/` 也不进 Git。
 
@@ -110,6 +111,29 @@
 6. **验收**：190 项单元测试全绿；设置界面截图、两版打包、`--selftest`、
    文件版本与 SHA256 核对均通过。文件夹版 2,838 个文件 / 429.31 MiB，
    单文件版 172,274,196 字节 / 164.29 MiB。
+
+## 2.9.0 阶段
+
+1. **惰性浏览器**：`main_window` 不再顶层导入 `token.capture`，只有第一次真正取 Token 时
+   才加载 Qt WebEngine。主窗口启动与托盘常驻阶段不会创建 `QtWebEngineProcess`。
+2. **后台启动检查**：新增 `StartupProbeWorker`，窗口显示后再收紧敏感目录 ACL、留首次原始备份、
+   探测目标并判断“两边都没装”。同步必须等它结束，保证“先备份再写入”。
+3. **启动探测提速**：`ensure_runtime_dirs(secure=False)` 只建目录；Windows 进程列表优先走
+   Toolhelp32 原生快照，不再额外启动 `tasklist`；CC Switch 检查使用强制刷新，避免缓存过期。
+4. **开机启动安全**：只把与当前 EXE 命令完全一致的项目显示为当前程序已启用。运行另一份便携
+   副本不会静默改写用户原有路径；设置保存失败时会恢复原始注册表命令。
+5. **发行包**：`build_app.ps1` 自动生成带顶层目录的
+   `autoThuDeepSeekAPI-2.9.0-portable.zip`，同时保留版本化单文件 EXE 和旧兼容名。
+6. **自检收尾**：`--selftest` 显式释放 profile 并处理 DeferredDelete，修复单文件自检后
+   偶发残留 QtWebEngine 渲染进程。
+7. **验收**：198 项测试、`compileall`、`git diff --check` 全通过；ZIP 顶层结构、两版
+   `--selftest`、版本资源、SHA256、无 WebEngine 残留均核对。
+   - 多文件目录版：2,838 文件 / 450,171,523 字节（429.32 MiB）；
+   - ZIP：173,427,891 字节（165.39 MiB）；
+   - 单文件版：172,280,579 字节（164.30 MiB）；
+   - 隔离启动：扫描缓存完成后多文件版约 1.0–1.1 秒，程序内部启动约 0.6 秒；全新构建
+     前几次可能被 Defender 扫描拖慢到约 6–13 秒；单文件约 6.65 秒；
+   - 隔离测试前后开机启动项不变。
 
 ## 2.0 阶段（本轮）
 

@@ -10,9 +10,10 @@ import http.server
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QTimer
 from PySide6.QtWidgets import QApplication
 
 from .http_tls import create_verified_context
@@ -90,6 +91,22 @@ def run(profile_dir: Path, timeout_seconds: int = 30) -> int:
     QTimer.singleShot(0, session.start)
     QTimer.singleShot((timeout_seconds + 10) * 1000, application.quit)
     application.exec()
+
+    # `QApplication.quit()` only leaves the event loop. In one-file builds the Chromium
+    # renderer can outlive the temporary `_MEI...` directory briefly unless the page and
+    # profile are explicitly destroyed and DeferredDelete events are processed.
+    try:
+        session.cancel()
+        session.deleteLater()
+    except RuntimeError:
+        # `TokenCaptureSession.finish()` may already have completed its DeferredDelete.
+        pass
+    profile.deleteLater()
+    for _ in range(30):
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        application.processEvents()
+        time.sleep(0.03)
+
     server.shutdown()
     server.server_close()
 

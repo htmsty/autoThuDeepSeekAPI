@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from auto_thu_deepseek_api import paths, startup  # noqa: E402
+from auto_thu_deepseek_api.app import _install_qt_translations  # noqa: E402
 from auto_thu_deepseek_api.logging_setup import close_file_handlers, setup_logging  # noqa: E402
 from auto_thu_deepseek_api.settings import AppSettings  # noqa: E402
 from auto_thu_deepseek_api.state_store import AppState  # noqa: E402
@@ -34,15 +35,16 @@ def main() -> int:
     output = Path(arguments[0]) if arguments else Path(default_name)
     with tempfile.TemporaryDirectory() as tmp:
         original_data_root = paths.data_root
-        original_startup_enabled = startup.is_enabled
+        original_startup_command = startup.current_command
         paths.data_root = lambda: Path(tmp) / "private"  # type: ignore[assignment]
-        # 截图不能因为开发机恰好开了开机启动就去改写注册表路径。
-        startup.is_enabled = lambda: False  # type: ignore[assignment]
+        # 截图不能因为开发机恰好开了开机启动就去读取/展示真实注册表状态。
+        startup.current_command = lambda: None  # type: ignore[assignment]
         try:
             paths.ensure_runtime_dirs()
             setup_logging()
 
             application = QApplication(sys.argv[:1])
+            _install_qt_translations(application)
             settings = AppSettings()
             state = AppState()
             window = MainWindow(settings, state)
@@ -62,7 +64,7 @@ def main() -> int:
             window.quit_app()
         finally:
             close_file_handlers()
-            startup.is_enabled = original_startup_enabled  # type: ignore[assignment]
+            startup.current_command = original_startup_command  # type: ignore[assignment]
             paths.data_root = original_data_root  # type: ignore[assignment]
     return 0
 

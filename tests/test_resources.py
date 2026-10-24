@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +15,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_thu_deepseek_api import logging_setup  # noqa: E402
 from auto_thu_deepseek_api.token import capture  # noqa: E402
+
+
+class LazyRuntimeImportTest(unittest.TestCase):
+    def test_main_window_import_does_not_load_webengine(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root / "src")
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        code = (
+            "import sys;"
+            "import auto_thu_deepseek_api.ui.main_window;"
+            "print(any(name.startswith('PySide6.QtWebEngine') for name in sys.modules))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "False", completed.stderr)
 
 
 class LogRetentionTest(unittest.TestCase):

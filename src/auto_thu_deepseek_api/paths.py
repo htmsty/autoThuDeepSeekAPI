@@ -528,11 +528,25 @@ def state_file() -> Path:
     return data_root() / "state.json"
 
 
-def ensure_runtime_dirs() -> None:
+def ensure_runtime_dirs(*, secure: bool = True) -> None:
+    """Create runtime directories.
+
+    Startup keeps this minimal (`secure=False`) and hands ACL hardening to a background
+    worker after the first window is visible.
+    """
+
     for path in (logs_dir(), backups_dir(), browser_profile_dir()):
         path.mkdir(parents=True, exist_ok=True)
     changes = data_root() / "changes"
     changes.mkdir(parents=True, exist_ok=True)
+    if secure:
+        harden_runtime_dirs()
+
+
+def harden_runtime_dirs() -> None:
+    """Best-effort current-user ACL for directories that hold cookies or secrets."""
+
+    changes = data_root() / "changes"
     for path in (backups_dir(), changes, browser_profile_dir()):
         restrict_to_current_user(path)
 

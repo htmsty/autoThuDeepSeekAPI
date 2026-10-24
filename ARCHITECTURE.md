@@ -60,7 +60,8 @@ private 的位置**可以改**（2.5 起）：
   回收站不可用时 `delete_path()` 保持原样并报告，不再退化成永久删除。
 - `resolve_*_paths()` 在默认目录、环境变量、常见配置目录、注册表卸载项与开始菜单快捷方式之间只做有界探测；
   用户显式填写的目录优先，不做全盘扫描。
-- `ensure_runtime_dirs()` 为备份、变更日志和浏览器档案设置当前用户 ACL。DPAPI 保护文件内容，
+- `ensure_runtime_dirs(secure=False)` 在启动主线程只创建目录；窗口显示后由启动工作线程调用
+  `harden_runtime_dirs()`，为备份、变更日志和浏览器档案设置当前用户 ACL。DPAPI 保护文件内容，
   但 Qt WebEngine 必须直接访问浏览器档案，因此只能依赖当前 Windows 账户隔离。
   旧目录清空到只剩程序自己时，连目录一起删；还剩用户文件就保留。
 - `defer_creation()`：启动早期只判断不落盘，避免"桌面提醒还没弹，private 已经在桌面上"。
@@ -101,6 +102,8 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
 - `capture.py`：QtWebEngine 内置窗口。页面脚本在 `DocumentCreation` 注入，
   收集 `localStorage` / `sessionStorage`、Cookie、`fetch` / `XHR` 响应和页面文本中的多个
   JWT 候选；`choose_jwt()` 按来源、域名、字段名、有效期评分，证据接近时宁可等待也不乱选。
+  模块由 `main_window._open_capture()` 在第一次真正取 Token 时惰性导入，主界面启动和托盘
+  常驻阶段不会提前加载 Qt WebEngine。
   默认不模拟登录。用户显式启用自动登录后，仅在清华域名下填充/提交，检测到验证码、二次验证、
   MFA、账号错误或页面异常时打开窗口并发出人工接管信号。验证码必须实际可见才算人工验证
   （清华页面始终存在一个隐藏验证码输入框）；登录控件覆盖 button/input/a/role=button
@@ -217,11 +220,17 @@ Windows DPAPI 加密；旧明文备份会在索引读取时原地迁移。SQLite
 关闭模式则隐藏日志区但文件日志照常记录。
 
 ### `startup.py`
-开机启动（HKCU 的 Run 项）与桌面快捷方式。启动时会核对注册表实际值：路径变了自动纠正，
-值为空（被别处写坏）直接重写。`create_desktop_shortcut()` 用系统自带的
+开机启动（HKCU 的 Run 项）与桌面快捷方式。启动时只读取启动项，并判断它是否正好指向
+**当前这一份程序**；运行另一份便携副本不会静默认领或改写原有路径。需要换路径时，由用户在
+设置里显式取消再勾选。`create_desktop_shortcut()` 用系统自带的
 PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以免中文/空格被命令行弄坏，
 并隐藏子进程窗口。`is_app_on_desktop()` 判断程序是不是**直接**在桌面根目录（子文件夹不算），
 `launch_command()` 供"重启程序"用。
+
+### `ui/workers.py`
+`StartupProbeWorker` 在主窗口显示后执行三类原本会拖慢首帧的工作：当前用户 ACL 收紧、
+首次运行原始备份、DSH / CC Switch 目标探测与"都没装"判断。启动同步必须等它结束；
+顺序固定为"先备份、后探测、最后才允许写入"，不会为了启动快而绕过原始备份。
 
 ### `http_tls.py`
 所有 Python HTTPS 请求共用的证书上下文。正常路径调用 `ssl.create_default_context()`；
@@ -258,13 +267,19 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
   是不是"一点痕迹都没有"（配置目录、进程、常见安装目录任一命中就算有），
   只有真的两边都没有才提醒"先安装"。
 
+### `procinfo.py`
+Windows 下优先用 Toolhelp32 原生进程快照，不再为了启动探测额外启动一次 `tasklist`；
+原生 API 不可用时才回退 `tasklist`。普通目标探测复用一次缓存，CC Switch 运行状态检查会
+显式刷新缓存，避免把启动前未运行、之后才打开的程序误判成未运行。
+
 ### `ui/`
 - `main_window.py`：状态区 + 立即同步/设置/退出 + 下次同步时间 + 底部运行日志 + 托盘。
   `log_bus` 的日志只在完整模式直接追加；简化模式仅显示同步结果与时间，关闭模式隐藏日志区。
   预检、备份、还原、数据目录、快捷方式和关于都在对应设置页。托盘固定五项。
   主窗口与设置窗口尺寸写入 `private/state.json`，恢复时按当前屏幕可用区域限制。
-  启动流程（2.5 起）：`startup_then_sync()` → 先 `_check_desktop_private()`（程序在桌面根目录
-  时提醒一次，三个选择），再 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
+  启动流程：`startup_then_sync()` 先在主线程做很快的 `_check_desktop_private()`（程序在桌面
+  根目录时提醒一次），随后把首次备份、ACL 和目标探测交给 `StartupProbeWorker`。工作线程结束后
+  才用预计算出的结果走 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
   都通过才跑"启动时立即同步"。两条提醒的"已处理"状态写在 private 的 `state.json` 里。
   「强行终止并重试」也在这里：`_ask_force_retry()` + `_retry_after_stop`。
   2.5.1 起，桌面提醒其实由 `app.py` 在**创建任何目录之前**调 `data_location.desktop_notice()`
@@ -279,7 +294,8 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
   「校验写入内容」把当前草稿设置交给后台 `PreflightWorker`，结果框优先挂在仍然可见的
   设置窗口上；按钮在运行时显示进度，成功后信息框、失败后警告框。
   「备份、日志与维护」包含 private 位置、恢复默认设置和干净卸载。
-- `workers.py`：把同步放到 `QThread`，避免界面卡死。
+- `workers.py`：`StartupProbeWorker` 负责窗口显示后的启动检查；`SyncWorker` 把同步放到线程，
+  避免界面卡死。
   `request_cancel()` 只是给同步流程一个"请停下"的信号（协作式取消，见 `sync.py`）。
 
 ## 每一步要做什么（里程碑）
@@ -292,14 +308,15 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
 | M3 | 写入器 | DSH、CC Switch 写入正确且不动无关内容 |
 | M4 | 备份与还原 | 首次修改前有备份，"还原"能回到初始状态 |
 | M5 | 自动化 | 自动同步、开机启动、启动即同步、同步后最小化 |
-| M6 | 打包 | 文件夹版与单文件版均可双击运行 |
+| M6 | 打包 | 多文件 ZIP 为正式主资产，单文件版保留为兼容备用 |
 | M7 | 实测与发布 | 本机端到端验证通过并推送 GitHub |
 
 打包注意：`build/atd.spec` 会过滤两类 DLL —— Codex 运行库自带的旧 `api-ms-win-*`
 转发 DLL，以及外部工具链（Poppler）里的 ICU。它们会盖住 Qt 需要的系统版本，
 导致打包后导入 QtCore 时报 WinError 127。spec 还会把定制 `ssl.py` 需要的
-`codex-rejected-cas.pem` 放到包根目录。`--selftest` 同时确认浏览器捕获链路与 HTTPS
-证书上下文可用。
+`codex-rejected-cas.pem` 放到包根目录。`build_app.ps1` 生成带顶层
+`autoThuDeepSeekAPI\` 目录的版本化 ZIP，同时保留展开目录和单文件兼容版。
+`--selftest` 同时确认浏览器捕获链路与 HTTPS 证书上下文可用。
 
 ## 约定
 

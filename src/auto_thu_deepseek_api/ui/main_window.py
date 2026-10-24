@@ -12,8 +12,9 @@ import weakref
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,12 +45,19 @@ from ..settings import (
 from ..state_store import AppState
 from ..sync import SyncReport, both_targets_missing, detect_targets
 from ..targets.ccswitch import is_running as ccswitch_is_running
-from ..token.capture import TokenCaptureSession, build_profile
 from ..token.jwt_utils import describe_expiry, is_expired
 from ..token.verifier import site_reachable
 from .icon import app_icon
 from .settings_dialog import SettingsDialog
-from .workers import PreflightWorker, SyncWorker
+from .workers import (
+    PreflightWorker,
+    StartupProbeResult,
+    StartupProbeWorker,
+    SyncWorker,
+)
+
+if TYPE_CHECKING:
+    from ..token.capture import TokenCaptureSession
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,7 @@ class MainWindow(QMainWindow):
         *,
         desktop_notice_done: bool = False,
         started_minimized: bool = False,
+        startup_checks_pending: bool = False,
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -78,9 +87,13 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._sync_worker: SyncWorker | None = None
         self._preflight_worker: PreflightWorker | None = None
+        self._startup_worker: StartupProbeWorker | None = None
+        self._startup_checks_pending = bool(startup_checks_pending)
+        self._startup_probe_result: StartupProbeResult | None = None
+        self._startup_probe_error = ""
         self._preflight_result_parent_ref: weakref.ReferenceType[QWidget] | None = None
         self._capture: TokenCaptureSession | None = None
-        self._browser_profile = None
+        self._browser_profile: QObject | None = None
         self._browser_release_timer = QTimer(self)
         self._browser_release_timer.setSingleShot(True)
         self._browser_release_timer.timeout.connect(self._release_browser_profile)
@@ -105,18 +118,13 @@ class MainWindow(QMainWindow):
         # 开机静默失败后只自动打开一次登录窗口，避免反复弹
         self._login_offered_after_silent_failure = False
 
-        # 开机启动的真实状态以注册表为准：外面被人删掉时，界面上的勾要跟着回到未勾。
+        # 开机启动的真实状态以注册表为准。这里只读取，不因为运行了另一份便携副本
+        # 就偷偷改写用户已有的启动路径；是否修改由设置页里显式操作。
         try:
-            self.settings.launch_at_startup = startup.is_enabled()
-            if self.settings.launch_at_startup:
-                # 路径变了就改成当前路径；值为空（被别处写坏）就直接重写一遍。
-                current = startup.current_command()
-                if current is None or not current.strip():
-                    ok, message = startup.set_enabled(True)
-                    if not ok:
-                        logger.warning("修开机启动项失败：%s", message)
-                else:
-                    startup.sync_command()
+            current = startup.current_command()
+            self.settings.launch_at_startup = startup.command_matches_current(current)
+            if current and not self.settings.launch_at_startup and paths.is_frozen():
+                logger.warning("开机启动项属于另一份程序副本，本次不自动改写：%s", current)
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取开机启动状态失败：%s", exc)
 
@@ -136,7 +144,9 @@ class MainWindow(QMainWindow):
         self._auto_timer.setSingleShot(True)
         self._auto_timer.timeout.connect(self._auto_tick)
         self._apply_auto_timer()
-        self.refresh_status()
+        # 目标探测与首次备份由窗口显示后的后台线程完成；主线程只刷新 Token 等本地状态。
+        self._apply_target_policy_labels()
+        self._refresh_local_status()
 
     # —— 界面 ——
 
@@ -150,8 +160,8 @@ class MainWindow(QMainWindow):
         # 状态
         status_box = QGroupBox("状态")
         status_grid = QGridLayout(status_box)
-        self.dsh_status = QLabel("—")
-        self.ccswitch_status = QLabel("—")
+        self.dsh_status = QLabel("正在检测…")
+        self.ccswitch_status = QLabel("正在检测…")
         self.token_status = QLabel("—")
         self.last_sync_status = QLabel("—")
         for row, (title, widget) in enumerate(
@@ -373,9 +383,17 @@ class MainWindow(QMainWindow):
         if self._skip_save_on_quit or self._quitting:
             # 设置对话框里刚做过"干净卸载"或正在退出：别再写设置文件，否则刚删的会被建回来
             return False
+        if self._startup_checks_pending:
+            QMessageBox.information(
+                self,
+                "正在完成启动检查",
+                "程序还在做首次备份和目标检查。等它完成后再应用设置，避免新目标在原始备份前被写入。",
+            )
+            return False
 
         old_settings = copy.deepcopy(self.settings)
-        old_startup = startup.is_enabled()
+        old_startup = startup.enabled_for_current_app()
+        old_startup_command = startup.current_command()
         startup_changed = draft.launch_at_startup != old_startup
         if startup_changed:
             ok, message = startup.set_enabled(draft.launch_at_startup)
@@ -388,12 +406,12 @@ class MainWindow(QMainWindow):
         previous_keep_days = self.settings.log_keep_days
         for field in fields(AppSettings):
             setattr(self.settings, field.name, getattr(draft, field.name))
-        self.settings.launch_at_startup = startup.is_enabled()
+        self.settings.launch_at_startup = startup.enabled_for_current_app()
         if not self._persist_settings():
             for field in fields(AppSettings):
                 setattr(self.settings, field.name, getattr(old_settings, field.name))
             if startup_changed:
-                startup.set_enabled(old_startup)
+                startup.restore_command(old_startup_command)
             return False
         if (
             self.settings.log_level != previous_level
@@ -411,8 +429,6 @@ class MainWindow(QMainWindow):
             )
         logger.info("设置已保存")
         self.apply_settings_to_ui()
-        self._apply_auto_timer()
-        self.refresh_status()
         return True
 
     def _consume_manual_dialog_token(self, dialog: SettingsDialog) -> None:
@@ -434,7 +450,7 @@ class MainWindow(QMainWindow):
             self.state.remember_token(token)
         except OSError as exc:
             logger.error("保存手动粘贴的 Token 失败：%s", exc)
-        self.refresh_status()
+        self._refresh_local_status()
         logger.info("使用手动粘贴的 Token 开始同步")
         self._start_sync_worker(token, auto=False)
 
@@ -463,22 +479,95 @@ class MainWindow(QMainWindow):
     # —— 启动检查（先"程序在桌面"，再"两个目标都没装"） ——
 
     def startup_then_sync(self) -> None:
-        """启动后的第一件事：先跑两条提醒，再决定要不要跑启动同步。"""
+        """窗口显示后先做本机提醒，再把重活交给后台启动检查。"""
 
-        if not self.run_startup_checks():
+        if self._quitting or self._startup_worker is not None:
+            return
+        self._startup_checks_pending = True
+        # 桌面提醒很快，而且它必须在任何数据搬迁/备份之前按顺序完成。
+        if not self._check_desktop_private():
+            return
+
+        self.dsh_status.setText("正在检测…")
+        self.ccswitch_status.setText("正在检测…")
+        self._show_status_hint("正在完成启动检查与首次备份…")
+        worker = StartupProbeWorker(self.settings, self)
+        self._startup_worker = worker
+        self._startup_probe_result = None
+        self._startup_probe_error = ""
+        worker.ready.connect(lambda result, w=worker: self._on_startup_probe_ready(result, w))
+        worker.failed.connect(lambda message, w=worker: self._on_startup_probe_failed(message, w))
+        worker.finished.connect(lambda w=worker: self._on_startup_thread_finished(w))
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001 - 线程起不来也不能留下假忙状态
+            logger.exception("启动检查线程启动失败")
+            self._startup_worker = None
+            self._startup_checks_pending = False
+            self._restore_status_hint()
+            self.dsh_status.setText("启动检测失败，可手动同步")
+            self.ccswitch_status.setText("启动检测失败，可手动同步")
+            if not self._started_minimized:
+                self.notify(f"启动检查失败：{exc}", warning=True)
+
+    def _on_startup_probe_ready(
+        self,
+        result: StartupProbeResult,
+        worker: StartupProbeWorker | None = None,
+    ) -> None:
+        if worker is not None and worker is not self._startup_worker:
+            logger.info("旧启动检查结果晚到，已忽略")
+            return
+        self._startup_probe_result = result
+        self._apply_target_statuses(result.statuses)
+        for warning in result.warnings:
+            logger.warning(warning)
+        if result.backups_done:
+            logger.info("启动检查已完成首次备份：%d 份", result.backups_done)
+
+    def _on_startup_probe_failed(
+        self,
+        message: str,
+        worker: StartupProbeWorker | None = None,
+    ) -> None:
+        if worker is not None and worker is not self._startup_worker:
+            return
+        self._startup_probe_error = message
+        logger.warning("启动检查失败：%s", message)
+        self.dsh_status.setText("启动检测失败，可手动同步")
+        self.ccswitch_status.setText("启动检测失败，可手动同步")
+
+    def _on_startup_thread_finished(
+        self,
+        worker: StartupProbeWorker | None = None,
+    ) -> None:
+        if worker is not None and worker is not self._startup_worker:
+            return
+        self._startup_worker = None
+        self._startup_checks_pending = False
+        if worker is not None:
+            worker.deleteLater()
+        self._restore_status_hint()
+        if self._startup_probe_error:
+            if not self._started_minimized:
+                self.notify(
+                    f"启动检查失败：{self._startup_probe_error}。可稍后手动点同步。",
+                    warning=True,
+                )
+            return
+        result = self._startup_probe_result
+        if result is None:
+            return
+        if not self._check_targets_missing(
+            missing=result.targets_missing,
+            traces=result.traces,
+        ):
             return
         if self.settings.sync_on_start:
             logger.info("启动后自动同步一次")
             self.start_sync(interactive=False)
         else:
             logger.info("设置里关掉了「启动时立即同步」，本次不自动同步")
-
-    def run_startup_checks(self) -> bool:
-        """返回 True 表示可以继续这次启动同步。"""
-
-        if not self._check_desktop_private():
-            return False
-        return self._check_targets_missing()
 
     def _check_desktop_private(self) -> bool:
         """程序直接在桌面根目录时提醒用户；返回 False 表示已经退出程序。"""
@@ -503,10 +592,16 @@ class MainWindow(QMainWindow):
         self.quit_app()
         return False
 
-    def _check_targets_missing(self) -> bool:
+    def _check_targets_missing(
+        self,
+        *,
+        missing: bool | None = None,
+        traces: dict[str, str] | None = None,
+    ) -> bool:
         """DSH 与 CC Switch 都没检出时提醒一次并跳过这次同步；返回是否继续同步。"""
 
-        missing, traces = both_targets_missing(self.settings)
+        if missing is None or traces is None:
+            missing, traces = both_targets_missing(self.settings)
         if not missing:
             return True
         logger.info("DSH 与 CC Switch 都没有痕迹，跳过这次同步：%s", traces)
@@ -531,7 +626,9 @@ class MainWindow(QMainWindow):
 
         if self._busy():
             QMessageBox.warning(
-                self, "更改 private 位置", "正在同步或正在取 Token，等它结束再改 private 位置。"
+                self,
+                "更改 private 位置",
+                "正在完成启动检查、同步或取 Token，等它结束再改 private 位置。",
             )
             return False
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -758,6 +855,13 @@ class MainWindow(QMainWindow):
         self._restore_status_hint()
 
     def manual_backup(self) -> None:
+        if self._busy():
+            QMessageBox.warning(
+                self,
+                "手动备份",
+                "正在做启动检查、同步或取 Token，等它结束再备份。",
+            )
+            return
         try:
             done, lines = backup_ops.manual_backup(self.settings)
         except Exception as exc:  # noqa: BLE001
@@ -859,6 +963,25 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self._auto_timer.stop()
         self._auto_retry_timer.stop()
+        startup_worker = self._startup_worker
+        if startup_worker is not None and startup_worker.isRunning():
+            # 首次备份是写操作。退出时先等它完成，避免留下半截备份或让 QThread
+            # 随窗口一起销毁。等待超过 10 秒再交给 QApplication 保活。
+            logger.info("退出前等启动检查与首次备份结束（最多 10 秒）…")
+            if not startup_worker.wait(10000):
+                logger.warning("启动检查仍未结束，交给进程退出处理")
+                startup_worker.setParent(None)
+                application = QApplication.instance()
+                if application is not None:
+                    orphans = getattr(application, "_atd_orphan_threads", None)
+                    if orphans is None:
+                        orphans = []
+                        application._atd_orphan_threads = orphans  # type: ignore[attr-defined]
+                    orphans.append(startup_worker)
+        self._startup_worker = None
+        self._startup_checks_pending = False
+        self._startup_probe_result = None
+        self._startup_probe_error = ""
         if self._capture is not None:
             self._capture.cancel()
         worker = self._sync_worker
@@ -904,19 +1027,26 @@ class MainWindow(QMainWindow):
     # —— 状态刷新 ——
 
     def refresh_status(self) -> None:
+        """Refresh target detection and the cheap local status fields."""
+
         try:
             statuses = detect_targets(self.settings)
         except Exception as exc:  # noqa: BLE001
             logger.warning("探测目标失败：%s", exc)
             statuses = []
+        self._apply_target_statuses(statuses)
+        self._refresh_local_status()
 
+    def _apply_target_statuses(self, statuses) -> None:  # noqa: ANN001
         for status in statuses:
             text = ("已安装 · " if status.detected else "未检测到 · ") + status.detail
             if status.key == "dsh":
                 self.dsh_status.setText(text)
             elif status.key == "ccswitch":
                 self.ccswitch_status.setText(text)
+        self._apply_target_policy_labels()
 
+    def _apply_target_policy_labels(self) -> None:
         if not self.settings.enable_dsh:
             self.dsh_status.setText("已关闭写入（设置里可重新开启）")
         elif not (
@@ -930,6 +1060,7 @@ class MainWindow(QMainWindow):
         ):
             self.ccswitch_status.setText("已关闭全部 CC Switch 写入项（设置里可重新开启）")
 
+    def _refresh_local_status(self) -> None:
         token = self.state.last_token
         if token and is_expired(token) is not True:
             self.token_status.setText(
@@ -948,6 +1079,15 @@ class MainWindow(QMainWindow):
     def start_sync(self, interactive: bool = True) -> None:
         if self._maintenance:
             logger.info("正在搬 private 位置或卸载，本次同步先跳过")
+            return
+        if self._startup_worker is not None or self._startup_checks_pending:
+            logger.info("启动检查还没结束，本次同步请求先等待")
+            if interactive:
+                QMessageBox.information(
+                    self,
+                    "正在完成启动检查",
+                    "程序还在做首次备份和目标检查。等它完成后再点同步即可。",
+                )
             return
         dsh_active = self.settings.enable_dsh and (
             self.settings.enable_dsh_credentials or self.settings.enable_dsh_provider
@@ -1052,8 +1192,10 @@ class MainWindow(QMainWindow):
         return bool(self.state.last_token) or bool(self.current_token())
 
     def _busy(self) -> bool:
-        """正在同步，或正在取 Token。"""
+        """正在完成启动检查、同步，或取 Token。"""
 
+        if self._startup_worker is not None or self._startup_checks_pending:
+            return True
         # 线程对象还在就算忙：哪怕它刚好跑完、finished 信号还没派发到主线程，
         # 这时候放新的同步进来会让两轮并排跑（旧线程收尾时还会误清新线程的状态）。
         if self._sync_worker is not None:
@@ -1107,8 +1249,6 @@ class MainWindow(QMainWindow):
     def _open_capture(self, silent: bool) -> None:
         self._capture_silent = silent
         self._browser_release_timer.stop()
-        if self._browser_profile is None:
-            self._browser_profile = build_profile(paths.browser_profile_dir())
 
         auto_username = ""
         auto_password = ""
@@ -1126,18 +1266,6 @@ class MainWindow(QMainWindow):
                 auto_username = stored.username
                 auto_password = stored.password
 
-        self._capture = TokenCaptureSession(
-            self._browser_profile,
-            silent=silent,
-            timeout_seconds=None if not silent else self.settings.silent_capture_timeout_seconds,
-            auto_username=auto_username,
-            auto_password=auto_password,
-            parent=self,
-        )
-        self._capture.captured.connect(self._on_token_captured)
-        self._capture.failed.connect(self._on_capture_failed)
-        self._capture.cancelled.connect(self._on_capture_cancelled)
-        self._capture.manual_intervention_required.connect(self._on_manual_login_required)
         if silent:
             if auto_username:
                 logger.info("开始后台取 Token（使用已保存的账号密码自动登录）")
@@ -1148,6 +1276,27 @@ class MainWindow(QMainWindow):
         else:
             self._show_status_hint("正在获取 Token：请在登录窗口完成登录…")
         try:
+            # Qt WebEngine 只在这一刻导入：主窗口启动和托盘常驻时不加载 Chromium。
+            from ..token.capture import TokenCaptureSession, build_profile
+
+            if self._browser_profile is None:
+                self._browser_profile = build_profile(paths.browser_profile_dir())
+            self._capture = TokenCaptureSession(
+                self._browser_profile,
+                silent=silent,
+                timeout_seconds=(
+                    None if not silent else self.settings.silent_capture_timeout_seconds
+                ),
+                auto_username=auto_username,
+                auto_password=auto_password,
+                parent=self,
+            )
+            self._capture.captured.connect(self._on_token_captured)
+            self._capture.failed.connect(self._on_capture_failed)
+            self._capture.cancelled.connect(self._on_capture_cancelled)
+            self._capture.manual_intervention_required.connect(
+                self._on_manual_login_required
+            )
             self._capture.start()
         except Exception as exc:  # noqa: BLE001 - 起不来的话不能把 _capture 留在那儿
             logger.exception("打开取 Token 流程失败")
@@ -1157,6 +1306,7 @@ class MainWindow(QMainWindow):
                 failed_capture.cancel()
             self._capture_user_initiated = False
             self._schedule_browser_release()
+            self._restore_status_hint()
             self.notify(f"取 Token 失败：{exc}", warning=True)
 
     def _on_manual_login_required(self, reason: str) -> None:
@@ -1174,7 +1324,7 @@ class MainWindow(QMainWindow):
             # 状态文件写不进去不该拦住同步：Token 已经在内存里，这次先用着
             logger.error("保存 Token 到状态文件失败：%s", exc)
             self.notify(f"Token 保存失败（本次同步继续）：{exc}", warning=True)
-        self.refresh_status()
+        self._refresh_local_status()
         self._show_status_hint("已获取 Token，正在写入目标…")
         self._start_sync_worker(token, auto=not was_user_initiated)
 
@@ -1192,7 +1342,7 @@ class MainWindow(QMainWindow):
             self._schedule_browser_release()
             self._start_sync_worker(fallback, auto=not was_user_initiated)
             return
-        self.refresh_status()
+        self._refresh_local_status()
         should_open_login = (
             was_silent
             and (self._started_minimized or was_user_initiated)
@@ -1253,7 +1403,7 @@ class MainWindow(QMainWindow):
             self.state.remember_status(summary)
         except OSError as exc:
             logger.error("保存同步状态失败：%s", exc)
-        self.refresh_status()
+        self._refresh_local_status()
         self._restore_status_hint()
         if report.cancelled:
             # 是我们自己请它停下的，别弹"同步完成"的通知吓人

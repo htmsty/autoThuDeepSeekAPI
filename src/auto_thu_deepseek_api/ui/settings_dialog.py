@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,11 +45,23 @@ from ..token.jwt_utils import looks_like_jwt
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_DIALOG_WIDTH = 700
+DEFAULT_DIALOG_HEIGHT = 540
+MIN_DIALOG_WIDTH = 640
+MIN_DIALOG_HEIGHT = 480
+
 
 class SettingsDialog(QDialog):
     settings_applied = Signal()
+    window_size_saved = Signal(int, int)
 
-    def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        parent: QWidget | None = None,
+        *,
+        saved_size: Sequence[int] | None = None,
+    ) -> None:
         super().__init__(parent)
         # 使用草稿副本：取消时不能把已经点过的控件值写回主窗口。
         self.settings = copy.deepcopy(settings)
@@ -61,8 +75,8 @@ class SettingsDialog(QDialog):
         if stored is not None:
             self._saved_username = stored.username
         self.setWindowTitle("设置")
-        self.setMinimumSize(760, 620)
-        self.resize(820, 720)
+        self.setMinimumSize(MIN_DIALOG_WIDTH, MIN_DIALOG_HEIGHT)
+        self.resize(DEFAULT_DIALOG_WIDTH, DEFAULT_DIALOG_HEIGHT)
 
         # 只有一个挂在对话框上的布局：滚动区 + 底部按钮。
         # 注意别再造第二个 QVBoxLayout(self)——后建的那个会把先挂的布局顶掉，
@@ -378,8 +392,37 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         # 按钮固定在窗口底部，不跟着内容一起滚
         self.outer.addWidget(buttons)
+        self._restore_window_size(saved_size)
 
     # —— 小工具 ——
+
+    def _restore_window_size(self, saved_size: Sequence[int] | None) -> None:
+        width, height = DEFAULT_DIALOG_WIDTH, DEFAULT_DIALOG_HEIGHT
+        if saved_size is not None and len(saved_size) == 2:
+            try:
+                saved_width, saved_height = int(saved_size[0]), int(saved_size[1])
+            except (TypeError, ValueError):
+                pass
+            else:
+                if saved_width > 0 and saved_height > 0:
+                    width, height = saved_width, saved_height
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, max(MIN_DIALOG_WIDTH, available.width() - 40))
+            height = min(height, max(MIN_DIALOG_HEIGHT, available.height() - 40))
+        self.resize(max(MIN_DIALOG_WIDTH, width), max(MIN_DIALOG_HEIGHT, height))
+
+    def _emit_window_size(self) -> None:
+        self.window_size_saved.emit(self.width(), self.height())
+
+    def done(self, result: int) -> None:  # noqa: D102 - QDialog 约定
+        self._emit_window_size()
+        super().done(result)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
+        self._emit_window_size()
+        super().closeEvent(event)
 
     def _path_row(self, edit: QLineEdit, browse) -> QWidget:  # noqa: ANN001
         container = QWidget()

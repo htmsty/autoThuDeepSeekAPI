@@ -154,6 +154,91 @@ class UiSmokeTest(unittest.TestCase):
         window._quitting = True
         window.close()
 
+    def test_saved_auto_login_keeps_browser_hidden(self) -> None:
+        """保存了自动登录凭据后，手动同步也先在后台登录；需要验证时才显示窗口。"""
+
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        window = MainWindow(AppSettings(auto_login_enabled=True), AppState())
+        try:
+            with mock.patch.object(
+                main_window_module.credentials,
+                "load_login",
+                return_value=SimpleNamespace(username="tester", password="secret"),
+            ):
+                self.assertTrue(window._should_capture_silently(interactive=True))
+            with mock.patch.object(
+                main_window_module.credentials,
+                "load_login",
+                return_value=None,
+            ):
+                self.assertFalse(
+                    window._should_capture_silently(interactive=True),
+                    "没有保存凭据时必须显示登录窗口",
+                )
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_saved_auto_login_manual_sync_actually_starts_hidden(self) -> None:
+        """回归：判断为静默之后，打开捕获窗口时不能又按 interactive 强行显示。"""
+
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        window = MainWindow(AppSettings(auto_login_enabled=True), AppState())
+        opened: list[bool] = []
+        window._open_capture = lambda silent: opened.append(silent)  # type: ignore[assignment]
+        window._ask_about_ccswitch = lambda: True  # type: ignore[assignment]
+        try:
+            with mock.patch.object(
+                main_window_module.credentials,
+                "load_login",
+                return_value=SimpleNamespace(username="tester", password="secret"),
+            ):
+                window.start_sync(interactive=True)
+            self.assertEqual(opened, [True], "手动点击同步时也应先使用后台登录")
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_user_initiated_hidden_login_failure_opens_window(self) -> None:
+        """用户刚点过同步时，后台登录失败要显示登录窗口，不能只留托盘气泡。"""
+
+        window = MainWindow(AppSettings(), AppState())
+        opened: list[bool] = []
+        window._open_capture = lambda silent: opened.append(silent)  # type: ignore[assignment]
+        window.notify = lambda *args, **kwargs: None  # type: ignore[assignment]
+        try:
+            window._capture_silent = True
+            window._capture_user_initiated = True
+            window._login_offered_after_silent_failure = True
+            window._on_capture_failed("静默取 Token 超时：多半需要重新登录")
+            self.assertEqual(opened, [False], "用户每次手动触发失败都应重新显示登录窗口")
+        finally:
+            window._quitting = True
+            window.close()
+
+    def test_user_initiated_background_login_is_not_treated_as_auto_sync(self) -> None:
+        """用户点同步、后台自动登录成功时，后续写入失败不该走自动重试。"""
+
+        window = MainWindow(AppSettings(), AppState())
+        captured: list[bool] = []
+        window._start_sync_worker = lambda token, auto=None: captured.append(bool(auto))  # type: ignore[assignment]
+        try:
+            window._capture_silent = True
+            window._capture_user_initiated = True
+            window._on_token_captured(FAKE_OLD_TOKEN)
+            self.assertEqual(captured, [False])
+        finally:
+            window._quitting = True
+            window.close()
+
     def test_settings_dialog_has_shortcut_button_and_ccswitch_default(self) -> None:
         settings = AppSettings()
         dialog = SettingsDialog(settings)
@@ -163,6 +248,29 @@ class UiSmokeTest(unittest.TestCase):
         # 目标里要有"创建桌面快捷方式"功能
         self.assertTrue(hasattr(dialog, "shortcut_button"))
         dialog.close()
+
+    def test_settings_dialog_defaults_smaller_and_restores_saved_size(self) -> None:
+        default_dialog = SettingsDialog(AppSettings())
+        try:
+            self.assertLessEqual(default_dialog.width(), 700)
+            self.assertLessEqual(default_dialog.height(), 540)
+        finally:
+            default_dialog.close()
+
+        restored = SettingsDialog(AppSettings(), saved_size=[660, 500])
+        try:
+            self.assertEqual((restored.width(), restored.height()), (660, 500))
+        finally:
+            restored.close()
+
+    def test_main_window_restores_saved_size(self) -> None:
+        state = AppState(main_window_size=[660, 460])
+        window = MainWindow(AppSettings(), state)
+        try:
+            self.assertEqual((window.width(), window.height()), (660, 460))
+        finally:
+            window._quitting = True
+            window.close()
 
     def test_settings_has_apply_ok_cancel_and_login_controls(self) -> None:
         from PySide6.QtWidgets import QDialogButtonBox
@@ -454,9 +562,14 @@ class UiInteractionTest(unittest.TestCase):
         class FakeDialog:
             DialogCode = QDialog.DialogCode
 
-            def __init__(self, settings, parent=None) -> None:  # noqa: ANN001, ANN002
+            def __init__(self, settings, parent=None, **kwargs) -> None:  # noqa: ANN001, ANN002, ANN003
                 self.manual_token = FAKE_OLD_TOKEN
                 callbacks = []
+                self.window_size_saved = type(
+                    "FakeSignal",
+                    (),
+                    {"connect": lambda _self, callback: None},
+                )()
                 self.settings_applied = type(
                     "FakeSignal",
                     (),

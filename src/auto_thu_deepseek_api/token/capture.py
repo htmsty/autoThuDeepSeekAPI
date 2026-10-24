@@ -147,38 +147,81 @@ AUTO_LOGIN_SCRIPT = r"""
 (function (username, password) {
   var host = (location.hostname || '').toLowerCase();
   if (!(host === 'tsinghua.edu.cn' || host.endsWith('.tsinghua.edu.cn'))) {
-    return {action: 'ignore'};
+    return JSON.stringify({action: 'ignore'});
+  }
+  function isVisible(element) {
+    if (!element || !element.isConnected) { return false; }
+    var style = window.getComputedStyle(element);
+    if (!style ||
+        style.display === 'none' ||
+        style.visibility === 'hidden' ||
+        Number(style.opacity) === 0) {
+      return false;
+    }
+    if (element.offsetWidth <= 0 || element.offsetHeight <= 0) { return false; }
+    return element.getClientRects().length > 0;
   }
   var bodyText = document.body ? (document.body.innerText || '') : '';
+  var errorMarkers = [
+    '用户名或密码不正确', '账号或密码错误', '用户名或密码错误',
+    '密码不正确', '登录失败，请重试'
+  ];
+  if (errorMarkers.some(function (marker) { return bodyText.indexOf(marker) >= 0; })) {
+    return JSON.stringify({
+      action: 'manual',
+      reason: '自动登录未成功，请检查账号密码后手动登录'
+    });
+  }
   var manualMarkers = [
     '二次验证', '双因素', '动态口令', '动态验证码', '手机验证码',
     '身份验证器', 'MFA', '两步验证', '请完成验证'
   ];
-  var captcha = document.querySelector(
+  // 清华登录页始终在 DOM 里放着一个隐藏的图形验证码输入框。
+  // 只有真正显示出来时才暂停自动登录，不能见到隐藏节点就误判。
+  var captchaNodes = document.querySelectorAll(
     'input[name*="captcha" i], input[id*="captcha" i], img[src*="captcha" i], .captcha'
   );
-  var manual = captcha !== null || manualMarkers.some(function (marker) {
+  var captchaVisible = Array.prototype.some.call(captchaNodes, isVisible);
+  var manual = captchaVisible || manualMarkers.some(function (marker) {
     return bodyText.indexOf(marker) >= 0;
   });
   if (manual) {
-    return {action: 'manual', reason: '检测到验证码或二次验证，请手动完成'};
+    return JSON.stringify({
+      action: 'manual',
+      reason: '检测到验证码或二次验证，请手动完成'
+    });
   }
 
-  var passwordInput = document.querySelector('input[type="password"]');
-  if (!passwordInput || passwordInput.offsetParent === null) {
-    return {action: 'none'};
+  var passwordInputs = Array.prototype.slice.call(
+    document.querySelectorAll('input[type="password"]')
+  );
+  var passwordInput = passwordInputs.find(isVisible);
+  if (!passwordInput) {
+    if (/^\/do\/off\/ui\/auth\/login\//.test(location.pathname || '')) {
+      return JSON.stringify({
+        action: 'manual',
+        reason: '登录页面没有找到可用的密码输入框，请手动完成'
+      });
+    }
+    return JSON.stringify({action: 'none'});
   }
   var scope = passwordInput.form || document;
   var candidates = Array.prototype.slice.call(
-    scope.querySelectorAll('input[type="text"], input[type="email"], input:not([type])')
+    scope.querySelectorAll(
+      'input[type="text"], input[type="email"], input[type="tel"], input:not([type])'
+    )
   );
-  var usernameInput = candidates.find(function (item) {
+  var visibleCandidates = candidates.filter(isVisible);
+  var usernameInput = visibleCandidates.find(function (item) {
     var marker = ((item.name || '') + ' ' + (item.id || '') + ' ' +
       (item.autocomplete || '')).toLowerCase();
     return /user|account|mail|login|学号|账号/.test(marker);
-  }) || candidates.find(function (item) { return item.offsetParent !== null; });
+  }) || visibleCandidates[0];
   if (!usernameInput) {
-    return {action: 'none'};
+    return JSON.stringify({
+      action: 'manual',
+      reason: '登录页面没有找到可用的用户名输入框，请手动完成'
+    });
   }
 
   function setValue(input, value) {
@@ -196,20 +239,40 @@ AUTO_LOGIN_SCRIPT = r"""
   setValue(usernameInput, username);
   setValue(passwordInput, password);
 
-  var button = scope.querySelector('button[type="submit"], input[type="submit"]');
+  var controls = Array.prototype.slice.call(
+    scope.querySelectorAll(
+      'button, input[type="submit"], input[type="button"], a, [role="button"]'
+    )
+  ).filter(isVisible);
+  // 清华统一身份认证页的「登录」是 <a onclick="doLogin()">，不是 button。
+  var button = controls.find(function (item) {
+    var label = item.innerText || item.value || item.getAttribute('aria-label') || '';
+    return /登录|登陆|sign\s*in|log\s*in/i.test(label);
+  });
   if (!button) {
-    var buttons = Array.prototype.slice.call(scope.querySelectorAll('button'));
-    button = buttons.find(function (item) {
-      return /登录|登陆|sign\s*in|log\s*in/i.test(item.innerText || item.value || '');
+    return JSON.stringify({
+      action: 'manual',
+      reason: '账号密码已填写，但没有找到可点击的登录按钮，请手动点击'
     });
   }
-  if (!button) {
-    return {action: 'filled-no-submit'};
-  }
   setTimeout(function () { button.click(); }, 250);
-  return {action: 'submitted'};
+  return JSON.stringify({action: 'submitted'});
 })(__ATD_USERNAME__, __ATD_PASSWORD__)
 """
+
+
+def parse_auto_login_result(value: object) -> dict[str, object] | None:
+    """Parse either a Qt dict result or the JSON string used by the page script."""
+
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def build_profile(profile_dir: Path) -> QWebEngineProfile:
@@ -264,6 +327,7 @@ class TokenCaptureSession(QObject):
         self._auto_password = auto_password
         self._manual_prompted = False
         self._auto_submit_enabled = bool(auto_username and auto_password)
+        self._last_auto_action = ""
 
         self._page = QWebEnginePage(profile, self)
         self._window: QMainWindow | None = None
@@ -353,12 +417,19 @@ class TokenCaptureSession(QObject):
         self._page.runJavaScript(script, self._on_auto_login_result)
 
     def _on_auto_login_result(self, value: object) -> None:
-        if self._finished or not isinstance(value, dict):
+        if self._finished:
             return
-        action = value.get("action")
+        parsed = parse_auto_login_result(value)
+        if not isinstance(parsed, dict):
+            logger.warning("自动登录脚本返回了无法解析的数据")
+            return
+        action = parsed.get("action")
+        if action != self._last_auto_action:
+            self._last_auto_action = str(action or "")
+            logger.info("自动登录页面处理结果：%s", action)
         if action != "manual":
             return
-        reason = str(value.get("reason") or "需要人工完成登录验证")
+        reason = str(parsed.get("reason") or "需要人工完成登录验证")
         self._auto_submit_enabled = False
         self._ensure_window()
         self._silent = False

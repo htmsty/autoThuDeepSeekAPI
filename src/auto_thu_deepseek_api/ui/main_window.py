@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         self._auto_retry_timer.timeout.connect(lambda: self.start_sync(interactive=False))
         # 本次取 Token 是不是静默（自动）模式；本次同步是不是自动发起的
         self._capture_silent = False
+        self._capture_user_initiated = False
         self._sync_is_auto = False
         # 开机静默失败后只自动打开一次登录窗口，避免反复弹
         self._login_offered_after_silent_failure = False
@@ -115,6 +116,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._wire_signals()
+        self._restore_main_window_size()
 
         self._auto_timer = QTimer(self)
         self._auto_timer.setSingleShot(True)
@@ -277,9 +279,37 @@ class MainWindow(QMainWindow):
     # —— 界面动作 ——
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self)
+        dialog = SettingsDialog(
+            self.settings,
+            self,
+            saved_size=self.state.settings_dialog_size,
+        )
+        dialog.window_size_saved.connect(self._remember_settings_dialog_size)
         dialog.settings_applied.connect(lambda: self._consume_manual_dialog_token(dialog))
         dialog.exec()
+
+    def _restore_main_window_size(self) -> None:
+        size = self.state.main_window_size
+        if not isinstance(size, list) or len(size) != 2:
+            return
+        try:
+            width, height = int(size[0]), int(size[1])
+        except (TypeError, ValueError):
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, max(self.minimumWidth(), available.width() - 40))
+            height = min(height, max(self.minimumHeight(), available.height() - 40))
+        self.resize(max(self.minimumWidth(), width), max(self.minimumHeight(), height))
+
+    def _remember_main_window_size(self) -> None:
+        self.state.main_window_size = [self.width(), self.height()]
+
+    def _remember_settings_dialog_size(self, width: int, height: int) -> None:
+        self.state.settings_dialog_size = [int(width), int(height)]
+        if not self._skip_save_on_quit:
+            self._persist_state()
 
     def apply_settings_from_dialog(self, draft: AppSettings) -> bool:
         """Apply one settings draft immediately (used by Apply and OK)."""
@@ -684,6 +714,8 @@ class MainWindow(QMainWindow):
     # —— 关闭与退出 ——
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
+        if not self._skip_save_on_quit:
+            self._remember_main_window_size()
         if self._quitting:
             event.accept()
             return
@@ -694,6 +726,8 @@ class MainWindow(QMainWindow):
             return
         event.ignore()
         self.hide()
+        if not self._skip_save_on_quit:
+            self._persist_state()
         if not self._tray_hint_shown:
             self._tray_hint_shown = True
             self.tray.showMessage(
@@ -738,6 +772,7 @@ class MainWindow(QMainWindow):
                     orphans.append(preflight_worker)
         self._preflight_worker = None
         if not self._skip_save_on_quit:
+            self._remember_main_window_size()
             self._persist_settings()
             self._persist_state()
         self.tray.hide()
@@ -837,12 +872,14 @@ class MainWindow(QMainWindow):
             logger.info("等待对话框期间已经开始了同步，忽略这次请求")
             return
         # 第一次运行、还没有任何历史 Token 时，浏览器档案里也没有可复用的登录会话，
-        # 静默取只会白等超时。这种情况直接开浏览器窗口让用户登录；之后有了缓存就静默取。
-        if not self._should_capture_silently(interactive):
+        # 静默取只会白等超时。保存了自动登录凭据时，手动点击也先走后台登录。
+        silent = self._should_capture_silently(interactive)
+        self._capture_user_initiated = interactive
+        if not silent:
             logger.info("还没有缓存 Token，改开浏览器窗口完成首次登录")
             self._open_capture(silent=False)
             return
-        self._open_capture(silent=not interactive)
+        self._open_capture(silent=True)
 
     def _ask_force_retry(self) -> bool:
         """上一次还没结束时问用户：强行终止并按原样重试，还是取消。"""
@@ -880,12 +917,18 @@ class MainWindow(QMainWindow):
 
         第一次运行还没有任何历史 Token，浏览器档案里没有可复用的登录会话，
         静默只会白等超时，所以直接开窗口；之后有缓存就走静默。
+        用户保存了自动登录凭据时，手动点击同步也先在后台尝试登录；只有验证码、
+        二次验证或页面异常时才把登录窗口显示出来。
         """
 
+        if self.settings.auto_login_enabled:
+            try:
+                if credentials.load_login() is not None:
+                    return True
+            except OSError as exc:
+                logger.warning("读取自动登录凭据失败：%s", exc)
         if interactive:
             return False
-        if self.settings.auto_login_enabled:
-            return True
         return bool(self.state.last_token) or bool(self.current_token())
 
     def _busy(self) -> bool:
@@ -975,8 +1018,12 @@ class MainWindow(QMainWindow):
         self._capture.cancelled.connect(self._on_capture_cancelled)
         self._capture.manual_intervention_required.connect(self._on_manual_login_required)
         if silent:
-            logger.info("开始静默取 Token（自动同步）")
-            self._show_status_hint("正在静默获取 Token…")
+            if auto_username:
+                logger.info("开始后台取 Token（使用已保存的账号密码自动登录）")
+                self._show_status_hint("正在后台登录并获取 Token…")
+            else:
+                logger.info("开始静默取 Token（使用已保存的登录会话）")
+                self._show_status_hint("正在静默获取 Token…")
         else:
             self._show_status_hint("正在获取 Token：请在登录窗口完成登录…")
         try:
@@ -984,6 +1031,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 - 起不来的话不能把 _capture 留在那儿
             logger.exception("打开取 Token 流程失败")
             self._capture = None
+            self._capture_user_initiated = False
             self.notify(f"取 Token 失败：{exc}", warning=True)
 
     def _on_manual_login_required(self, reason: str) -> None:
@@ -992,6 +1040,8 @@ class MainWindow(QMainWindow):
 
     def _on_token_captured(self, token: str) -> None:
         self._capture = None
+        was_user_initiated = self._capture_user_initiated
+        self._capture_user_initiated = False
         try:
             self.state.remember_token(token)
         except OSError as exc:
@@ -1000,26 +1050,37 @@ class MainWindow(QMainWindow):
             self.notify(f"Token 保存失败（本次同步继续）：{exc}", warning=True)
         self.refresh_status()
         self._show_status_hint("已获取 Token，正在写入目标…")
-        self._start_sync_worker(token)
+        self._start_sync_worker(token, auto=not was_user_initiated)
 
     def _on_capture_failed(self, message: str) -> None:
         self._capture = None
         self._restore_status_hint()
         was_silent = self._capture_silent
+        was_user_initiated = self._capture_user_initiated
         self._capture_silent = False
+        self._capture_user_initiated = False
         logger.warning(message)
         fallback = self.state.last_token
         if fallback and not is_expired(fallback):
             logger.info("取新 Token 失败，沿用现有仍有效的 Token 继续同步")
-            self._start_sync_worker(fallback, auto=was_silent)
+            self._start_sync_worker(fallback, auto=not was_user_initiated)
             return
         self.refresh_status()
-        if was_silent and self._started_minimized and not self._login_offered_after_silent_failure:
-            # 开机启动时静默取 Token 失败（多半是登录会话过期）：
-            # 直接把登录窗口打开，用户回来就能登录，而不是只留一条托盘气泡。
+        should_open_login = (
+            was_silent
+            and (self._started_minimized or was_user_initiated)
+            and not self._login_offered_after_silent_failure
+        )
+        if was_silent and was_user_initiated:
+            # 用户刚点过同步：每次都应把失败的登录页显示出来。
+            should_open_login = True
+        if should_open_login:
+            # 后台登录失败时，开机启动或用户刚点过同步都直接把登录窗口打开；
+            # 用户手动点击后不能只留一条托盘气泡，否则看起来像“完全没反应”。
             self._login_offered_after_silent_failure = True
-            logger.info("开机静默取 Token 失败：打开登录窗口等用户登录")
+            logger.info("后台取 Token 失败：打开登录窗口等用户登录")
             self.notify("自动更新需要重新登录，已打开登录窗口", warning=True)
+            self._capture_user_initiated = was_user_initiated
             self._open_capture(silent=False)
             return
         self.notify(message + "：请点「立即获取并同步」并完成登录。", warning=True)
@@ -1028,6 +1089,7 @@ class MainWindow(QMainWindow):
 
     def _on_capture_cancelled(self) -> None:
         self._capture = None
+        self._capture_user_initiated = False
         self._restore_status_hint()
         logger.info("已取消取 Token")
 

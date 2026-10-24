@@ -13,6 +13,23 @@ from . import crypto, paths
 logger = logging.getLogger(__name__)
 
 
+def _clean_window_size(value: object) -> list[int]:
+    """Return a safe two-value window size, or an empty list for bad input."""
+
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return []
+    try:
+        width = int(value[0])
+        height = int(value[1])
+    except (TypeError, ValueError):
+        return []
+    if isinstance(value[0], bool) or isinstance(value[1], bool):
+        return []
+    if not (320 <= width <= 10000 and 240 <= height <= 10000):
+        return []
+    return [width, height]
+
+
 @dataclass
 class AppState:
     # 只在内存中保存明文。写盘时一定会转成 DPAPI 密文。
@@ -23,6 +40,9 @@ class AppState:
     # 启动提醒的"已处理"状态（按用户要求写在 private 里，处理过就不再提醒）
     desktop_note_ack: bool = False  # 程序在桌面根目录的提醒
     targets_note_ack: bool = False  # DSH / CC Switch 都没检出的提醒
+    # 窗口尺寸放在运行状态里：随 private 一起迁移、一起清理，不污染系统注册表。
+    main_window_size: list[int] = field(default_factory=list)
+    settings_dialog_size: list[int] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> "AppState":
@@ -39,6 +59,8 @@ class AppState:
             return cls()
         known = {field for field in cls.__dataclass_fields__}
         state = cls(**{k: v for k, v in raw.items() if k in known})
+        state.main_window_size = _clean_window_size(state.main_window_size)
+        state.settings_dialog_size = _clean_window_size(state.settings_dialog_size)
         encrypted = raw.get("last_token_encrypted")
         if isinstance(encrypted, str) and encrypted:
             try:
@@ -69,6 +91,8 @@ class AppState:
             "last_status": self.last_status,
             "desktop_note_ack": self.desktop_note_ack,
             "targets_note_ack": self.targets_note_ack,
+            "main_window_size": _clean_window_size(self.main_window_size),
+            "settings_dialog_size": _clean_window_size(self.settings_dialog_size),
             "last_token_encrypted": "",
         }
         if self.last_token:

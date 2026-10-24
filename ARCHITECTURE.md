@@ -101,7 +101,11 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
   收集 `localStorage` / `sessionStorage`、Cookie、`fetch` / `XHR` 响应和页面文本中的多个
   JWT 候选；`choose_jwt()` 按来源、域名、字段名、有效期评分，证据接近时宁可等待也不乱选。
   默认不模拟登录。用户显式启用自动登录后，仅在清华域名下填充/提交，检测到验证码、二次验证、
-  MFA 时打开窗口并发出人工接管信号。拿到 Token 后窗口自动关闭；静默续期时不显示窗口。
+  MFA、账号错误或页面异常时打开窗口并发出人工接管信号。验证码必须实际可见才算人工验证
+  （清华页面始终存在一个隐藏验证码输入框）；登录控件覆盖 button/input/a/role=button
+  （清华页面的登录按钮实际是 `<a onclick="doLogin()">`）。脚本结果用 JSON 字符串回传，
+  由 Python 侧解析，避免 Qt 对象回调偶尔为空。保存凭据时，手动同步也先尝试后台登录；
+  只有需要人工接手才显示窗口。拿到 Token 后窗口自动关闭。
 - `verifier.py`：先用站点的会话接口 `GET /model-api/auth-login`（带 `Authorization: Bearer`）
   判断 Token —— 快、不消耗模型额度；401/403 或 `success:false` 判无效，200+`success:true` 判有效。
   只有它给不出结论且设置里允许时才兜底发一次最小对话请求；默认不消耗模型额度。
@@ -239,6 +243,7 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
 ### `ui/`
 - `main_window.py`：精简状态区 + 立即同步/设置/退出 + 下次同步时间 + 托盘。
   日志、预检、备份、还原、数据目录、快捷方式和关于全部移入设置。托盘固定五项。
+  主窗口与设置窗口尺寸写入 `private/state.json`，恢复时按当前屏幕可用区域限制。
   启动流程（2.5 起）：`startup_then_sync()` → 先 `_check_desktop_private()`（程序在桌面根目录
   时提醒一次，三个选择），再 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
   都通过才跑"启动时立即同步"。两条提醒的"已处理"状态写在 private 的 `state.json` 里。
@@ -250,6 +255,7 @@ Manager 保存可选的自动登录账号密码，密码不进入 settings/state
   应用调用父窗口立即保存，取消不会把控件值写回。**只有一个挂在对话框上的布局**（滚动区 + 底部按钮）。
   千万不要再造第二个 `QVBoxLayout(self)`：后建的会把先挂的布局顶掉，对话框会变成空窗口
   （2.4 踩过一次，`test_settings_dialog_is_actually_openable` 是这条的回归用例）。
+  设置窗口默认 `700×540`、最小 `640×480`，尺寸同样会被记住。
   2.5 起多了「运行数据与维护」一块：private 位置（+ 更改位置）、恢复默认设置、干净卸载。
 - `workers.py`：把同步放到 `QThread`，避免界面卡死。
   `request_cancel()` 只是给同步流程一个"请停下"的信号（协作式取消，见 `sync.py`）。

@@ -81,6 +81,9 @@ class MainWindow(QMainWindow):
         self._preflight_result_parent_ref: weakref.ReferenceType[QWidget] | None = None
         self._capture: TokenCaptureSession | None = None
         self._browser_profile = None
+        self._browser_release_timer = QTimer(self)
+        self._browser_release_timer.setSingleShot(True)
+        self._browser_release_timer.timeout.connect(self._release_browser_profile)
         self._tray_hint_shown = False
         # 「强行终止并重试」：等当前同步线程安全停下后再补一次同步
         self._retry_after_stop = False
@@ -382,6 +385,7 @@ class MainWindow(QMainWindow):
                 return False
 
         previous_level = self.settings.log_level
+        previous_keep_days = self.settings.log_keep_days
         for field in fields(AppSettings):
             setattr(self.settings, field.name, getattr(draft, field.name))
         self.settings.launch_at_startup = startup.is_enabled()
@@ -391,10 +395,20 @@ class MainWindow(QMainWindow):
             if startup_changed:
                 startup.set_enabled(old_startup)
             return False
-        if self.settings.log_level != previous_level:
-            # 改日志级别立刻生效，不用等下次启动
-            setup_logging(logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO)
-            logger.info("日志级别已切换为 %s", self.settings.log_level)
+        if (
+            self.settings.log_level != previous_level
+            or self.settings.log_keep_days != previous_keep_days
+        ):
+            # 日志级别与保留天数都立刻生效，不用等下次启动。
+            setup_logging(
+                logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO,
+                keep_days=self.settings.log_keep_days,
+            )
+            logger.info(
+                "日志配置已切换：级别 %s，保留 %d 天",
+                self.settings.log_level,
+                self.settings.log_keep_days,
+            )
         logger.info("设置已保存")
         self.apply_settings_to_ui()
         self._apply_auto_timer()
@@ -533,9 +547,10 @@ class MainWindow(QMainWindow):
 
     # —— 搬迁/卸载前的准备与收尾 ——
 
-    def _release_browser_profile(self) -> None:
+    def _release_browser_profile(self, *, wait: bool = True) -> None:
         """放掉内置浏览器档案：不然 browser-profile 里的 Cookies 被占着，搬不动也删不掉。"""
 
+        self._browser_release_timer.stop()
         if self._capture is not None:
             self._capture.cancel()
             self._capture = None
@@ -547,15 +562,19 @@ class MainWindow(QMainWindow):
             profile.deleteLater()
         except (RuntimeError, AttributeError):  # pragma: no cover - 已经没了就算了
             pass
-        # 让 Qt 真正处理 deleteLater（普通 processEvents 不会处理 DeferredDelete），
-        # 再给 Chromium 一点时间把手里的文件关掉。剩下的（极少数仍被占的）会在
-        # 下次启动时由 paths.finish_pending_migration() 补删干净。
-        for _ in range(12):
-            # 普通 processEvents 不处理 DeferredDelete，这里显式投递一次
-            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-            QApplication.processEvents()
-            time.sleep(0.05)
+        if wait:
+            # 搬家 / 卸载前需要确认文件真的解锁。普通 processEvents 不处理
+            # DeferredDelete，这里显式投递并给 Chromium 一点收尾时间。
+            for _ in range(12):
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                QApplication.processEvents()
+                time.sleep(0.05)
         logger.info("已释放内置浏览器档案（browser-profile 解锁）")
+
+    def _schedule_browser_release(self) -> None:
+        """同步结束后稍等片刻再释放 Chromium，避免常驻内存。"""
+
+        self._browser_release_timer.start(500)
 
     def _prepare_for_data_move(self) -> None:
         """搬 private 之前：停取 Token、放掉浏览器、关掉日志文件句柄。"""
@@ -570,7 +589,10 @@ class MainWindow(QMainWindow):
     def _after_data_move(self) -> None:
         """搬完之后：在新位置重开日志，再补一次旧位置清理。"""
 
-        setup_logging(logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO)
+        setup_logging(
+            logging.DEBUG if self.settings.log_level == "DEBUG" else logging.INFO,
+            keep_days=self.settings.log_keep_days,
+        )
         old = self._moving_from
         self._moving_from = None
         if old is None or old == paths.data_root() or not old.is_dir():
@@ -867,6 +889,8 @@ class MainWindow(QMainWindow):
                         application._atd_orphan_threads = orphans  # type: ignore[attr-defined]
                     orphans.append(preflight_worker)
         self._preflight_worker = None
+        self._browser_release_timer.stop()
+        self._release_browser_profile()
         if not self._skip_save_on_quit:
             self._remember_main_window_size()
             self._persist_settings()
@@ -1082,6 +1106,7 @@ class MainWindow(QMainWindow):
 
     def _open_capture(self, silent: bool) -> None:
         self._capture_silent = silent
+        self._browser_release_timer.stop()
         if self._browser_profile is None:
             self._browser_profile = build_profile(paths.browser_profile_dir())
 
@@ -1126,8 +1151,12 @@ class MainWindow(QMainWindow):
             self._capture.start()
         except Exception as exc:  # noqa: BLE001 - 起不来的话不能把 _capture 留在那儿
             logger.exception("打开取 Token 流程失败")
+            failed_capture = self._capture
             self._capture = None
+            if failed_capture is not None:
+                failed_capture.cancel()
             self._capture_user_initiated = False
+            self._schedule_browser_release()
             self.notify(f"取 Token 失败：{exc}", warning=True)
 
     def _on_manual_login_required(self, reason: str) -> None:
@@ -1136,6 +1165,7 @@ class MainWindow(QMainWindow):
 
     def _on_token_captured(self, token: str) -> None:
         self._capture = None
+        self._schedule_browser_release()
         was_user_initiated = self._capture_user_initiated
         self._capture_user_initiated = False
         try:
@@ -1159,6 +1189,7 @@ class MainWindow(QMainWindow):
         fallback = self.state.last_token
         if fallback and not is_expired(fallback):
             logger.info("取新 Token 失败，沿用现有仍有效的 Token 继续同步")
+            self._schedule_browser_release()
             self._start_sync_worker(fallback, auto=not was_user_initiated)
             return
         self.refresh_status()
@@ -1179,12 +1210,14 @@ class MainWindow(QMainWindow):
             self._capture_user_initiated = was_user_initiated
             self._open_capture(silent=False)
             return
+        self._schedule_browser_release()
         self.notify(message + "：请点「立即获取并同步」并完成登录。", warning=True)
         if was_silent:
             self._schedule_auto_retry("取 Token 失败")
 
     def _on_capture_cancelled(self) -> None:
         self._capture = None
+        self._schedule_browser_release()
         self._capture_user_initiated = False
         self._restore_status_hint()
         logger.info("已取消取 Token")

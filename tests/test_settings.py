@@ -39,6 +39,7 @@ class SettingsTest(unittest.TestCase):
         self.assertFalse(settings.auto_login_enabled)
         self.assertFalse(settings.chat_verification_enabled)
         self.assertEqual(settings.log_display_mode, LOG_DISPLAY_FULL)
+        self.assertEqual(settings.log_keep_days, 7)
         self.assertTrue(settings.enable_ccswitch_card)
         self.assertFalse(settings.enable_ccswitch_activate)
 
@@ -55,8 +56,14 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(AppSettings.load().log_display_mode, LOG_DISPLAY_FULL)
 
         settings.log_display_mode = LOG_DISPLAY_OFF
+        settings.log_keep_days = 0
         settings.normalize()
         self.assertEqual(settings.log_display_mode, LOG_DISPLAY_OFF)
+        self.assertEqual(settings.log_keep_days, 1)
+
+        settings.log_keep_days = 999
+        settings.normalize()
+        self.assertEqual(settings.log_keep_days, 90)
 
     def test_v1_settings_are_migrated_once(self) -> None:
         settings_path = self.root / "settings.json"
@@ -72,6 +79,7 @@ class SettingsTest(unittest.TestCase):
         saved = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["settings_version"], SETTINGS_VERSION)
         self.assertNotIn("unify_all_profiles", saved)
+        self.assertEqual(saved["log_keep_days"], 7)
 
     def test_defaults_match_goal(self) -> None:
         """默认开启自动同步、60 分钟，并将高风险 CC Switch 路由激活关闭。"""

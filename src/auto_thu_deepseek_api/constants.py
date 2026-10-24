@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "autoThuDeepSeekAPI"
 APP_DISPLAY_NAME = "Auto THU DeepSeek API"
 APP_AUTHOR = "htmsty"
-APP_VERSION = "2.7.3"
+APP_VERSION = "2.8.0"
 REPO_URL = "https://github.com/htmsty/autoThuDeepSeekAPI"
 
 # —— 清华 MadModel ——
@@ -83,6 +83,15 @@ CONTEXT_WINDOW = 1000000
 
 # 站点前端包有几 MB，读一次缓存 6 小时。
 MODEL_CACHE_TTL_SECONDS = 6 * 3600
+
+# —— 资源占用 ——
+# 内置浏览器只用于登录，HTTP 磁盘缓存不需要跟着站点长期膨胀。
+BROWSER_HTTP_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+# 日志按大小轮转，再按天清理旧文件，避免长期挂机无限占盘。
+DEFAULT_LOG_KEEP_DAYS = 7
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 # 注册表开机启动项名。
 STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"

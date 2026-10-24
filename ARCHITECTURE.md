@@ -89,6 +89,7 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
 | v3 | 默认开启自动同步；v5 把旧默认 180 分钟迁移为 60 分钟 |
 | v4 | CC Switch 运行中策略合并 |
 | v5 | 默认 60±10 分钟、DSH/CC Switch 写入拆成独立开关、路由激活默认关 |
+| v6 | 新增日志保留天数，默认 7 天；旧配置缺少该字段时补默认值 |
 
 迁移只发生一次：之后用户手动取消勾选、自己填的间隔都不会被默认值打回。
 
@@ -105,7 +106,10 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
   （清华页面始终存在一个隐藏验证码输入框）；登录控件覆盖 button/input/a/role=button
   （清华页面的登录按钮实际是 `<a onclick="doLogin()">`）。脚本结果用 JSON 字符串回传，
   由 Python 侧解析，避免 Qt 对象回调偶尔为空。保存凭据时，手动同步也先尝试后台登录；
-  只有需要人工接手才显示窗口。拿到 Token 后窗口自动关闭。
+  只有需要人工接手才显示窗口。拿到 Token 后窗口自动关闭。浏览器 HTTP 缓存上限为
+  32 MiB；每次会话结束会删除已完成的 `QWebEnginePage` 并延迟释放 profile，避免长期
+  自动同步累积 Chromium 对象。Cookie / localStorage 仍持久化在 `browser-profile/`，
+  下一次同步重新创建 profile 时继续使用。
 - `verifier.py`：先用站点的会话接口 `GET /model-api/auth-login`（带 `Authorization: Bearer`）
   判断 Token —— 快、不消耗模型额度；401/403 或 `success:false` 判无效，200+`success:true` 判有效。
   只有它给不出结论且设置里允许时才兜底发一次最小对话请求；默认不消耗模型额度。
@@ -200,7 +204,9 @@ Windows DPAPI 加密；旧明文备份会在索引读取时原地迁移。SQLite
 装了但还没生成配置文件时，进程名是一条有用的线索。
 
 ### `logging_setup.py`
-日志放 `private/logs/`，按大小轮转（2 MB × 5）。有一个坑要记住：
+日志放 `private/logs/`，每个文件按 2 MiB × 3 轮转，并按日志文件名里的日期清理超过
+“日志保留天数”（默认 7 天、可设 1–90 天）的旧文件；清理走回收站，用户放进目录里的
+非 `app-YYYYMMDD.log*` 文件不动。有一个坑要记住：
 **重新配置日志时必须真的 `close()` 掉旧的文件 handler** —— 只从 logger 上
 `removeHandler()` 并不会释放文件句柄，Windows 上那个日志文件就删不掉、也搬不走
 （2.5.3 修的 WinError 32 就是这个）。模块里另外记了一份"开过的文件 handler"清单，
@@ -219,10 +225,12 @@ PowerShell + `WScript.Shell` 生成 `.lnk`，路径通过环境变量传入以�
 
 ### `http_tls.py`
 所有 Python HTTPS 请求共用的证书上下文。正常路径调用 `ssl.create_default_context()`；
+创建成功后用进程内缓存复用，避免每次请求都重新读取证书库、增加启动延迟和内存峰值。
 精简 Python / PyInstaller 缺少 `ssl.py` 预期 CA 文件时，绕过损坏的自定义构造器，
 创建完整的 `ssl.SSLContext` 子类，并从 Windows `CA` / `ROOT` 证书库加载服务器认证根证书。
 回退路径仍保持 `CERT_REQUIRED` 和主机名校验，绝不以关闭证书验证来“修网络”。
 `build/atd.spec` 同时把 `assets/codex-rejected-cas.pem` 放到 `_MEIPASS` 根目录，正常路径优先。
+此外打包会排除 WebEngine 的 DevTools 与 debug 资源；这些文件只供开发调试，不影响登录页面。
 
 ### `state_store.py`
 `state.json`（在 private 里）：最近 Token 的 DPAPI 密文、时间戳、上次同步摘要、两条启动提醒的

@@ -15,17 +15,24 @@ from auto_thu_deepseek_api.token import site_models, verifier  # noqa: E402
 
 
 class TlsContextTest(unittest.TestCase):
-    def tearDown(self) -> None:
+    def setUp(self) -> None:
+        http_tls.create_verified_context.cache_clear()
         http_tls._windows_certificate_context.cache_clear()
 
+    def tearDown(self) -> None:
+        http_tls._windows_certificate_context.cache_clear()
+        http_tls.create_verified_context.cache_clear()
+
     def test_default_context_is_preferred(self) -> None:
-        sentinel = object()
+        sentinel = mock.MagicMock(spec=ssl.SSLContext)
         with mock.patch.object(
             http_tls.ssl,
             "create_default_context",
             return_value=sentinel,
-        ):
+        ) as factory:
             self.assertIs(http_tls.create_verified_context(), sentinel)
+            self.assertIs(http_tls.create_verified_context(), sentinel)
+            factory.assert_called_once_with()
 
     def test_raw_context_factory_still_returns_full_ssl_context(self) -> None:
         context = http_tls._new_ssl_context()

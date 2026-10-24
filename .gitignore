@@ -11,6 +11,7 @@ venv/
 # 打包产物与中间文件
 dist/
 build/_work/
+build/_selftest*/
 *.spec.bak
 
 # 留档的发行版单文件程序（体积太大，不进 Git；只有 releases/README.md 进仓库）

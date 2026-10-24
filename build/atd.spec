@@ -64,10 +64,19 @@ EXCLUDED_QT_PREFIXES = (
     "qt6virtualkeyboard",
     "qt6websockets",
     "qt6networkauth",
+    "qt6quicktest",
+    "qttest",
 )
 
-# DevTools 的调试资源有 70 多 MB，运行时用不到。
-EXCLUDED_DATA_SUFFIXES = ("qtwebengine_devtools_resources.debug.pak",)
+# DevTools 与 debug 资源用不到；打包后它们约 16 MB。
+EXCLUDED_DATA_SUFFIXES = (
+    "qtwebengine_devtools_resources.pak",
+    "qtwebengine_devtools_resources.debug.pak",
+    "qtwebengine_resources.debug.pak",
+    "qtwebengine_resources_100p.debug.pak",
+    "qtwebengine_resources_200p.debug.pak",
+    "v8_context_snapshot.debug.bin",
+)
 LOCALIZATION_FILES = {
     "qt_zh_cn.qm",
     "qtbase_zh_cn.qm",

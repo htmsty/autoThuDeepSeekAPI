@@ -137,6 +137,7 @@ class UiSmokeTest(unittest.TestCase):
         dialog.close_to_tray_check.setChecked(False)
         dialog.silent_timeout_spin.setValue(75)
         dialog.log_level_combo.setCurrentText("DEBUG")
+        dialog.log_keep_spin.setValue(14)
         dialog.log_display_combo.setCurrentIndex(
             dialog.log_display_combo.findData(LOG_DISPLAY_SUMMARY)
         )
@@ -158,6 +159,7 @@ class UiSmokeTest(unittest.TestCase):
         self.assertFalse(settings.close_to_tray)
         self.assertEqual(settings.silent_capture_timeout_seconds, 75)
         self.assertEqual(settings.log_level, "DEBUG")
+        self.assertEqual(settings.log_keep_days, 14)
         self.assertEqual(settings.log_display_mode, LOG_DISPLAY_SUMMARY)
         self.assertEqual(settings.default_model_id, "qwen3.8-27b")
         dialog.close()
@@ -722,6 +724,7 @@ class UiInteractionTest(unittest.TestCase):
             )
             self.assertTrue(dialog.policy_prompt.isChecked(), "运行策略要回到默认的「先提示」")
             self.assertEqual(dialog.keep_spin.value(), AppSettings().backup_keep)
+            self.assertEqual(dialog.log_keep_spin.value(), AppSettings().log_keep_days)
             self.assertEqual(
                 dialog.log_display_combo.currentData(),
                 LOG_DISPLAY_FULL,

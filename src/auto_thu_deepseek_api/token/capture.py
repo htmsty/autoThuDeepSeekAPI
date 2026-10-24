@@ -282,6 +282,8 @@ def build_profile(profile_dir: Path) -> QWebEngineProfile:
     profile = QWebEngineProfile(constants.APP_NAME)
     profile.setPersistentStoragePath(str(profile_dir))
     profile.setCachePath(str(profile_dir / "cache"))
+    profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+    profile.setHttpCacheMaximumSize(constants.BROWSER_HTTP_CACHE_MAX_BYTES)
     profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
 
     script = QWebEngineScript()
@@ -329,7 +331,7 @@ class TokenCaptureSession(QObject):
         self._auto_submit_enabled = bool(auto_username and auto_password)
         self._last_auto_action = ""
 
-        self._page = QWebEnginePage(profile, self)
+        self._page: QWebEnginePage | None = QWebEnginePage(profile, self)
         self._window: QMainWindow | None = None
         self._view: QWebEngineView | None = None
         if not silent:
@@ -346,7 +348,7 @@ class TokenCaptureSession(QObject):
         self._deadline.timeout.connect(self._on_timeout)
 
         profile.cookieStore().cookieAdded.connect(self._on_cookie_added)
-        if self._auto_username and self._auto_password:
+        if self._auto_username and self._auto_password and self._page is not None:
             self._page.loadFinished.connect(self._on_load_finished)
 
     # —— 界面 ——
@@ -366,7 +368,8 @@ class TokenCaptureSession(QObject):
         layout.addWidget(hint)
 
         view = QWebEngineView()
-        view.setPage(self._page)
+        if self._page is not None:
+            view.setPage(self._page)
         layout.addWidget(view, 1)
         window.setCentralWidget(central)
         return window, view
@@ -392,7 +395,8 @@ class TokenCaptureSession(QObject):
             self._window.show()
             self._window.raise_()
             self._window.activateWindow()
-        self._page.load(QUrl(self._url))
+        if self._page is not None:
+            self._page.load(QUrl(self._url))
         logger.info("已打开登录窗口（%s 模式）：%s", "静默" if self._silent else "交互", self._url)
 
     def _ensure_window(self) -> QMainWindow:
@@ -407,7 +411,7 @@ class TokenCaptureSession(QObject):
         return self._window
 
     def _on_load_finished(self, ok: bool) -> None:
-        if self._finished or not ok or not self._auto_submit_enabled:
+        if self._finished or not ok or not self._auto_submit_enabled or self._page is None:
             return
         if not self._page.url().host().lower().endswith("tsinghua.edu.cn"):
             return
@@ -442,16 +446,29 @@ class TokenCaptureSession(QObject):
     def finish(self) -> None:
         self._finished = True
         self._auto_password = ""
+        self._auto_username = ""
         self._timer.stop()
         self._deadline.stop()
         try:
             self._profile.cookieStore().cookieAdded.disconnect(self._on_cookie_added)
         except (RuntimeError, TypeError):
             pass
+        self._cookie_values.clear()
         if self._window is not None:
             self._window.close()
             self._window.deleteLater()
             self._window = None
+            self._view = None
+        page = self._page
+        self._page = None
+        if page is not None:
+            try:
+                page.deleteLater()
+            except (RuntimeError, AttributeError):
+                pass
+        # 会话对象本身也挂在主窗口下；不显式释放的话，每次同步都会留下
+        # 一个已结束的 QWebEnginePage，长期挂机时内存只增不减。
+        self.deleteLater()
 
     # —— 捕获 ——
 
@@ -470,7 +487,7 @@ class TokenCaptureSession(QObject):
             self._cookie_values.append(value.strip())
 
     def _poll(self) -> None:
-        if self._finished:
+        if self._finished or self._page is None:
             return
         self._poll_count += 1
         self._page.runJavaScript(
@@ -498,7 +515,7 @@ class TokenCaptureSession(QObject):
                             url=str(item.get("url") or ""),
                         )
                     )
-        page_url = self._page.url().toString()
+        page_url = self._page.url().toString() if self._page is not None else ""
         candidates.extend(
             JwtCandidate(token=token, source="cookie", key="cookie", url=page_url)
             for token in self._cookie_values

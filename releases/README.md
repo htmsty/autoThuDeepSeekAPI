@@ -2,7 +2,7 @@
 
 这里存放每个大版本**打包好的单文件程序**（`autoThuDeepSeekAPI-<版本>.exe`）。
 
-**为什么不进 Git**：单文件版约 180 MB，超过普通 Git 文件 100 MB 的限制，
+**为什么不进 Git**：单文件版约 165 MB，超过普通 Git 文件 100 MB 的限制，
 所以这些 exe 只在本机留档，仓库里只记录校验和。GitHub **Release 资产**的限额更高，
 发布时可以把 EXE 直接作为 release asset 上传。
 

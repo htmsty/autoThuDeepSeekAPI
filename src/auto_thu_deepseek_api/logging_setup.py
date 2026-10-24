@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from . import paths
+from . import constants, paths
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_FILE_RE = re.compile(r"^app-(\d{8})(?:-\d+)?\.log(?:\.\d+)?$")
 
 
 class LogBus(QObject):
@@ -42,7 +44,10 @@ def _open_file_handler(log_file: Path, formatter: logging.Formatter) -> logging.
 
     try:
         handler = RotatingFileHandler(
-            log_file, maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            log_file,
+            maxBytes=constants.LOG_MAX_BYTES,
+            backupCount=constants.LOG_BACKUP_COUNT,
+            encoding="utf-8",
         )
     except OSError:
         return None
@@ -50,7 +55,61 @@ def _open_file_handler(log_file: Path, formatter: logging.Formatter) -> logging.
     return handler
 
 
-def setup_logging(level: int = logging.INFO) -> Path:
+def prune_old_logs(
+    log_dir: Path,
+    keep_days: int = constants.DEFAULT_LOG_KEEP_DAYS,
+    *,
+    active_path: Path | None = None,
+) -> int:
+    """删除超过保留天数的程序日志；只认 `app-YYYYMMDD.log*` 命名。
+
+    用户放进日志目录的其它文件一律不动。删除走统一回收站入口，
+    回收站不可用时保留原文件并记录警告。
+    """
+
+    try:
+        keep = max(1, min(int(keep_days), 90))
+    except (TypeError, ValueError):
+        keep = constants.DEFAULT_LOG_KEEP_DAYS
+    cutoff = date.today() - timedelta(days=keep - 1)
+    try:
+        candidates = list(log_dir.iterdir())
+    except OSError:
+        return 0
+
+    active_key = str(active_path.resolve()).lower() if active_path is not None else ""
+    removed = 0
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            if active_key and str(path.resolve()).lower() == active_key:
+                continue
+        except OSError:
+            continue
+        match = LOG_FILE_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        try:
+            file_date = datetime.strptime(match.group(1), "%Y%m%d").date()
+        except ValueError:
+            continue
+        if file_date >= cutoff:
+            continue
+        ok, detail = paths.delete_path(path)
+        if ok:
+            removed += 1
+            logging.getLogger(__name__).info("已清理过期日志 %s（%s）", path.name, detail)
+        else:
+            logging.getLogger(__name__).warning("清理过期日志失败：%s", detail)
+    return removed
+
+
+def setup_logging(
+    level: int = logging.INFO,
+    *,
+    keep_days: int = constants.DEFAULT_LOG_KEEP_DAYS,
+) -> Path:
     """配置根日志。返回本次日志文件路径。"""
 
     log_dir = paths.logs_dir()
@@ -86,6 +145,9 @@ def setup_logging(level: int = logging.INFO) -> Path:
     if file_handler is not None:
         root.addHandler(file_handler)
         _CREATED_FILE_HANDLERS.append(file_handler)
+    removed = prune_old_logs(log_dir, keep_days, active_path=log_file)
+    if removed:
+        logging.getLogger(__name__).info("本次启动已清理 %d 个过期日志文件", removed)
 
     ui_handler = QtLogHandler()
     ui_handler.setFormatter(formatter)

@@ -106,7 +106,9 @@ def main(argv: list[str] | None = None) -> int:
         paths.finish_pending_migration()
     except Exception as exc:  # noqa: BLE001
         logger.warning("补清理旧 private 位置失败：%s", exc)
-    setup_logging()
+    # 设置文件还没读取，先按最大保留期启动，避免把用户配置的 90 天日志误清掉；
+    # 读取 settings 后会立即按实际天数重新配置并清理一次。
+    setup_logging(keep_days=90)
 
     if not instance.acquire_with_retry(_lock_wait_seconds(argv)):
         error_name = instance.last_error()
@@ -130,8 +132,11 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = AppSettings.load()
     state = AppState.load()
+    setup_logging(
+        logging.DEBUG if settings.log_level == "DEBUG" else logging.INFO,
+        keep_days=settings.log_keep_days,
+    )
     if settings.log_level == "DEBUG":
-        setup_logging(level=logging.DEBUG)
         logger.info("日志级别已切到 DEBUG")
 
     if not QSystemTrayIcon.isSystemTrayAvailable():

@@ -7,7 +7,7 @@ import logging
 from dataclasses import asdict, dataclass
 
 from . import paths
-from .constants import DEFAULT_SYNC_INTERVAL_MINUTES
+from .constants import DEFAULT_LOG_KEEP_DAYS, DEFAULT_SYNC_INTERVAL_MINUTES
 
 CCSWITCH_POLICY_PROMPT = "prompt"
 CCSWITCH_POLICY_DIRECT = "direct"
@@ -23,7 +23,8 @@ LOG_DISPLAY_OFF = "off"
 #       等价于"不提示、直接改"，两个控件会互相矛盾，已去掉）。
 #   v5：默认 60 分钟并随机浮动；移除"统一所有 profile"；DSH / CC Switch
 #       拆成凭据、Provider、卡片、路由四个独立写入开关。
-SETTINGS_VERSION = 5
+#   v6：新增日志保留天数，默认 7 天。
+SETTINGS_VERSION = 6
 
 # 「恢复默认设置」时**不**动的字段：它们不是"设置项"，而是运行状态或系统状态。
 RESET_KEEP_FIELDS = (
@@ -62,6 +63,7 @@ class AppSettings:
     close_to_tray: bool = True
     log_level: str = "INFO"
     log_display_mode: str = LOG_DISPLAY_FULL
+    log_keep_days: int = DEFAULT_LOG_KEEP_DAYS
 
     # 目标开关（检测到哪个写哪个；可分别关闭）
     enable_dsh: bool = True
@@ -149,6 +151,20 @@ class AppSettings:
                 SETTINGS_VERSION,
                 DEFAULT_SYNC_INTERVAL_MINUTES,
             )
+        if version < 6:
+            # v5 → v6：旧配置没有这个字段时使用新的 7 天默认值。
+            try:
+                settings.log_keep_days = int(
+                    raw.get("log_keep_days", DEFAULT_LOG_KEEP_DAYS)
+                )
+            except (TypeError, ValueError):
+                settings.log_keep_days = DEFAULT_LOG_KEEP_DAYS
+            migrated = True
+            logging.getLogger(__name__).info(
+                "设置已升级到 v%d：日志默认保留 %d 天",
+                SETTINGS_VERSION,
+                settings.log_keep_days,
+            )
         if version < SETTINGS_VERSION:
             settings.settings_version = SETTINGS_VERSION
             if migrated:
@@ -195,6 +211,12 @@ class AppSettings:
             LOG_DISPLAY_OFF,
         ):
             self.log_display_mode = LOG_DISPLAY_FULL
+
+        try:
+            self.log_keep_days = int(self.log_keep_days)
+        except (TypeError, ValueError):
+            self.log_keep_days = DEFAULT_LOG_KEEP_DAYS
+        self.log_keep_days = max(1, min(self.log_keep_days, 90))
 
         self.default_model_id = (self.default_model_id or "").strip()
         self.dsh_dir = (self.dsh_dir or "").strip()

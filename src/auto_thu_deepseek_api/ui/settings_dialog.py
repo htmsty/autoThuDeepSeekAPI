@@ -323,6 +323,14 @@ class SettingsDialog(QDialog):
         self.log_level_combo.setCurrentText(settings.log_level)
         self.log_level_combo.setToolTip("DEBUG 会记录更多细节，排查问题时再开")
         log_form.addRow("日志级别", self.log_level_combo)
+        self.log_keep_spin = QSpinBox()
+        self.log_keep_spin.setRange(1, 90)
+        self.log_keep_spin.setSuffix(" 天")
+        self.log_keep_spin.setValue(settings.log_keep_days)
+        self.log_keep_spin.setToolTip(
+            "自动清理超过这个天数的旧日志；默认 7 天。每个日志文件仍按 2 MiB × 3 轮转。"
+        )
+        log_form.addRow("日志保留", self.log_keep_spin)
         self.log_button = QPushButton("打开日志目录")
         self.log_button.clicked.connect(self._open_log)
         log_form.addRow(self.log_button)
@@ -725,6 +733,7 @@ class SettingsDialog(QDialog):
             "CC Switch 运行中：先提示\n"
             f"· 备份保留 {defaults.backup_keep} 份；静默取 Token 超时 "
             f"{defaults.silent_capture_timeout_seconds} 秒；日志级别 {defaults.log_level}；"
+            f"日志保留 {defaults.log_keep_days} 天；"
             f"主界面日志{self._log_mode_label(defaults.log_display_mode)}；"
             f"关窗{'最小化到托盘' if defaults.close_to_tray else '直接退出'}\n\n"
             "开机启动项（注册表）保持现状，不会被动。\n确定恢复吗？",
@@ -775,6 +784,7 @@ class SettingsDialog(QDialog):
             settings.default_model_id or str(DEFAULT_MODELS[0]["id"])
         )
         self.log_level_combo.setCurrentText(settings.log_level)
+        self.log_keep_spin.setValue(settings.log_keep_days)
         log_index = self.log_display_combo.findData(settings.log_display_mode)
         self.log_display_combo.setCurrentIndex(log_index if log_index >= 0 else 0)
         self.private_path_label.setText(str(paths.data_root()))
@@ -927,6 +937,7 @@ class SettingsDialog(QDialog):
         settings.log_display_mode = str(
             self.log_display_combo.currentData() or LOG_DISPLAY_FULL
         )
+        settings.log_keep_days = self.log_keep_spin.value()
         text = self.default_model_combo.currentText().strip()
         settings.default_model_id = "" if text == str(DEFAULT_MODELS[0]["id"]) else text
         settings.normalize()

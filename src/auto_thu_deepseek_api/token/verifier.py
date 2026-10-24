@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 30
 LIGHT_TIMEOUT = 15
 CHAT_TIMEOUT = 30
+MAX_RESPONSE_BYTES = 512 * 1024
 
 
 @dataclass
@@ -46,10 +47,13 @@ def _request(
     try:
         context = create_verified_context()
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-            return response.status, response.read(), ""
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(body) > MAX_RESPONSE_BYTES:
+                return response.status, b"", f"响应超过 {MAX_RESPONSE_BYTES} 字节上限"
+            return response.status, body, ""
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read()
+            body = exc.read(MAX_RESPONSE_BYTES + 1)[:MAX_RESPONSE_BYTES]
         except Exception:  # pragma: no cover
             body = b""
         return exc.code, body, ""

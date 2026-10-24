@@ -28,6 +28,7 @@
 | 2.7.1 | 真机回归：自动登录隐藏验证码误判、`<a>` 登录按钮未提交、后台登录不应弹窗；设置窗口缩小并记住主/设置窗口尺寸 | ✅ 已完成（留档 `releases/2.7.1/`） |
 | 2.7.2 | 主界面恢复日志（完整/同步结果/关闭）、修复设置内预检使用旧配置且结果被遮挡、按内容重整五个设置页 | ✅ 已完成（留档 `releases/2.7.2/`） |
 | 2.7.3 | 修复打包版 `ssl.py` 缺少 `codex-rejected-cas.pem` 导致 HTTPS 初始化异常、成功登录后同步中断 | ✅ 已完成（留档 `releases/2.7.3/`） |
+| 2.8.0 | 资源占用优化：释放浏览器会话、限制 HTTP 缓存、日志按天清理、复用 TLS 上下文、精简打包调试资源 | ✅ 已完成（tag `v2.8.0`） |
 
 两个版本的**单文件程序**都要留档在 `releases/<版本>/`（产物不进 Git，使用
 `releases/<版本>/SHA256.txt` 记录校验和；GitHub Release 资产本身支持更大的附件）。
@@ -36,7 +37,7 @@
 
 - 开发环境：`D:\2\program\codex\autoThuDeepSeekAPI\autoThuDeepSeekAPI`，`.venv` 里装
   PySide6 6.12 / PyYAML / ruamel.yaml / PyInstaller 6.22。
-- 测试：`python -m unittest discover -s tests -t .`（当前 187 项）。
+- 测试：`python -m unittest discover -s tests -t .`（当前 190 项）。
 - 打包：`powershell -File build\build_app.ps1`（同时出文件夹版与单文件版）。
 - 自检：`autoThuDeepSeekAPI.exe --selftest`（起本地网页写假 Token，验证捕获链路）。
 - 运行数据全部在程序目录的 `private/`，不进 Git；`dist/`、`releases/` 也不进 Git。
@@ -95,6 +96,20 @@
    同步会回退内置模型继续，不再整次失败。
 5. 验证：全量 187 项测试全绿；强制模拟缺 CA 后实际连接 MadModel 返回 HTTP 200；
    两版打包、包内证书文件、`--selftest` 与文件版本核对通过。
+
+## 2.8.0 阶段
+
+1. **浏览器内存**：`TokenCaptureSession.finish()` 显式释放页面与自身，主窗口在取 Token
+   结束后延迟释放 `QWebEngineProfile`；不再把每次同步的旧页面挂在主窗口下。
+2. **浏览器存储**：HTTP 磁盘缓存上限设为 32 MiB，持久化 Cookie / localStorage 保留。
+3. **日志存储**：单文件轮转从 2 MiB × 5 调整为 2 MiB × 3；新增日志保留天数（默认 7 天，
+   范围 1–90 天），清除旧日志仍走回收站，设置 v5 → v6 自动迁移。
+4. **网络性能**：SSLContext 在进程内复用；Token 校验响应读取上限 512 KiB，避免异常响应
+   占满内存。
+5. **发行包**：排除 Qt WebEngine DevTools、debug PAK 与 debug V8 snapshot，并排除 QtTest。
+6. **验收**：190 项单元测试全绿；设置界面截图、两版打包、`--selftest`、
+   文件版本与 SHA256 核对均通过。文件夹版 2,838 个文件 / 429.31 MiB，
+   单文件版 172,274,196 字节 / 164.29 MiB。
 
 ## 2.0 阶段（本轮）
 

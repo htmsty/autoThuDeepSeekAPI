@@ -63,6 +63,7 @@ def _windows_certificate_context() -> ssl.SSLContext:
     return context
 
 
+@lru_cache(maxsize=1)
 def create_verified_context() -> ssl.SSLContext:
     """Create a certificate-verifying context with a Windows-store fallback."""
 

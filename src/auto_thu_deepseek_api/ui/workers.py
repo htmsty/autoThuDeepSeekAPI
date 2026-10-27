@@ -28,6 +28,7 @@ class StartupProbeResult:
     traces: dict[str, str]
     backups_done: int = 0
     warnings: tuple[str, ...] = ()
+    interrupted: bool = False
 
 
 class StartupProbeWorker(QThread):
@@ -42,6 +43,12 @@ class StartupProbeWorker(QThread):
     def __init__(self, settings: AppSettings, parent=None) -> None:
         super().__init__(parent)
         self._settings = copy.deepcopy(settings)
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        """请启动检查在原始备份完成后尽快让出，供用户手动同步使用。"""
+
+        self._cancel.set()
 
     def run(self) -> None:  # noqa: D102
         warnings: list[str] = []
@@ -60,6 +67,21 @@ class StartupProbeWorker(QThread):
             message = f"首次运行自动备份失败：{exc}"
             logger.warning(message)
             warnings.append(message)
+
+        # 手动同步可以跳过剩下的探测，但绝不能跳过首次原始备份。
+        if self._cancel.is_set():
+            logger.info("启动检查已按用户请求中断；原始备份阶段已完成，跳过目标探测")
+            self.ready.emit(
+                StartupProbeResult(
+                    statuses=[],
+                    targets_missing=False,
+                    traces={},
+                    backups_done=backups_done,
+                    warnings=tuple(warnings),
+                    interrupted=True,
+                )
+            )
+            return
 
         try:
             statuses = detect_targets(self._settings)

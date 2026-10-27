@@ -89,6 +89,8 @@ class MainWindow(QMainWindow):
         self._preflight_worker: PreflightWorker | None = None
         self._startup_worker: StartupProbeWorker | None = None
         self._startup_checks_pending = bool(startup_checks_pending)
+        self._startup_pipeline_claimed = False
+        self._manual_sync_after_startup = False
         self._startup_probe_result: StartupProbeResult | None = None
         self._startup_probe_error = ""
         self._preflight_result_parent_ref: weakref.ReferenceType[QWidget] | None = None
@@ -481,8 +483,13 @@ class MainWindow(QMainWindow):
     def startup_then_sync(self) -> None:
         """窗口显示后先做本机提醒，再把重活交给后台启动检查。"""
 
-        if self._quitting or self._startup_worker is not None:
+        if (
+            self._quitting
+            or self._startup_worker is not None
+            or self._startup_pipeline_claimed
+        ):
             return
+        self._startup_pipeline_claimed = True
         self._startup_checks_pending = True
         # 桌面提醒很快，而且它必须在任何数据搬迁/备份之前按顺序完成。
         if not self._check_desktop_private():
@@ -504,6 +511,7 @@ class MainWindow(QMainWindow):
             logger.exception("启动检查线程启动失败")
             self._startup_worker = None
             self._startup_checks_pending = False
+            self._manual_sync_after_startup = False
             self._restore_status_hint()
             self.dsh_status.setText("启动检测失败，可手动同步")
             self.ccswitch_status.setText("启动检测失败，可手动同步")
@@ -524,6 +532,8 @@ class MainWindow(QMainWindow):
             logger.warning(warning)
         if result.backups_done:
             logger.info("启动检查已完成首次备份：%d 份", result.backups_done)
+        if result.interrupted:
+            logger.info("启动检查已让出给手动同步")
 
     def _on_startup_probe_failed(
         self,
@@ -543,11 +553,16 @@ class MainWindow(QMainWindow):
     ) -> None:
         if worker is not None and worker is not self._startup_worker:
             return
+        manual_sync = self._manual_sync_after_startup
+        self._manual_sync_after_startup = False
         self._startup_worker = None
         self._startup_checks_pending = False
         if worker is not None:
             worker.deleteLater()
         self._restore_status_hint()
+        if manual_sync:
+            self._resume_manual_sync_after_startup()
+            return
         if self._startup_probe_error:
             if not self._started_minimized:
                 self.notify(
@@ -557,6 +572,9 @@ class MainWindow(QMainWindow):
             return
         result = self._startup_probe_result
         if result is None:
+            return
+        if result.interrupted:
+            logger.info("启动检查被手动同步打断，本次不再自动同步")
             return
         if not self._check_targets_missing(
             missing=result.targets_missing,
@@ -568,6 +586,54 @@ class MainWindow(QMainWindow):
             self.start_sync(interactive=False)
         else:
             logger.info("设置里关掉了「启动时立即同步」，本次不自动同步")
+
+    def _queue_manual_sync_after_startup(self) -> None:
+        """手动同步优先于开机后的延迟等待，但原始备份仍要先完成。"""
+
+        if self._manual_sync_after_startup:
+            logger.info("手动同步已经在等待启动检查让出，忽略重复请求")
+            return
+        self._manual_sync_after_startup = True
+        worker = self._startup_worker
+        if worker is not None:
+            logger.info("用户手动同步：请启动检查在安全位置立即让出")
+            self._show_status_hint("正在停止启动检查，随后开始手动同步…")
+            worker.request_cancel()
+            return
+
+        # 开机启动原本还会等待 90 秒。手动点击后立即跑同一个检查线程：
+        # 首次原始备份必须保留，但目标探测在收到中断请求后可以跳过。
+        logger.info("用户手动同步：跳过开机启动等待，立即完成安全备份检查")
+        self.startup_then_sync()
+        worker = self._startup_worker
+        if worker is not None:
+            self._show_status_hint("正在完成安全备份，随后开始手动同步…")
+            worker.request_cancel()
+
+    def _resume_manual_sync_after_startup(self) -> None:
+        """启动检查让出后，继续用户刚才点下的同步。"""
+
+        if self._quitting or self._maintenance:
+            return
+        result = self._startup_probe_result
+        try:
+            if result is not None and not result.interrupted:
+                allowed = self._check_targets_missing(
+                    missing=result.targets_missing,
+                    traces=result.traces,
+                )
+            else:
+                # 中断发生在目标探测前；这里补做一次很轻的“两边是否都没痕迹”判断，
+                # 避免手动同步绕过原有的未安装提醒。
+                allowed = self._check_targets_missing()
+        except Exception as exc:  # noqa: BLE001 - 探测异常交给同步线程继续判断
+            logger.warning("手动同步前复核目标失败，继续由同步流程检测：%s", exc)
+            allowed = True
+        if not allowed:
+            self.refresh_status()
+            return
+        logger.info("启动检查已让出，继续执行用户点击的同步")
+        self.start_sync(interactive=True)
 
     def _check_desktop_private(self) -> bool:
         """程序直接在桌面根目录时提醒用户；返回 False 表示已经退出程序。"""
@@ -980,6 +1046,7 @@ class MainWindow(QMainWindow):
                     orphans.append(startup_worker)
         self._startup_worker = None
         self._startup_checks_pending = False
+        self._manual_sync_after_startup = False
         self._startup_probe_result = None
         self._startup_probe_error = ""
         if self._capture is not None:
@@ -1081,13 +1148,10 @@ class MainWindow(QMainWindow):
             logger.info("正在搬 private 位置或卸载，本次同步先跳过")
             return
         if self._startup_worker is not None or self._startup_checks_pending:
-            logger.info("启动检查还没结束，本次同步请求先等待")
             if interactive:
-                QMessageBox.information(
-                    self,
-                    "正在完成启动检查",
-                    "程序还在做首次备份和目标检查。等它完成后再点同步即可。",
-                )
+                self._queue_manual_sync_after_startup()
+            else:
+                logger.info("启动检查还没结束，本次自动同步先跳过")
             return
         dsh_active = self.settings.enable_dsh and (
             self.settings.enable_dsh_credentials or self.settings.enable_dsh_provider
@@ -1395,6 +1459,9 @@ class MainWindow(QMainWindow):
         if worker is not None and worker is not self._sync_worker:
             logger.info("上一次同步的结果晚到了，忽略（已经有新的同步在跑）")
             return
+        if report.statuses:
+            # 手动同步可能中断了启动探测；同步线程已经重新探测过一次，直接把结果显示出来。
+            self._apply_target_statuses(report.statuses)
         summary = report.summary()
         self.settings.last_sync_at = datetime.now().isoformat(timespec="seconds")
         self.settings.last_sync_summary = f"{self.settings.last_sync_at} · {summary}"

@@ -890,8 +890,8 @@ class UiInteractionTest(unittest.TestCase):
             finally:
                 self._close(window)
 
-    def test_sync_waits_for_startup_probe(self) -> None:
-        """启动备份/探测没完成时，用户提前点同步不能抢跑到备份之前。"""
+    def test_manual_sync_interrupts_startup_probe_without_backup_notice(self) -> None:
+        """启动期间手点同步应让探测让出，而不是弹首次备份提示。"""
 
         from unittest import mock
 
@@ -902,11 +902,110 @@ class UiInteractionTest(unittest.TestCase):
             AppState(),
             startup_checks_pending=True,
         )
+        cancelled: list[bool] = []
+
+        class FakeWorker:
+            def request_cancel(self) -> None:
+                cancelled.append(True)
+
         try:
+            window._startup_worker = FakeWorker()  # type: ignore[assignment]
             with mock.patch.object(QMessageBox, "information") as information:
                 window.start_sync(interactive=True)
-            self.assertTrue(information.called)
+            information.assert_not_called()
+            self.assertEqual(cancelled, [True])
+            self.assertTrue(window._manual_sync_after_startup)
             self.assertIsNone(window._capture)
+        finally:
+            self._close(window)
+
+    def test_manual_sync_during_startup_delay_starts_pipeline_immediately(self) -> None:
+        """还没到 90 秒检查点时，手点同步应立即启动安全检查而不是继续等。"""
+
+        from unittest import mock
+
+        from PySide6.QtCore import QObject, Signal
+
+        import auto_thu_deepseek_api.ui.main_window as main_window_module
+
+        started = []
+        cancelled = []
+
+        class FakeWorker(QObject):
+            ready = Signal(object)
+            failed = Signal(str)
+            finished = Signal()
+
+            def __init__(self, settings, parent=None) -> None:  # noqa: ANN001
+                super().__init__(parent)
+
+            def start(self) -> None:
+                started.append(self)
+
+            def request_cancel(self) -> None:
+                cancelled.append(True)
+
+        window = MainWindow(
+            AppSettings(),
+            AppState(),
+            startup_checks_pending=True,
+        )
+        original_worker = main_window_module.StartupProbeWorker
+        main_window_module.StartupProbeWorker = FakeWorker  # type: ignore[assignment]
+        try:
+            window._check_desktop_private = lambda: True  # type: ignore[assignment]
+            with mock.patch.object(
+                main_window_module.QMessageBox, "information"
+            ) as information:
+                window.start_sync(interactive=True)
+                # 模拟 app.py 原本的 90 秒定时器晚到。
+                window.startup_then_sync()
+            information.assert_not_called()
+            self.assertEqual(len(started), 1, "提前启动后，晚到的定时器不能再跑第二轮")
+            self.assertEqual(cancelled, [True], "首次备份开始后应立即跳过剩余探测")
+            self.assertTrue(window._manual_sync_after_startup)
+        finally:
+            main_window_module.StartupProbeWorker = original_worker  # type: ignore[assignment]
+            window._startup_worker = None
+            window._startup_checks_pending = False
+            self._close(window)
+
+    def test_interrupted_startup_resumes_manual_sync_after_safety_check(self) -> None:
+        """探测让出后要转入手动同步，同时保留“两边都没装”的判断。"""
+
+        from unittest import mock
+
+        from PySide6.QtCore import QObject
+
+        from auto_thu_deepseek_api.ui.workers import StartupProbeResult
+
+        class FakeWorker(QObject):
+            pass
+
+        window = MainWindow(
+            AppSettings(),
+            AppState(),
+            startup_checks_pending=True,
+        )
+        worker = FakeWorker()
+        window._startup_worker = worker  # type: ignore[assignment]
+        window._manual_sync_after_startup = True
+        window._startup_probe_result = StartupProbeResult(
+            statuses=[],
+            targets_missing=False,
+            traces={},
+            backups_done=1,
+            interrupted=True,
+        )
+        try:
+            with (
+                mock.patch.object(window, "_check_targets_missing", return_value=True) as check,
+                mock.patch.object(window, "start_sync") as start_sync,
+            ):
+                window._on_startup_thread_finished(worker)
+            check.assert_called_once_with()
+            start_sync.assert_called_once_with(interactive=True)
+            self.assertFalse(window._startup_checks_pending)
         finally:
             self._close(window)
 

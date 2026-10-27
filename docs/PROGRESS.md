@@ -30,6 +30,7 @@
 | 2.7.3 | 修复打包版 `ssl.py` 缺少 `codex-rejected-cas.pem` 导致 HTTPS 初始化异常、成功登录后同步中断 | ✅ 已完成（留档 `releases/2.7.3/`） |
 | 2.8.0 | 资源占用优化：释放浏览器会话、限制 HTTP 缓存、日志按天清理、复用 TLS 上下文、精简打包调试资源 | ✅ 已完成（tag `v2.8.0`） |
 | 2.9.0 | 启动结构优化：WebEngine 惰性导入、首次备份/探测后台化、原生进程快照、多文件 ZIP 主发布 | ✅ 已完成（tag `v2.9.0`） |
+| 2.9.1 | 开机后的启动等待允许手动同步打断；仍先完成原始备份并保留未安装提醒 | ✅ 已完成（tag `v2.9.1`） |
 
 多文件 ZIP 是正式主资产，单文件 EXE 作为兼容备用；两者都要留档在 `releases/<版本>/`
 （产物不进 Git，使用 `releases/<版本>/SHA256.txt` 记录校验和；GitHub Release 资产本身支持更大的附件）。
@@ -38,7 +39,7 @@
 
 - 开发环境：`D:\2\program\codex\autoThuDeepSeekAPI\autoThuDeepSeekAPI`，`.venv` 里装
   PySide6 6.12 / PyYAML / ruamel.yaml / PyInstaller 6.22。
-- 测试：`python -m unittest discover -s tests -t .`（当前 198 项）。
+- 测试：`python -m unittest discover -s tests -t .`（当前 201 项）。
 - 打包：`powershell -File build\build_app.ps1`（同时出版本化多文件 ZIP、展开目录与单文件版）。
 - 自检：`autoThuDeepSeekAPI.exe --selftest`（起本地网页写假 Token，验证捕获链路）。
 - 运行数据全部在程序目录的 `private/`，不进 Git；`dist/`、`releases/` 也不进 Git。
@@ -134,6 +135,20 @@
    - 隔离启动：扫描缓存完成后多文件版约 1.0–1.1 秒，程序内部启动约 0.6 秒；全新构建
      前几次可能被 Defender 扫描拖慢到约 6–13 秒；单文件约 6.65 秒；
    - 隔离测试前后开机启动项不变。
+
+## 2.9.1 阶段
+
+1. **手动同步优先**：开机启动后的 90 秒等待期内，手点「立即获取并同步」不再弹首次备份提示，
+   而是立即开始安全检查并跳过剩余等待。
+2. **安全中断**：`StartupProbeWorker.request_cancel()` 为协作式中断；ACL 收紧和首次原始备份
+   一定先完成，之后才允许跳过目标探测。主窗口补做“两边是否都没痕迹”的判断，保留未安装提醒。
+3. **防重复启动**：`_startup_pipeline_claimed` 防止手动提前启动后，`app.py` 原来的延迟定时器
+   再触发第二轮启动检查。
+4. **验证**：201 项测试、`compileall`、`pip check`、`git diff --check` 全通过；两版
+   `--selftest` 均为退出码 0，EXE 文件版本为 2.9.1，无新增 QtWebEngine 残留。
+   - 多文件目录版：2,883 文件 / 452,854,896 字节（431.88 MiB）；
+   - ZIP：173,428,299 字节（165.39 MiB）；
+   - 单文件版：172,282,763 字节（164.30 MiB）。
 
 ## 2.0 阶段（本轮）
 

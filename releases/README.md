@@ -19,6 +19,10 @@ releases/
     autoThuDeepSeekAPI-2.9.0-portable.zip
     autoThuDeepSeekAPI-2.9.0.exe
     SHA256.txt
+  2.9.1/
+    autoThuDeepSeekAPI-2.9.1-portable.zip
+    autoThuDeepSeekAPI-2.9.1.exe
+    SHA256.txt
 ```
 
 从 2.7.0 起，打包的 EXE 带文件版本资源；没有 Authenticode 证书时 Windows 仍会显示

@@ -116,6 +116,46 @@ class StartupProbeWorkerTest(unittest.TestCase):
         self.assertEqual(results[0].backups_done, 2)
         self.assertFalse(results[0].targets_missing)
 
+    def test_cancel_skips_probe_only_after_first_run_backup(self) -> None:
+        """手动同步可以打断探测，但不能把首次原始备份一起跳过。"""
+
+        from auto_thu_deepseek_api.settings import AppSettings
+        from auto_thu_deepseek_api.ui import workers
+
+        order: list[str] = []
+        results = []
+
+        def step(name: str, value=0):  # noqa: ANN001, ANN202
+            def run(*_args, **_kwargs):  # noqa: ANN002, ANN003
+                order.append(name)
+                return value
+
+            return run
+
+        with (
+            mock.patch.object(workers.paths, "harden_runtime_dirs", side_effect=step("acl")),
+            mock.patch.object(
+                workers,
+                "auto_backup_on_first_run",
+                side_effect=step("backup", 2),
+            ),
+            mock.patch.object(workers, "detect_targets", side_effect=step("statuses")),
+            mock.patch.object(
+                workers,
+                "both_targets_missing",
+                side_effect=step("missing"),
+            ),
+        ):
+            worker = workers.StartupProbeWorker(AppSettings())
+            worker.ready.connect(results.append)
+            worker.request_cancel()
+            worker.run()
+
+        self.assertEqual(order, ["acl", "backup"])
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].interrupted)
+        self.assertEqual(results[0].backups_done, 2)
+
 
 class ProcessProbeTest(unittest.TestCase):
     def test_ccswitch_refresh_sees_a_process_started_after_cache(self) -> None:

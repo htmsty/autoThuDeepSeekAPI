@@ -281,6 +281,10 @@ Windows 下优先用 Toolhelp32 原生进程快照，不再为了启动探测额
   根目录时提醒一次），随后把首次备份、ACL 和目标探测交给 `StartupProbeWorker`。工作线程结束后
   才用预计算出的结果走 `_check_targets_missing()`（两边都没痕迹时提醒一次并跳过这次同步），
   都通过才跑"启动时立即同步"。两条提醒的"已处理"状态写在 private 的 `state.json` 里。
+  开机后的 90 秒等待期内，用户手动点同步会取消这段等待：若启动线程尚未开始就在当前线程上下文
+  启动它，若已在运行则请求协作式中断。`StartupProbeWorker` 始终先完成 ACL 与首次原始备份，
+  然后才允许跳过目标探测；主窗口随后补做“两边是否都没痕迹”的判断并继续用户请求的同步。
+  `_startup_pipeline_claimed` 防止已经提前启动后，原来的延迟定时器再启动第二轮启动检查。
   「强行终止并重试」也在这里：`_ask_force_retry()` + `_retry_after_stop`。
   2.5.1 起，桌面提醒其实由 `app.py` 在**创建任何目录之前**调 `data_location.desktop_notice()`
   完成（`MainWindow` 里那条只是兜底）；搬家/卸载前会先 `_prepare_for_data_move()` /
@@ -294,8 +298,8 @@ Windows 下优先用 Toolhelp32 原生进程快照，不再为了启动探测额
   「校验写入内容」把当前草稿设置交给后台 `PreflightWorker`，结果框优先挂在仍然可见的
   设置窗口上；按钮在运行时显示进度，成功后信息框、失败后警告框。
   「备份、日志与维护」包含 private 位置、恢复默认设置和干净卸载。
-- `workers.py`：`StartupProbeWorker` 负责窗口显示后的启动检查；`SyncWorker` 把同步放到线程，
-  避免界面卡死。
+- `workers.py`：`StartupProbeWorker` 负责窗口显示后的启动检查，并支持在首次备份完成后让出给
+  手动同步；`SyncWorker` 把同步放到线程，避免界面卡死。
   `request_cancel()` 只是给同步流程一个"请停下"的信号（协作式取消，见 `sync.py`）。
 
 ## 每一步要做什么（里程碑）

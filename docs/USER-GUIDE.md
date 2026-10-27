@@ -36,8 +36,8 @@ Windows Credential Manager。
 
 | 形态 | 说明 | 建议 |
 | --- | --- | --- |
-| 多文件 ZIP（`autoThuDeepSeekAPI-2.9.0-portable.zip`） | 解压后是完整文件夹，启动最快、常驻更省资源 | **正式推荐，日常使用** |
-| 单文件版（`autoThuDeepSeekAPI-2.9.0.exe`） | 只有一个文件，每次启动都要先解包，约慢几秒 | 只作兼容备用 |
+| 多文件 ZIP（`autoThuDeepSeekAPI-2.9.1-portable.zip`） | 解压后是完整文件夹，启动最快、常驻更省资源 | **正式推荐，日常使用** |
+| 单文件版（`autoThuDeepSeekAPI-2.9.1.exe`） | 只有一个文件，每次启动都要先解包，约慢几秒 | 只作兼容备用 |
 
 ZIP 必须**完整解压**到固定目录（例如 `D:\Tools\autoThuDeepSeekAPI\`），保持
 `autoThuDeepSeekAPI.exe` 与同目录的 `_internal\` 在一起。不要只把 EXE 单独拖出来。

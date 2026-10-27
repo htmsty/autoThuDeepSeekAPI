@@ -110,7 +110,7 @@ def _api_json(
     payload: dict | None = None,
     *,
     allow_not_found: bool = False,
-) -> dict | None:
+) -> dict | list | None:
     data = None
     headers = _headers(token)
     if payload is not None:
@@ -155,7 +155,22 @@ def _release_url(repo: str, tag: str) -> str:
 
 
 def _get_release(repo: str, tag: str, token: str) -> dict | None:
-    return _api_json("GET", _release_url(repo, tag), token, allow_not_found=True)
+    release = _api_json("GET", _release_url(repo, tag), token, allow_not_found=True)
+    if isinstance(release, dict):
+        return release
+
+    # The tag endpoint does not reliably return draft releases. Newly created
+    # drafts are still available to an authenticated caller through the list.
+    releases = _api_json(
+        "GET",
+        f"{API_ROOT}/repos/{repo}/releases?per_page=100",
+        token,
+    )
+    if isinstance(releases, list):
+        for item in releases:
+            if isinstance(item, dict) and item.get("tag_name") == tag:
+                return item
+    return None
 
 
 def _delete_asset(repo: str, asset_id: int, token: str) -> None:

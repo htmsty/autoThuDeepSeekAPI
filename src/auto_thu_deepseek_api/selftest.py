@@ -9,6 +9,8 @@ from __future__ import annotations
 import http.server
 import logging
 import sys
+import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -59,7 +61,42 @@ def _start_server() -> tuple[http.server.ThreadingHTTPServer, int]:
     return server, port
 
 
+def check_sqlite_backup() -> None:
+    """Exercise the packaged SQLite/DPAPI path using only disposable fake data."""
+
+    from . import crypto
+    from .backup import BackupManager
+
+    with tempfile.TemporaryDirectory(prefix="atd-sqlite-selftest-") as tmp:
+        root = Path(tmp)
+        source = root / "source.db"
+        connection = sqlite3.connect(source)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE checks(value)")
+            connection.execute("INSERT INTO checks VALUES ('selftest')")
+            connection.commit()
+            saved = BackupManager(root / "backups").backup_sqlite(source, "original")
+        finally:
+            connection.close()
+        if saved is None:
+            raise RuntimeError("SQLite 备份未生成")
+        restored = root / "restored.db"
+        restored.write_bytes(crypto.unprotect_bytes(saved.read_bytes()))
+        check = sqlite3.connect(restored)
+        try:
+            if check.execute("SELECT value FROM checks").fetchone() != ("selftest",):
+                raise RuntimeError("SQLite 备份内容不一致")
+        finally:
+            check.close()
+
+
 def run(profile_dir: Path, timeout_seconds: int = 30) -> int:
+    try:
+        check_sqlite_backup()
+        backup_ok, backup_detail = True, "SQLite/DPAPI 备份通过"
+    except Exception as exc:
+        backup_ok, backup_detail = False, f"SQLite/DPAPI 备份失败：{exc}"
     try:
         create_verified_context()
         tls_ok = True
@@ -110,21 +147,23 @@ def run(profile_dir: Path, timeout_seconds: int = 30) -> int:
     server.shutdown()
     server.server_close()
 
-    ok = bool(result["ok"]) and tls_ok
+    ok = bool(result["ok"]) and tls_ok and backup_ok
     print(
         ("自检通过：" if ok else "自检失败：")
         + str(result["detail"])
         + "；"
         + tls_detail
+        + "；"
+        + backup_detail
     )
     return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
-    from . import paths
-
     argv = sys.argv if argv is None else argv
-    paths.ensure_runtime_dirs()
-    profile_dir = Path(argv[1]) if len(argv) > 1 and not argv[1].startswith("-") else paths.browser_profile_dir() / "selftest"
-    return run(profile_dir)
+    if len(argv) > 1 and not argv[1].startswith("-"):
+        return run(Path(argv[1]))
+    # 自检不读取 private 指针，也不收紧真实运行目录权限。
+    with tempfile.TemporaryDirectory(prefix="atd-browser-selftest-") as tmp:
+        return run(Path(tmp) / "profile")
 

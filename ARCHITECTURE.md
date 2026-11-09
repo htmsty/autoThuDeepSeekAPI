@@ -122,7 +122,8 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
   `modelList:[{label,value,supportImage,effortOptions}…]` → 转成 provider 的 models 形状
   （`contextWindow` 统一 1000000；排除 `DeepSeek-V4-Flash-Vision-Exp` 与 `DeepSeek-R1-W8A8`；
   思考档只保留 pi-ai 认得的等级）。解析支持属性引号与空白差异；缓存会重新校验结构，
-  缓存坏了就丢弃。结果缓存 6 小时，读不到才退回 `/v1/models` 与内置名单。
+  缓存坏了就丢弃。结果缓存 6 小时，读不到才退回 `/v1/models` 与内置名单；内置回退短缓存 5 分钟。
+  页面和后续前端包共用 25 秒请求预算，带 Token 的请求只允许同来源 HTTPS 重定向。
 
 ### `targets/dsh.py`
 - 凭据：`<.dsh>/.credentials.yaml` 的 `refs.MADMODEL_API_KEY`。用 ruamel.yaml 往返模式读写，
@@ -177,11 +178,13 @@ DSH 凭据/Provider 分开关、CC Switch 卡片/路由分开关、自定义路�
 每次写入前把原文件复制到 `private/backups/<时间戳>-<标签>/`，并写入
 `private/backups/index.json`（源路径、备份路径、时间、sha256、是否原始备份）。文件内容用
 Windows DPAPI 加密；旧明文备份会在索引读取时原地迁移。SQLite 用 `Connection.backup()`
-保证一致性后再加密。
+生成内存中的一致性快照，直接加密后落盘；备份失败不退化成直接复制数据库主文件。
 
 新版“还原”优先读取 `private/changes/` 的字段级加密日志并逆向撤销；只有没有字段日志的旧备份
 才允许在显式高风险确认后做整文件恢复。整文件恢复 SQLite 前会先清理 WAL/SHM，避免旧日志覆盖。
 
+- `sources.json` 逐文件保存来源，旧索引有效时补齐；索引丢失的旧多文件快照不猜来源。
+- 整文件恢复先验证 SHA256 并解密；坏备份不会覆盖当前文件。
 - `begin_snapshot(label)`：让同一次操作的多份文件共用一个快照目录。
 - `_snapshot_target()`：同一目录里重名（多个 profile 都叫 `cordis.patch.yml`）时自动
   加 `-2`、`-3` 序号，避免互相覆盖导致还原错位。
@@ -349,3 +352,9 @@ Windows 下优先用 Toolhelp32 原生进程快照，不再为了启动探测额
   新版优先字段级撤销，旧备份才要求额外高风险确认。
 - 写入前一律先备份；写失败有回滚；写坏的目标不会被留在那儿。
 
+
+## 2.9.2 后台收尾
+
+自动同步的网络探测由 `ReachabilityWorker` 完成，不占用 GUI 线程。`quit_app()` 发出协作式
+停止请求，由 100 毫秒定时器检查所有后台线程，确认结束后才退出，不调用 QThread.terminate。
+同步和预检线程收尾时调用 deleteLater，退出期间不再弹出结果对话框或启动新的同步。

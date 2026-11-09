@@ -19,9 +19,9 @@ releases/
     autoThuDeepSeekAPI-2.9.0-portable.zip
     autoThuDeepSeekAPI-2.9.0.exe
     SHA256.txt
-  2.9.1/
-    autoThuDeepSeekAPI-2.9.1-portable.zip
-    autoThuDeepSeekAPI-2.9.1.exe
+  2.9.2/
+    autoThuDeepSeekAPI-2.9.2-portable.zip
+    autoThuDeepSeekAPI-2.9.2.exe
     SHA256.txt
 ```
 

@@ -105,7 +105,7 @@ class TlsContextTest(unittest.TestCase):
 
     def test_model_download_turns_tls_setup_failure_into_fallback(self) -> None:
         with mock.patch.object(
-            site_models,
+            http_tls,
             "create_verified_context",
             side_effect=FileNotFoundError("missing CA"),
         ):
@@ -115,7 +115,7 @@ class TlsContextTest(unittest.TestCase):
 
     def test_token_request_turns_tls_setup_failure_into_error_result(self) -> None:
         with mock.patch.object(
-            verifier,
+            http_tls,
             "create_verified_context",
             side_effect=FileNotFoundError("missing CA"),
         ):

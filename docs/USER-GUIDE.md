@@ -36,8 +36,8 @@ Windows Credential Manager。
 
 | 形态 | 说明 | 建议 |
 | --- | --- | --- |
-| 多文件 ZIP（`autoThuDeepSeekAPI-2.9.1-portable.zip`） | 解压后是完整文件夹，启动最快、常驻更省资源 | **正式推荐，日常使用** |
-| 单文件版（`autoThuDeepSeekAPI-2.9.1.exe`） | 只有一个文件，每次启动都要先解包，约慢几秒 | 只作兼容备用 |
+| 多文件 ZIP（`autoThuDeepSeekAPI-2.9.2-portable.zip`） | 解压后是完整文件夹，启动最快、常驻更省资源 | **正式推荐，日常使用** |
+| 单文件版（`autoThuDeepSeekAPI-2.9.2.exe`） | 只有一个文件，每次启动都要先解包，约慢几秒 | 只作兼容备用 |
 
 ZIP 必须**完整解压**到固定目录（例如 `D:\Tools\autoThuDeepSeekAPI\`），保持
 `autoThuDeepSeekAPI.exe` 与同目录的 `_internal\` 在一起。不要只把 EXE 单独拖出来。
@@ -185,11 +185,14 @@ ZIP 必须**完整解压**到固定目录（例如 `D:\Tools\autoThuDeepSeekAPI\
   各备份一份（带 `original` 标记，永不清理）；
 - 之后每次真正要写文件之前，都会再留一份普通备份（按"备份保留份数"轮换）；
 - 备份文件使用 Windows DPAPI 加密，放在 `private\backups\` 下；每个快照目录里都有
-  `source.txt` 记录来源文件；
+  `sources.json` 逐个记录备份文件对应的源路径，兼容保留旧版 `source.txt`；
 - 每次成功写入还会在 `private\changes\` 记录字段级变更（同样是 DPAPI 密文）；
 - 「还原到首次修改前」会从新到旧撤销本程序写过的字段；当前值已被你或别的程序改动时保留并报告冲突；
 - 只有旧备份、没有字段日志时，才会在额外高风险提示后执行整文件还原；
 - 清理旧备份走**回收站**，可以撤销。
+
+退出时如果正在备份或同步，状态栏会显示“正在安全结束后台操作”，程序保持响应并等当前
+操作安全收尾后自动退出。同步失败时不会自动隐藏主窗口，便于查看原因。
 
 ## 6. 数据、隐私与安全
 

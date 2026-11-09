@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
 SOURCE_MARKER = "source.txt"
+SOURCES_MANIFEST = "sources.json"
 
 
 @dataclass
@@ -73,7 +75,12 @@ class BackupManager:
         except (OSError, ValueError):
             logger.warning("备份索引损坏，稍后从快照目录重建：%s", self.index_path)
             return []
-        return raw if isinstance(raw, list) else []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict)
+                and all(isinstance(item.get(key), str) for key in ("label", "source", "backup", "created", "sha256"))
+                and item["source"] and item["backup"]
+                and isinstance(item.get("size"), int) and item["size"] >= 0]
 
     def _rebuild_index(self) -> list[dict]:
         """索引丢了就从快照目录自愈。
@@ -88,15 +95,29 @@ class BackupManager:
         for snapshot in sorted(self.root.iterdir()):
             if not snapshot.is_dir():
                 continue
-            marker = snapshot / SOURCE_MARKER
+            manifest = snapshot / SOURCES_MANIFEST
+            sources = None
             try:
-                source = marker.read_text(encoding="utf-8").strip()
-            except OSError:
+                if manifest.exists():
+                    sources = json.loads(manifest.read_text(encoding="utf-8"))
+                    if not isinstance(sources, dict):
+                        continue
+            except (OSError, ValueError):
+                logger.warning("快照来源清单损坏，跳过以免还原错位置：%s", snapshot)
                 continue
-            if not source:
-                continue
-            for payload in snapshot.iterdir():
-                if not payload.is_file() or payload.name == SOURCE_MARKER:
+            payloads = [p for p in snapshot.iterdir() if p.is_file() and p.name not in (SOURCE_MARKER, SOURCES_MANIFEST)]
+            if sources is None:
+                # 老版只记了最后一个来源。多文件快照无法可靠推断，不能猜。
+                if len(payloads) != 1:
+                    logger.warning("旧多文件快照缺少逐文件来源清单，无法安全重建：%s", snapshot)
+                    continue
+                try:
+                    sources = {payloads[0].name: (snapshot / SOURCE_MARKER).read_text(encoding="utf-8").strip()}
+                except OSError:
+                    continue
+            for payload in payloads:
+                source = sources.get(payload.name)
+                if not isinstance(source, str) or not source:
                     continue
                 try:
                     stat = payload.stat()
@@ -113,7 +134,8 @@ class BackupManager:
                             created=created,
                             sha256=_sha256(payload),
                             size=stat.st_size,
-                            encrypted=crypto.is_encrypted(payload.read_bytes()[:64]),
+                            encrypted=self._payload_is_encrypted(payload),
+                            is_original=is_original_label(snapshot.name),
                         )
                     )
                 )
@@ -124,6 +146,11 @@ class BackupManager:
             except OSError as exc:  # pragma: no cover
                 logger.warning("重建后的索引写不进去：%s", exc)
         return rebuilt
+
+    @staticmethod
+    def _payload_is_encrypted(payload: Path) -> bool:
+        with payload.open("rb") as handle:
+            return crypto.is_encrypted(handle.read(64))
 
     def _save_index(self, entries: list[dict]) -> None:
         # 原子写：索引被写坏会让"一键还原"找不到任何备份
@@ -156,15 +183,34 @@ class BackupManager:
         entries = self._load_index()
         if not entries:
             return
+        # 在索引还完整时为旧快照补齐来源，避免将来丢索引后无法区分多文件。
+        by_snapshot: dict[Path, dict[str, str]] = {}
+        for item in entries:
+            payload = Path(item["backup"])
+            if payload.parent.parent == self.root and payload.is_file():
+                by_snapshot.setdefault(payload.parent, {})[payload.name] = item["source"]
+        for snapshot, sources in by_snapshot.items():
+            manifest = snapshot / SOURCES_MANIFEST
+            if not manifest.exists():
+                try:
+                    paths.write_text_atomic(manifest, json.dumps(sources, ensure_ascii=False, indent=2) + "\n")
+                except OSError as exc:
+                    logger.warning("补写旧快照来源失败：%s（%s）", snapshot, exc)
         changed = False
         for item in entries:
             try:
                 payload = Path(item.get("backup", ""))
                 if not payload.is_file():
                     continue
+                if item.get("encrypted"):
+                    continue
                 data = payload.read_bytes()
                 if crypto.is_encrypted(data):
                     item["encrypted"] = True
+                    changed = True
+                    continue
+                if item.get("sha256") and _sha256(payload) != item["sha256"]:
+                    logger.warning("旧备份校验和不匹配，跳过迁移：%s", payload)
                     continue
                 encrypted = crypto.protect_bytes(data)
                 paths.write_bytes_atomic(payload, encrypted)
@@ -262,7 +308,7 @@ class BackupManager:
             shutil.copystat(source, target)
         except OSError:
             pass
-        self._write_source_marker(snapshot, source)
+        self._write_source_marker(snapshot, source, target)
         self._record(
             BackupEntry(
                 label=label,
@@ -287,34 +333,28 @@ class BackupManager:
             return None
         snapshot = self._new_snapshot_dir(label)
         target = self._snapshot_target(snapshot, source.name)
-        self._write_source_marker(snapshot, source)
+        deadline = time.monotonic() + 10
+
+        def check_progress(status, remaining, total):
+            if time.monotonic() > deadline:
+                raise OSError("SQLite 一致性备份超时，未写入目标配置")
+
         try:
-            src = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
+            src = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
             try:
-                dst = sqlite3.connect(target)
+                dst = sqlite3.connect(":memory:")
                 try:
-                    src.backup(dst)
+                    src.backup(dst, pages=256, progress=check_progress, sleep=0.05)
+                    # 一致性快照在内存中加密，磁盘上从不生成明文数据库备份。
+                    encrypted = crypto.protect_bytes(dst.serialize())
                 finally:
                     dst.close()
             finally:
                 src.close()
-        except sqlite3.Error as exc:
-            logger.warning("SQLite 备份接口失败（%s），改用文件复制", exc)
-            paths.write_bytes_atomic(target, source.read_bytes())
-        try:
-            encrypted = crypto.protect_bytes(target.read_bytes())
-        except (OSError, ValueError) as exc:
-            # SQLite's backup API must first create a plaintext file. If DPAPI
-            # fails, do not leave that plaintext behind in the backup folder.
-            try:
-                paths.write_bytes_atomic(target, b"")
-            except OSError:
-                pass
-            removed, detail = paths.delete_path(target)
-            if not removed:
-                logger.error("加密失败后无法清理明文数据库备份：%s（%s）", target, detail)
-            raise OSError(f"SQLite 备份加密失败：{exc}") from exc
+        except (sqlite3.Error, ValueError) as exc:
+            raise OSError(f"SQLite 一致性备份失败：{exc}") from exc
         paths.write_bytes_atomic(target, encrypted)
+        self._write_source_marker(snapshot, source, target)
         self._record(
             BackupEntry(
                 label=label,
@@ -331,12 +371,19 @@ class BackupManager:
         self.prune()
         return target
 
-    @staticmethod
-    def _write_source_marker(snapshot: Path, source: Path) -> None:
-        try:
-            (snapshot / SOURCE_MARKER).write_text(str(source), encoding="utf-8")
-        except OSError as exc:  # pragma: no cover - 只是方便自愈，写不进去不算失败
-            logger.warning("写备份来源标记失败：%s", exc)
+    def _write_source_marker(self, snapshot: Path, source: Path, target: Path) -> None:
+        manifest = snapshot / SOURCES_MANIFEST
+        sources = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+        if not isinstance(sources, dict):
+            raise OSError("快照来源清单损坏，未登记本次备份")
+        # 给已经有索引的旧快照补齐逐文件来源。
+        for item in self._load_index():
+            backup = Path(item.get("backup", ""))
+            if backup.parent == snapshot:
+                sources[backup.name] = item.get("source", "")
+        sources[target.name] = str(source)
+        paths.write_text_atomic(manifest, json.dumps(sources, ensure_ascii=False, indent=2) + "\n")
+        (snapshot / SOURCE_MARKER).write_text(str(source), encoding="utf-8")
 
     # —— 清理 ——
 
@@ -366,7 +413,7 @@ class BackupManager:
         return min(items, key=cls._sort_key) if items else None
 
     def prune(self) -> None:
-        """每个源文件保留最早的那份备份 + 最近 `keep-1` 份，避免无限增长。
+        """每个源文件保留原始备份 + 最近 `keep` 份普通备份。
 
         "最早的那份"就是"程序第一次动这个文件之前"的状态，无论它是否带 original 标记，
         都不参与清理；这样「一键还原」在任何时候都能回到最初。
@@ -383,15 +430,13 @@ class BackupManager:
             rest = [item for item in items if not self._is_original(item)]
             rest.sort(key=self._sort_key)
             keep_paths.update(item.get("backup", "") for item in originals)
-            already = len(originals)
             # 没有 original 标记的老索引：把时间最早的一条当作受保护的原始备份
             if not originals:
                 oldest = self._oldest(items)
                 if oldest is not None:
                     keep_paths.add(oldest.get("backup", ""))
                     rest = [item for item in rest if item is not oldest]
-                    already = 1
-            keep_paths.update(item.get("backup", "") for item in rest[-max(0, self.keep - already) :])
+            keep_paths.update(item.get("backup", "") for item in rest[-self.keep :])
 
         removed_dirs: set[str] = set()
         for item in entries:
@@ -400,8 +445,9 @@ class BackupManager:
                 removed_dirs.add(str(Path(backup_path).parent))
 
         self._save_index([item for item in entries if item.get("backup", "") in keep_paths])
+        retained_dirs = {str(Path(name).parent) for name in keep_paths if name}
 
-        for directory in removed_dirs:
+        for directory in removed_dirs - retained_dirs:
             path = Path(directory)
             # 正在用的显式会话快照不能删：同一次操作可能还要往它里面写下一份文件
             if self._session_explicit and self._session_snapshot is not None and path == self._session_snapshot:
@@ -439,6 +485,15 @@ class BackupManager:
             if not backup.exists():
                 messages.append(f"跳过 {source}：备份文件已不存在")
                 continue
+            try:
+                data = backup.read_bytes()
+                if entry.sha256 and hashlib.sha256(data).hexdigest() != entry.sha256:
+                    raise ValueError("备份校验和不匹配")
+                # 必须在备份当前文件（可能触发轮换）之前读出待恢复内容。
+                payload = crypto.unprotect_bytes(data)
+            except (OSError, ValueError) as exc:
+                messages.append(f"跳过 {source}：备份损坏或无法解密（{exc}）")
+                continue
             if source.exists():
                 try:
                     self.backup_file(source, label)
@@ -447,7 +502,6 @@ class BackupManager:
                     continue
             try:
                 source.parent.mkdir(parents=True, exist_ok=True)
-                payload = crypto.unprotect_bytes(backup.read_bytes())
                 if payload.startswith(b"SQLite format 3\x00"):
                     sidecar_failed = False
                     for suffix in ("-wal", "-shm"):

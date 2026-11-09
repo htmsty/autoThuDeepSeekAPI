@@ -1430,7 +1430,7 @@ refs:
             self.backup.backup_file(credentials, "dsh-credentials")
         # 第一条是"第一次修改前"的原始备份，之后按 keep 保留最近的普通备份
         entries = self.backup.entries()
-        self.assertEqual(len(entries), 5, "原始备份 1 份 + 普通备份 keep-1 份")
+        self.assertEqual(len(entries), 6, "原始备份 1 份 + 普通备份 keep 份")
         oldest = min(entries, key=lambda item: Path(item.backup).parent.name)
         self.assertEqual(
             crypto.unprotect_bytes(Path(oldest.backup).read_bytes()).decode("utf-8"),

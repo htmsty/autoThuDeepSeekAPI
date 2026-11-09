@@ -195,21 +195,10 @@ def run_sync(
 
     targets = build_targets(settings)
 
-    models: list[dict] = []
-    if fetch_model_list:
-        # 站点前端包 → /v1/models → 内置名单（详见 token/site_models.py）
-        models = site_models.resolve_models(token)
-    report.models = models
-
-    if stopped():
-        report.cancelled = True
-        report.skipped.append("已被用户终止，未写入任何目标")
-        return report
-
     if verify:
         report.verified = verify_token(
             token,
-            models[0]["id"] if models else None,
+            settings.default_model_id or None,
             allow_chat_fallback=settings.chat_verification_enabled,
         )
         logger.info(
@@ -221,6 +210,15 @@ def run_sync(
             report.skipped.append("Token 被站点拒绝，未写入任何目标")
             return report
 
+    if stopped():
+        report.cancelled = True
+        report.skipped.append("已被用户终止，未写入任何目标")
+        return report
+
+    models: list[dict] = []
+    if fetch_model_list:
+        models = site_models.resolve_models(token)
+    report.models = models
     if stopped():
         report.cancelled = True
         report.skipped.append("已被用户终止，未写入任何目标")

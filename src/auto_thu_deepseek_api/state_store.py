@@ -21,7 +21,7 @@ def _clean_window_size(value: object) -> list[int]:
     try:
         width = int(value[0])
         height = int(value[1])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return []
     if isinstance(value[0], bool) or isinstance(value[1], bool):
         return []
@@ -59,6 +59,13 @@ class AppState:
             return cls()
         known = {field for field in cls.__dataclass_fields__}
         state = cls(**{k: v for k, v in raw.items() if k in known})
+        state.last_token = ""
+        for key in ("last_token_encrypted", "last_token_at", "last_status"):
+            if not isinstance(getattr(state, key), str):
+                setattr(state, key, "")
+        for key in ("desktop_note_ack", "targets_note_ack"):
+            if not isinstance(getattr(state, key), bool):
+                setattr(state, key, False)
         state.main_window_size = _clean_window_size(state.main_window_size)
         state.settings_dialog_size = _clean_window_size(state.settings_dialog_size)
         encrypted = raw.get("last_token_encrypted")

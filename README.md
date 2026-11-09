@@ -39,6 +39,13 @@
     显示后的后台线程。启动同步会等这些检查完成后再开始；如果用户在这段等待中主动点同步，
     程序会立即跳过剩余等待/探测，但仍会先完成首次原始备份，再执行这次手动同步。
 
+## 2.9.2 检修
+
+网络探测改为后台执行，退出会等待正在进行的写入安全结束；模型列表失败会缓存 5 分钟，
+避免重试时反复下载。修复备份轮换、分组快照误删、索引自愈错位和损坏备份还原问题，
+并收紧 Token 重定向和自动登录域名检查。共 228 项测试通过，详见
+[更新记录](CHANGELOG.md) 与 [审查记录](docs/REVIEW-2.9.2.md)。
+
 ## 首次运行的自动备份
 
 程序第一次运行时，会先把 DSH 凭据、各 profile、CC Switch 数据库与路由文件各备份一份，
@@ -245,7 +252,7 @@ src/auto_thu_deepseek_api/
   token/            内置浏览器取 Token、JWT、站点校验、模型清单
   targets/          DSH 与 CC Switch 的探测与写入
   ui/               主窗口、托盘、设置对话框、后台线程
-tests/              单元测试（当前 201 项）
+tests/              单元测试（当前 228 项）
 tools/              图标生成、界面截图、打包诊断等小工具
 build/              PyInstaller 规格与打包脚本
 private/            运行数据（Token、日志、备份、浏览器会话），不进 Git
@@ -279,9 +286,9 @@ python -m venv .venv
 
 会同时产出：
 
-- `dist/autoThuDeepSeekAPI-2.9.1-portable.zip`：**正式推荐**，Release 主资产；
+- `dist/autoThuDeepSeekAPI-2.9.2-portable.zip`：**正式推荐**，Release 主资产；
 - `dist/autoThuDeepSeekAPI/`：已展开的多文件目录，方便本机直接测试；
-- `dist/autoThuDeepSeekAPI-2.9.1.exe`：版本化单文件兼容版；
+- `dist/autoThuDeepSeekAPI-2.9.2.exe`：版本化单文件兼容版；
 - `dist/autoThuDeepSeekAPI.exe`：沿用旧名字的单文件兼容版。
 
 ZIP 内已经带顶层 `autoThuDeepSeekAPI\` 文件夹。使用时必须**完整解压整个目录**，不要只把
@@ -296,15 +303,15 @@ ZIP 内已经带顶层 `autoThuDeepSeekAPI\` 文件夹。使用时必须**完整
 
 EXE 会嵌入 `build/version_info.txt` 中的产品名、版本和公司信息。当前没有 Authenticode
 代码签名证书，因此 Windows 仍可能显示“未知发布者”；代码签名需要额外证书，不是打包脚本能
-凭空生成的。2.9.1 多文件 ZIP 约 165.39 MiB，单文件 EXE 约 164.30 MiB，均可作为 GitHub
+凭空生成的。2.9.1 的历史构建中，多文件 ZIP 约 165.39 MiB，单文件 EXE 约 164.30 MiB，均可作为 GitHub
 Release 附件（Release assets 的限额
 高于普通 Git 仓库单文件 100 MiB 限制）。
 
 体积主要来自 Qt WebEngine。程序不会为了压缩而移除登录所需的 Chromium 组件；浏览器档案只在
 取 Token 时启动，流程结束会关闭窗口并释放浏览器 profile，不再在托盘里常驻 Chromium；
-2.9.1 展开后的多文件版约 431.88 MiB、2,883 个文件。隔离测试中，系统完成文件扫描后，
+2.9.1 的历史构建中，展开后的多文件版约 431.88 MiB、2,883 个文件。隔离测试中，系统完成文件扫描后，
 多文件版到启动完成约 1.0–1.1 秒；程序内部从进入 Python 到启动日志约 0.6 秒。全新构建的
-前几次启动可能被 Windows Defender 扫描拖慢（本次复测约 6–13 秒，随后回落）；单文件版每次
+前几次启动可能被 Windows Defender 扫描拖慢（2.9.1 当时复测约 6–13 秒，随后回落）；单文件版每次
 都要解包，约 6.65 秒。因此正式下载使用多文件 ZIP，单文件只作兼容备用。
 
 ### 打包后自检

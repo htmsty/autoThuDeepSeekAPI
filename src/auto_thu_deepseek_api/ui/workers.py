@@ -15,8 +15,19 @@ from ..preflight import run_preflight
 from ..settings import AppSettings
 from ..sync import SyncReport, both_targets_missing, detect_targets, run_sync
 from ..targets.base import TargetStatus
+from ..token.verifier import site_reachable
 
 logger = logging.getLogger(__name__)
+
+
+class ReachabilityWorker(QThread):
+    """Keep the network probe off the GUI thread."""
+
+    def run(self) -> None:
+        try:
+            self.reachable = site_reachable()
+        except Exception:
+            self.reachable = False
 
 
 @dataclass(frozen=True)

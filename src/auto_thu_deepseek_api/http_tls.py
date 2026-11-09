@@ -4,9 +4,37 @@ from __future__ import annotations
 
 import logging
 import ssl
+import urllib.error
+import urllib.request
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never forward authentication to another origin or downgrade HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        if (
+            new.scheme != "https"
+            or (old.hostname, old.port or 443) != (new.hostname, new.port or 443)
+            or new.username is not None
+            or new.password is not None
+        ):
+            raise urllib.error.HTTPError(
+                req.full_url, code, "已阻止跨站或非 HTTPS 重定向", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_same_origin(request: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=create_verified_context()),
+        SameOriginRedirectHandler(),
+    )
+    return opener.open(request, timeout=timeout)
 
 
 def _server_auth_trusted(trust: object, purpose_oid: str) -> bool:

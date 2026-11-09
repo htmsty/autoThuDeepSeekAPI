@@ -5,4 +5,5 @@ ruamel.yaml==0.19.1
 
 # 打包依赖
 pyinstaller==6.22.3
+setuptools==84.2.1
 

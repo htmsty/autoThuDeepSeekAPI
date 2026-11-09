@@ -794,7 +794,7 @@ class NewVsOldInteractionTest(unittest.TestCase):
             manager.keep = 2
             manager.prune()
             left = {path for path in root.iterdir() if path.is_dir()}
-            self.assertLessEqual(len(left), 2, f"清完最多剩 2 个目录：{left}")
+            self.assertLessEqual(len(left), 3, f"原始备份加两份普通备份，最多 3 个目录：{left}")
 
     def test_explicit_snapshot_still_groups_files(self) -> None:
         """显式开的会话（首次运行那一批）仍然要把多份文件放进同一个目录。"""

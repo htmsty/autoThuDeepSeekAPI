@@ -9,7 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from ..constants import MADMODEL_API_BASE, MADMODEL_AUTH_LOGIN_PATH, MADMODEL_ORIGIN
-from ..http_tls import create_verified_context
+from ..http_tls import create_verified_context, open_same_origin
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,7 @@ def _request(
         request.add_header("Content-Type", "application/json")
 
     try:
-        context = create_verified_context()
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        with open_same_origin(request, timeout=timeout) as response:
             body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(body) > MAX_RESPONSE_BYTES:
                 return response.status, b"", f"响应超过 {MAX_RESPONSE_BYTES} 字节上限"
@@ -56,6 +55,8 @@ def _request(
             body = exc.read(MAX_RESPONSE_BYTES + 1)[:MAX_RESPONSE_BYTES]
         except Exception:  # pragma: no cover
             body = b""
+        finally:
+            exc.close()
         return exc.code, body, ""
     except Exception as exc:  # noqa: BLE001 - 网络异常种类多，统一处理
         return None, b"", f"{type(exc).__name__}: {exc}"

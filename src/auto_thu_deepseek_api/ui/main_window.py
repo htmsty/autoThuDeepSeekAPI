@@ -46,11 +46,11 @@ from ..state_store import AppState
 from ..sync import SyncReport, both_targets_missing, detect_targets
 from ..targets.ccswitch import is_running as ccswitch_is_running
 from ..token.jwt_utils import describe_expiry, is_expired
-from ..token.verifier import site_reachable
 from .icon import app_icon
 from .settings_dialog import SettingsDialog
 from .workers import (
     PreflightWorker,
+    ReachabilityWorker,
     StartupProbeResult,
     StartupProbeWorker,
     SyncWorker,
@@ -88,6 +88,10 @@ class MainWindow(QMainWindow):
         self._sync_worker: SyncWorker | None = None
         self._preflight_worker: PreflightWorker | None = None
         self._startup_worker: StartupProbeWorker | None = None
+        self._network_worker: ReachabilityWorker | None = None
+        self._exit_timer = QTimer(self)
+        self._exit_timer.setInterval(100)
+        self._exit_timer.timeout.connect(self._finish_quit_when_idle)
         self._startup_checks_pending = bool(startup_checks_pending)
         self._startup_pipeline_claimed = False
         self._manual_sync_after_startup = False
@@ -347,6 +351,8 @@ class MainWindow(QMainWindow):
     # —— 界面动作 ——
 
     def open_settings(self) -> None:
+        if self._quitting:
+            return
         dialog = SettingsDialog(
             self.settings,
             self,
@@ -560,6 +566,8 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.deleteLater()
         self._restore_status_hint()
+        if self._quitting:
+            return
         if manual_sync:
             self._resume_manual_sync_after_startup()
             return
@@ -890,6 +898,8 @@ class MainWindow(QMainWindow):
         return self
 
     def _on_preflight_report(self, report, worker=None) -> None:  # noqa: ANN001
+        if self._quitting:
+            return
         if worker is not None and worker is not self._preflight_worker:
             return
         for line in report.text().splitlines():
@@ -902,6 +912,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_preflight_failed(self, message: str, worker=None) -> None:
+        if self._quitting:
+            return
         if worker is not None and worker is not self._preflight_worker:
             return
         logger.error("预检失败：%s", message)
@@ -917,6 +929,8 @@ class MainWindow(QMainWindow):
         if worker is not None and worker is not self._preflight_worker:
             return
         self._preflight_worker = None
+        if worker is not None:
+            worker.deleteLater()
         self._preflight_result_parent_ref = None
         self._restore_status_hint()
 
@@ -945,6 +959,9 @@ class MainWindow(QMainWindow):
     def _restore_status_hint(self) -> None:
         """状态栏回到默认提示（运行数据目录）。"""
 
+        if self._quitting:
+            self._show_status_hint("正在安全结束后台操作，完成后自动退出…")
+            return
         self.statusBar().showMessage(f"数据目录：{paths.data_root()}")
 
     def _open_data_dir(self) -> None:
@@ -1026,59 +1043,35 @@ class MainWindow(QMainWindow):
             )
 
     def quit_app(self) -> None:
+        if self._quitting:
+            return
         self._quitting = True
         self._auto_timer.stop()
         self._auto_retry_timer.stop()
-        startup_worker = self._startup_worker
-        if startup_worker is not None and startup_worker.isRunning():
-            # 首次备份是写操作。退出时先等它完成，避免留下半截备份或让 QThread
-            # 随窗口一起销毁。等待超过 10 秒再交给 QApplication 保活。
-            logger.info("退出前等启动检查与首次备份结束（最多 10 秒）…")
-            if not startup_worker.wait(10000):
-                logger.warning("启动检查仍未结束，交给进程退出处理")
-                startup_worker.setParent(None)
-                application = QApplication.instance()
-                if application is not None:
-                    orphans = getattr(application, "_atd_orphan_threads", None)
-                    if orphans is None:
-                        orphans = []
-                        application._atd_orphan_threads = orphans  # type: ignore[attr-defined]
-                    orphans.append(startup_worker)
-        self._startup_worker = None
-        self._startup_checks_pending = False
+        self._retry_after_stop = False
         self._manual_sync_after_startup = False
-        self._startup_probe_result = None
-        self._startup_probe_error = ""
+        for worker in (self._startup_worker, self._sync_worker):
+            if worker is not None:
+                worker.request_cancel()
         if self._capture is not None:
             self._capture.cancel()
-        worker = self._sync_worker
-        if worker is not None and worker.isRunning():
-            # QThread 还在跑就销毁进程会直接崩。先请它在步骤之间安全停下，再等它；
-            # 只有实在等不到才强制收尾（这时可能正在写文件，日志里必须说清）。
-            logger.info("退出前请同步线程在安全位置停下…")
-            worker.request_cancel()
-            if not worker.wait(20000):
-                logger.warning("同步线程 20 秒内没有停下，只能强制结束（可能正在写文件）")
-                worker.terminate()
-                worker.wait(2000)
-        self._sync_worker = None
-        preflight_worker = self._preflight_worker
-        if preflight_worker is not None and preflight_worker.isRunning():
-            # 预检是只读的，但 QThread 在运行中被销毁会让 Qt 直接崩。
-            # 等一小会儿；还等不到就从窗口上摘下来、交给 QApplication 保活，
-            # 别让窗口析构把它一起删掉。
-            logger.info("退出前等校验线程结束（最多 5 秒）…")
-            if not preflight_worker.wait(5000):
-                logger.warning("校验线程还没结束（只读操作），交给进程退出处理")
-                preflight_worker.setParent(None)
-                application = QApplication.instance()
-                if application is not None:
-                    orphans = getattr(application, "_atd_orphan_threads", None)
-                    if orphans is None:
-                        orphans = []
-                        application._atd_orphan_threads = orphans  # type: ignore[attr-defined]
-                    orphans.append(preflight_worker)
-        self._preflight_worker = None
+        self.sync_button.setEnabled(False)
+        self.config_button.setEnabled(False)
+        for action in self.tray_menu.actions()[1:]:
+            action.setEnabled(False)
+        self._show_status_hint("正在安全结束后台操作，完成后自动退出…")
+        self.tray.setToolTip("正在安全退出…")
+        self._exit_timer.start()
+        self._finish_quit_when_idle()
+
+    def _finish_quit_when_idle(self) -> None:
+        # 不阻塞 GUI，也不强杀正在备份或写文件的线程。
+        if not self._quitting:
+            return
+        workers = (self._startup_worker, self._sync_worker, self._preflight_worker, self._network_worker)
+        if any(worker is not None and worker.isRunning() for worker in workers):
+            return
+        self._exit_timer.stop()
         self._browser_release_timer.stop()
         self._release_browser_profile()
         if not self._skip_save_on_quit:
@@ -1087,8 +1080,6 @@ class MainWindow(QMainWindow):
             self._persist_state()
         self.tray.hide()
         self.close()
-        from PySide6.QtWidgets import QApplication
-
         QApplication.quit()
 
     # —— 状态刷新 ——
@@ -1143,7 +1134,9 @@ class MainWindow(QMainWindow):
 
     # —— 同步流程 ——
 
-    def start_sync(self, interactive: bool = True) -> None:
+    def start_sync(self, interactive: bool = True, *, _network_checked: bool = False) -> None:
+        if self._quitting:
+            return
         if self._maintenance:
             logger.info("正在搬 private 位置或卸载，本次同步先跳过")
             return
@@ -1169,10 +1162,22 @@ class MainWindow(QMainWindow):
                     "请先在「设置…」里打开至少一个写入目标。",
                 )
             return
-        if not interactive and not site_reachable():
-            # 开机时网络经常还没就绪：先别去取 Token（那要白等 40 秒），过几分钟自动重试
-            logger.info("站点暂时连不上（可能网络还没就绪），本次自动同步先跳过")
-            self._schedule_auto_retry("网络还没就绪")
+        if self._network_worker is not None:
+            self._show_status_hint("正在检查网络，请稍候…")
+            return
+        if not interactive and not _network_checked and not self._busy():
+            worker = ReachabilityWorker(self)
+            self._network_worker = worker
+            worker.finished.connect(lambda w=worker: self._on_network_probe_finished(w))
+            self._show_status_hint("正在后台检查网络…")
+            try:
+                worker.start()
+            except Exception as exc:
+                self._network_worker = None
+                worker.deleteLater()
+                logger.warning("网络探测启动失败：%s", exc)
+                self._restore_status_hint()
+                self._schedule_auto_retry("网络探测启动失败")
             return
         if self._busy():
             if not interactive:
@@ -1204,6 +1209,21 @@ class MainWindow(QMainWindow):
             self._open_capture(silent=False)
             return
         self._open_capture(silent=True)
+
+    def _on_network_probe_finished(self, worker) -> None:
+        if worker is not self._network_worker:
+            return
+        self._network_worker = None
+        reachable = getattr(worker, "reachable", False)
+        worker.deleteLater()
+        if self._quitting:
+            return
+        self._restore_status_hint()
+        if reachable:
+            self.start_sync(interactive=False, _network_checked=True)
+        else:
+            logger.info("站点暂时连不上，稍后自动重试")
+            self._schedule_auto_retry("网络还没就绪")
 
     def _ask_force_retry(self) -> bool:
         """上一次还没结束时问用户：强行终止并按原样重试，还是取消。"""
@@ -1262,7 +1282,7 @@ class MainWindow(QMainWindow):
             return True
         # 线程对象还在就算忙：哪怕它刚好跑完、finished 信号还没派发到主线程，
         # 这时候放新的同步进来会让两轮并排跑（旧线程收尾时还会误清新线程的状态）。
-        if self._sync_worker is not None:
+        if self._sync_worker is not None or self._network_worker is not None:
             return True
         return self._capture is not None
 
@@ -1378,6 +1398,8 @@ class MainWindow(QMainWindow):
         self.notify(f"{reason}。已暂停自动登录并打开登录窗口。", warning=True)
 
     def _on_token_captured(self, token: str) -> None:
+        if self._quitting:
+            return
         self._capture = None
         self._schedule_browser_release()
         was_user_initiated = self._capture_user_initiated
@@ -1393,6 +1415,8 @@ class MainWindow(QMainWindow):
         self._start_sync_worker(token, auto=not was_user_initiated)
 
     def _on_capture_failed(self, message: str) -> None:
+        if self._quitting:
+            return
         self._capture = None
         self._restore_status_hint()
         was_silent = self._capture_silent
@@ -1456,6 +1480,8 @@ class MainWindow(QMainWindow):
             self.notify(f"同步启动失败：{exc}", warning=True)
 
     def _on_sync_report(self, report: SyncReport, worker=None) -> None:
+        if self._quitting:
+            return
         if worker is not None and worker is not self._sync_worker:
             logger.info("上一次同步的结果晚到了，忽略（已经有新的同步在跑）")
             return
@@ -1486,10 +1512,12 @@ class MainWindow(QMainWindow):
             self._schedule_auto_retry("上次同步没有成功")
         logger.info("同步完成：%s", summary)
         self.notify(summary, warning=not report.ok)
-        if self.settings.minimize_after_sync:
+        if report.ok and self.settings.minimize_after_sync:
             self.hide()
 
     def _on_sync_failed(self, message: str, worker=None) -> None:
+        if self._quitting:
+            return
         if worker is not None and worker is not self._sync_worker:
             logger.info("上一次同步的错误晚到了，忽略（已经有新的同步在跑）")
             return
@@ -1507,8 +1535,10 @@ class MainWindow(QMainWindow):
             # 老线程的收尾信号：别动新线程的状态
             logger.info("上一次同步的线程收尾，忽略（已经有新的同步在跑）")
             return
-        self.sync_button.setEnabled(True)
+        self.sync_button.setEnabled(not self._quitting)
         self._sync_worker = None
+        if worker is not None:
+            worker.deleteLater()
         self._restore_status_hint()
         if self._retry_after_stop:
             self._retry_after_stop = False

@@ -111,11 +111,13 @@ class AppSettings:
         version = raw.get("settings_version")
         try:
             version = int(version)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             version = 1
         known = {f for f in cls.__dataclass_fields__}
         data = {k: v for k, v in raw.items() if k in known}
         settings = cls(**data)
+        settings.settings_version = version
+        settings.normalize()
         migrated = False
         if version < 3:
             # v2 → v3：默认开启自动同步，并默认不弹 CC Switch 运行中提醒。
@@ -157,7 +159,7 @@ class AppSettings:
                 settings.log_keep_days = int(
                     raw.get("log_keep_days", DEFAULT_LOG_KEEP_DAYS)
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 settings.log_keep_days = DEFAULT_LOG_KEEP_DAYS
             migrated = True
             logging.getLogger(__name__).info(
@@ -182,15 +184,20 @@ class AppSettings:
         paths.write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def normalize(self) -> None:
+        defaults = AppSettings()
+        for name in self.__dataclass_fields__:
+            default = getattr(defaults, name)
+            if isinstance(default, (str, bool)) and not isinstance(getattr(self, name), type(default)):
+                setattr(self, name, default)
         try:
             self.sync_interval_minutes = int(self.sync_interval_minutes)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.sync_interval_minutes = DEFAULT_SYNC_INTERVAL_MINUTES
         self.sync_interval_minutes = max(1, min(self.sync_interval_minutes, 24 * 60))
 
         try:
             self.backup_keep = int(self.backup_keep)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.backup_keep = 10
         self.backup_keep = max(1, min(self.backup_keep, 200))
 
@@ -199,7 +206,7 @@ class AppSettings:
 
         try:
             self.silent_capture_timeout_seconds = int(self.silent_capture_timeout_seconds)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.silent_capture_timeout_seconds = 40
         self.silent_capture_timeout_seconds = max(10, min(self.silent_capture_timeout_seconds, 600))
 
@@ -214,7 +221,7 @@ class AppSettings:
 
         try:
             self.log_keep_days = int(self.log_keep_days)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.log_keep_days = DEFAULT_LOG_KEEP_DAYS
         self.log_keep_days = max(1, min(self.log_keep_days, 90))
 

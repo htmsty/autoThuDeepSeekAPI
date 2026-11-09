@@ -1125,8 +1125,13 @@ class UiInteractionTest(unittest.TestCase):
         scheduled: list[str] = []
         window._schedule_auto_retry = lambda reason: scheduled.append(reason)  # type: ignore[assignment]
         try:
-            with mock.patch.object(main_window_module, "site_reachable", return_value=False):
+            from auto_thu_deepseek_api.ui import workers
+            with mock.patch.object(workers, "site_reachable", return_value=False):
                 window.start_sync(interactive=False)
+                worker = window._network_worker
+                self.assertIsNotNone(worker)
+                self.assertTrue(worker.wait(2000))
+                self.application.processEvents()
             self.assertEqual(len(scheduled), 1, "连不上站点时要安排重试")
             self.assertIsNone(window._capture, "连不上站点时不该去取 Token")
         finally:

@@ -146,7 +146,7 @@ CAPTURE_SCRIPT = r"""
 AUTO_LOGIN_SCRIPT = r"""
 (function (username, password) {
   var host = (location.hostname || '').toLowerCase();
-  if (!(host === 'tsinghua.edu.cn' || host.endsWith('.tsinghua.edu.cn'))) {
+  if (location.protocol !== 'https:' || !(host === 'tsinghua.edu.cn' || host.endsWith('.tsinghua.edu.cn'))) {
     return JSON.stringify({action: 'ignore'});
   }
   function isVisible(element) {
@@ -413,7 +413,10 @@ class TokenCaptureSession(QObject):
     def _on_load_finished(self, ok: bool) -> None:
         if self._finished or not ok or not self._auto_submit_enabled or self._page is None:
             return
-        if not self._page.url().host().lower().endswith("tsinghua.edu.cn"):
+        url = self._page.url()
+        host = url.host().lower()
+        if (url.scheme().lower() != "https" or url.port(443) != 443
+                or not (host == "tsinghua.edu.cn" or host.endswith(".tsinghua.edu.cn"))):
             return
         script = AUTO_LOGIN_SCRIPT.replace(
             "__ATD_USERNAME__", json.dumps(self._auto_username, ensure_ascii=False)
@@ -484,7 +487,10 @@ class TokenCaptureSession(QObject):
         except Exception:  # noqa: BLE001
             return
         if looks_like_jwt(value):
-            self._cookie_values.append(value.strip())
+            value = value.strip()
+            if value not in self._cookie_values:
+                self._cookie_values.append(value)
+                self._cookie_values = self._cookie_values[-80:]
 
     def _poll(self) -> None:
         if self._finished or self._page is None:

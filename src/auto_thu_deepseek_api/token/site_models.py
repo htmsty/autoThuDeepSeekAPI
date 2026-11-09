@@ -15,11 +15,12 @@ import time
 import urllib.error
 import urllib.request
 import copy
+import math
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from .. import constants, paths
-from ..http_tls import create_verified_context
+from ..http_tls import open_same_origin
 from .verifier import fetch_models
 
 logger = logging.getLogger(__name__)
@@ -27,12 +28,14 @@ logger = logging.getLogger(__name__)
 PAGE_MAX_BYTES = 2 * 1024 * 1024
 BUNDLE_MAX_BYTES = 8 * 1024 * 1024
 REQUEST_TIMEOUT = 25
+FETCH_BUDGET_SECONDS = 25
+FALLBACK_CACHE_SECONDS = 300
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) autoThuDeepSeekAPI"
 
 ASSET_REF = re.compile(r"""["']([^"']*assets/js/[^"']+\.js)["']""")
 MODEL_LIST = re.compile(r"""["']?modelList["']?\s*:\s*\[""")
-SUPPORT_IMAGE = re.compile(r"supportImage:!0|supportImage:true")
-EFFORT_OPTIONS = re.compile(r"effortOptions:\[([^\]]*)\]")
+SUPPORT_IMAGE = re.compile(r'''["']?supportImage["']?\s*:\s*(?:!0|true)\b''')
+EFFORT_OPTIONS = re.compile(r'''["']?effortOptions["']?\s*:\s*\[([^\]]*)\]''')
 
 
 # —— 解析前端包 ——
@@ -225,13 +228,13 @@ def _get_text(url: str, max_bytes: int, timeout: int = REQUEST_TIMEOUT) -> str |
     request.add_header("User-Agent", USER_AGENT)
     request.add_header("Accept", "text/html,application/javascript,*/*")
     try:
-        context = create_verified_context()
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        with open_same_origin(request, timeout=timeout) as response:
             if response.status != 200:
                 return None
             raw = response.read(max_bytes + 1)
     except urllib.error.HTTPError as exc:
         logger.info("读取 %s 返回 HTTP %s", url, exc.code)
+        exc.close()
         return None
     except Exception as exc:  # noqa: BLE001 - 网络异常种类多
         logger.info("读取 %s 失败：%s", url, exc)
@@ -245,6 +248,7 @@ def _get_text(url: str, max_bytes: int, timeout: int = REQUEST_TIMEOUT) -> str |
 def fetch_site_models() -> list[dict] | None:
     """按 thu-tok-auto 的做法从站点前端包读模型列表；读不到返回 None。"""
 
+    deadline = time.monotonic() + FETCH_BUDGET_SECONDS
     page = _get_text(f"{constants.MADMODEL_ORIGIN}/", PAGE_MAX_BYTES)
     if not page:
         return None
@@ -254,8 +258,20 @@ def fetch_site_models() -> list[dict] | None:
         return None
 
     for path in paths[:4]:
-        url = urljoin(constants.MADMODEL_ORIGIN + "/", path)
-        bundle = _get_text(url, BUNDLE_MAX_BYTES)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            url = urljoin(constants.MADMODEL_ORIGIN + "/", path)
+            origin, asset = urlsplit(constants.MADMODEL_ORIGIN), urlsplit(url)
+            same_origin = (asset.scheme, asset.hostname, asset.port or 443) == (
+                origin.scheme, origin.hostname, origin.port or 443
+            )
+        except ValueError:
+            continue
+        if not same_origin or asset.username is not None or asset.password is not None:
+            continue
+        bundle = _get_text(url, BUNDLE_MAX_BYTES, timeout=min(REQUEST_TIMEOUT, remaining))
         if not bundle:
             continue
         models = to_provider_models(extract_model_list(bundle))
@@ -288,11 +304,12 @@ def _load_cache() -> list[dict] | None:
     try:
         # at 被写坏（不是数字）时也要当"没有缓存"，不能让整次同步挂掉
         age = time.time() - float(payload.get("at", 0))
+        ttl = min(float(payload.get("ttl", constants.MODEL_CACHE_TTL_SECONDS)), constants.MODEL_CACHE_TTL_SECONDS)
     except (TypeError, ValueError):
         logger.info("模型缓存的时间戳坏了，忽略这份缓存：%s", path)
         return None
     # 时间戳跑到未来太多（时钟被改过）也当过期，免得这份缓存"永远新鲜"
-    if age > constants.MODEL_CACHE_TTL_SECONDS or age < -3600:
+    if not math.isfinite(age) or not math.isfinite(ttl) or ttl <= 0 or age > ttl or age < -3600:
         return None
     raw_models = payload.get("models")
     if not isinstance(raw_models, list):
@@ -301,11 +318,11 @@ def _load_cache() -> list[dict] | None:
     return _valid_provider_models(raw_models)
 
 
-def _save_cache(models: list[dict]) -> None:
+def _save_cache(models: list[dict], *, ttl: int = constants.MODEL_CACHE_TTL_SECONDS) -> None:
     try:
         paths.write_text_atomic(
             _cache_file(),
-            json.dumps({"at": time.time(), "models": models}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps({"at": time.time(), "ttl": ttl, "models": models}, ensure_ascii=False, indent=2) + "\n",
         )
     except OSError as exc:  # pragma: no cover - 缓存写不进去不影响功能
         logger.info("写模型缓存失败：%s", exc)
@@ -341,4 +358,6 @@ def resolve_models(token: str | None = None, *, use_cache: bool = True) -> list[
             return validated
 
     logger.info("模型列表读不到，回退内置名单")
-    return [copy.deepcopy(model) for model in constants.DEFAULT_MODELS]
+    fallback_models = copy.deepcopy(constants.DEFAULT_MODELS)
+    _save_cache(fallback_models, ttl=FALLBACK_CACHE_SECONDS)
+    return fallback_models
